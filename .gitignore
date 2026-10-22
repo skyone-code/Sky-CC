@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# 构建产物（由 build-swift.sh 生成，不纳入版本控制）
+swift-stage/
+swift-dmgroot/
+*.dmg
+
+# 编辑器/临时文件
+*.bak
+build-swift.shw*
+*~

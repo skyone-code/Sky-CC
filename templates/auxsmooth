@@ -1,0 +1,9 @@
+#!/bin/zsh
+# auxsmooth CLI 包装（app bundle 版）
+# 2026-10-17 起为兼容层：get/set 走系统亮度（IOKit，原生链路真相源），
+# mode/pwm/aux/watch 委托 auxbright v4（PWM 模式保持器）。
+# 真正的实现在同级的 auxsmooth.py。
+DIR="$(cd "$(dirname "$0")/.." && pwd)"     # Resources/
+PY=/usr/bin/python3
+[[ -x "$PY" ]] || PY="$(command -v python3)"
+exec "$PY" "$DIR/auxsmooth.py" "$@"
