@@ -56,10 +56,11 @@ fi
 echo "==> auxbright: $AUXBRIGHT_SRC"
 VERSION="2.7.5"
 
-# pwmwake v5.1（事件驱动 PWM 恢复守护，2026-10-19 起接管亮度兜底）：
-# 优先复用已安装/随包的二进制，都没有就从源码现场编译，
-# 保证换机或源码更新后构建仍能拿到最新版。
-# 源码位置：本包自带副本优先，NUC9 项目工作区兜底。
+# pwmwake v5.2（事件驱动 PWM 恢复守护，2026-10-19 起接管亮度兜底）：
+# 源码已收进本包 Tools/pwmwake.c（2026-10-22 从 Documents/亮度修复包-20261020
+# 找回；原先指向 Desktop 与 WorkBuddy 的两个外部路径均已失效，故删除）。
+# 策略：优先复用已安装/随包的二进制；仅当源码比二进制新才重编。
+# 要强制用新源码重编：touch Tools/pwmwake.c 后再构建。
 PWMWAKE_SRC=""
 for cand in \
     "$HOME/bin/pwmwake" \
@@ -70,11 +71,7 @@ for cand in \
   if [[ -x "$cand" ]]; then PWMWAKE_SRC="$cand"; break; fi
 done
 PWMWAKE_C=""
-for cand in \
-    "/Users/skyone/Desktop/亮度修复以及mac控制台-AI接手包/06-黑苹果NUC9-知识库/06-工具源码/pwmwake-v5.1-长连接守护.c" \
-    "/Users/skyone/WorkBuddy/2026-10-17-09-17-51/NUC9-project/06-工具源码/pwmwake-v5.1-长连接守护.c"; do
-  if [[ -f "$cand" ]]; then PWMWAKE_C="$cand"; break; fi
-done
+if [[ -f "$BUILD/Tools/pwmwake.c" ]]; then PWMWAKE_C="$BUILD/Tools/pwmwake.c"; fi
 # 仅当源码比现有二进制新才重编译，避免每次构建都刷新二进制、白改校验和
 if [[ -n "$PWMWAKE_C" && ( ! -f "$PROJ/bin/pwmwake" || "$PWMWAKE_C" -nt "$PROJ/bin/pwmwake" ) ]]; then
   TMPW="$(mktemp -t pwmwake)"
@@ -98,12 +95,11 @@ fi
 
 # nvmetemp（NVMe 硬盘温度，SMART）——与 pwmwake 同样策略：有现成二进制就用，
 # 源码更新则现场重编。
+# ⚠️ 2026-10-22：该工具的 C 源码全盘已找不到（原先两个外部路径都已失效），
+# 现在 python后端/bin/nvmetemp 这份二进制就是唯一来源，已纳入 git。
+# 所以源码缺失不再静默降级——二进制也没了就直接报错，避免打出缺硬盘温度的包。
 NVME_C=""
-for cand in \
-    "/Users/skyone/Desktop/亮度修复以及mac控制台-AI接手包/06-黑苹果NUC9-知识库/06-工具源码/nvmetemp-NVMe温度.c" \
-    "/Users/skyone/WorkBuddy/2026-10-17-09-17-51/NUC9-project/06-工具源码/nvmetemp-NVMe温度.c"; do
-  if [[ -f "$cand" ]]; then NVME_C="$cand"; break; fi
-done
+if [[ -f "$BUILD/Tools/nvmetemp.c" ]]; then NVME_C="$BUILD/Tools/nvmetemp.c"; fi
 if [[ -n "$NVME_C" && ( ! -f "$PROJ/bin/nvmetemp" || "$NVME_C" -nt "$PROJ/bin/nvmetemp" ) ]]; then
   TMPN="$(mktemp -t nvmetemp)"
   if clang -O2 -Wall -o "$TMPN" "$NVME_C" \
@@ -119,7 +115,9 @@ if [[ -n "$NVME_C" && ( ! -f "$PROJ/bin/nvmetemp" || "$NVME_C" -nt "$PROJ/bin/nv
 elif [[ -x "$PROJ/bin/nvmetemp" ]]; then
   echo "==> nvmetemp: $PROJ/bin/nvmetemp"
 else
-  echo "警告：找不到 nvmetemp，硬盘温度将显示不可用" >&2
+  echo "错误：既没有 Tools/nvmetemp.c，也没有 $PROJ/bin/nvmetemp。" >&2
+  echo "      nvmetemp 源码已丢失，这份二进制是唯一来源，请从旧包/备份恢复后重试。" >&2
+  exit 1
 fi
 
 # nvmesmart（2.7.5）：按控制器枚举所有 NVMe 盘的 SMART。
