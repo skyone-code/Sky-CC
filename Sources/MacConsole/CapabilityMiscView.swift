@@ -3,8 +3,11 @@ import ServiceManagement
 
 /// 系统页：版本 / 外观 / 通用（开机自启）/ 菜单栏监控图标
 /// （2026-10-19 v2.4.2：删除「能力矩阵」整页；「磁盘·df」「HID 设备」两卡删除，
-///  「进程·CPU 占用 Top」移到监控页最下方。v2.4.3：新增「外观」卡——浅色/深色/随系统。
-///  v2.4.5：菜单栏卡新增「CPU / GPU 显示指标」切换（温度/占用率，默认温度）。）
+///  「进程·CPU 占用 Top」移到监控页最下方（2.7.6 起该卡已从监控页删除）。
+///  v2.4.3：新增「外观」卡——浅色/深色/随系统。
+///  v2.4.5：菜单栏卡新增「CPU / GPU 显示指标」切换（温度/占用率，默认温度）。
+///  2.7.6：删除「能力边界」卡；新增「静默启动」。
+///  2.8.15：删除「静默启动」（用户：没用了）——开机自启只剩 mainApp 一条。）
 struct MiscView: View {
     @EnvironmentObject var backend: BackendService
     @EnvironmentObject var store: MonitorStore
@@ -13,16 +16,13 @@ struct MiscView: View {
     @State private var launchNote: String?
     // 外观（v2.4.3：浅色 / 深色 / 随系统，UserDefaults 持久化）
     @State private var appearance: AppAppearance = AppAppearance.current
-    // 能力边界（v2.5.3.1：把 /api/capability 的能力矩阵放回 UI，含 EC 寄存器映射摘要）
-    @State private var capability: [String: Any] = [:]
-    @State private var capLoading = true
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 header
-                // 2.7.2 重排：左「后台服务 + 菜单栏图标」，右「版本 + 外观与通用」，
-                // 能力边界通栏放最底——它是最长的参考资料，不该挡在常用开关前面。
+                // 2.7.2 重排：左「后台服务 + 菜单栏图标」，右「版本 + 外观与通用」。
+                // 2.7.6：原第三行「能力边界」通栏卡删除。
                 Grid(horizontalSpacing: 14, verticalSpacing: 14) {
                     GridRow {
                         helperCard.gridEqual()
@@ -32,17 +32,14 @@ struct MiscView: View {
                         menuBarCard.gridEqual()
                         generalCard.gridEqual()
                     }
-                    GridRow {
-                        capabilityCard.gridEqual().gridCellColumns(2)
-                    }
                 }
             }
             .padding(22)
         }
         .background(Theme.bg)
+        .toastOverlay()
         .task {
             refreshLaunchState()
-            await loadCapability()
         }
     }
 
@@ -74,6 +71,7 @@ struct MiscView: View {
                      + "风扇曲线由它继续守护，崩溃后 launchd 会自动拉起。")
                     .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
                     .fixedSize(horizontal: false, vertical: true)
+                    .cardNote()
                 if !backend.helperOnline, let e = backend.lastError {
                     Text(e).font(.system(size: 10.5)).foregroundStyle(Theme.amber)
                 }
@@ -82,114 +80,8 @@ struct MiscView: View {
     }
 
     private var header: some View {
-        PageHeader(title: "设置", sub: "后台服务 · 菜单栏图标 · 外观与开机 · 能力边界")
+        PageHeader(title: "设置", sub: "后台服务 · 菜单栏图标 · 外观与开机")
     }
-
-    // MARK: - 能力边界（v2.5.3.1：可用/部分可用清单 + EC 寄存器映射）
-    private func loadCapability() async {
-        if let d = await backend.get("/api/capability") as? [String: Any] {
-            capability = d
-        }
-        capLoading = false
-    }
-
-    private var capabilityCard: some View {
-        let usable = (BackendService.array(capability, "usable") as? [[String: Any]]) ?? []
-        let partial = (BackendService.array(capability, "partial") as? [[String: Any]]) ?? []
-        let un = (BackendService.array(capability, "unavailable") as? [[String: Any]]) ?? []
-        return Card(title: "能力边界") {
-            if capLoading {
-                Text("读取中…").font(.system(size: 12)).foregroundStyle(Theme.dim)
-            } else {
-                VStack(alignment: .leading, spacing: 12) {
-                    // 摘要行：三组数量一眼可见，细项折在下面（原来一长串 ✅/⚠️/❌ 占满屏）
-                    HStack(spacing: 8) {
-                        Chip(text: "可用 \(usable.count)", color: Theme.green)
-                        Chip(text: "部分可用 \(partial.count)", color: Theme.amber)
-                        Chip(text: "不可用 \(un.count)", color: Theme.red)
-                        Spacer(minLength: 8)
-                        Text("以实机探测为准（qc71 同族开源驱动交叉验证）")
-                            .font(.system(size: 10)).foregroundStyle(Theme.dim2)
-                    }
-                    HStack(alignment: .top, spacing: 22) {
-                        VStack(alignment: .leading, spacing: 10) {
-                            capGroup(usable, title: "可用", color: Theme.green)
-                            capGroup(partial, title: "部分可用", color: Theme.amber)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        VStack(alignment: .leading, spacing: 10) {
-                            capGroup(un, title: "不可用", color: Theme.red)
-                            Divider().overlay(Theme.line)
-                            ecMapBlock
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                }
-            }
-        }
-    }
-
-    /// 一组能力条目：小色条 + 标题 +（可展开的）细项
-    private func capGroup(_ items: [[String: Any]], title: String, color: Color) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
-                RoundedRectangle(cornerRadius: 1.5)
-                    .fill(color)
-                    .frame(width: 3, height: 11)
-                Text("\(title)（\(items.count)）")
-                    .font(.system(size: 11.5, weight: .semibold))
-                    .foregroundStyle(color)
-            }
-            ForEach(Array(items.enumerated()), id: \.offset) { _, item in
-                DisclosureGroup {
-                    Text(BackendService.string(item, "detail") ?? "")
-                        .font(.system(size: 10.5)).foregroundStyle(Theme.dim)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .padding(.vertical, 3)
-                } label: {
-                    Text(BackendService.string(item, "name") ?? "")
-                        .font(.system(size: 11.5, weight: .medium))
-                }
-                .tint(color)
-            }
-        }
-    }
-
-    /// EC 寄存器映射摘要（v2.5.3.1，名称 = qc71 官方命名，本机全扫实测）
-    private var ecMapBlock: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("EC 寄存器映射（ABBC0F6F WMI，qc71 官方命名）")
-                .font(.system(size: 11.5, weight: .medium))
-            let rows: [(String, String)] = [
-                ("FAN_CTRL · 0x0751", "散热档位 0x80+n（配 CTRL_1 手动门）"),
-                ("CTRL_1 · 0x0741", "bit0 手动门：EC 自动调度 / app 接管"),
-                ("FAN_MODE_INDEX · 0x07AB", "性能模式 0x11 专业 / 0x22 平衡 / 0x33 省电"),
-                ("CTRL_2 · 0x078C", "bit2-3 Turbo 档位"),
-                ("BATT_CHARGE_CTRL · 0x07B9", "充电阈值（0 = 100%）"),
-                ("LIGHTBAR_CTRL · 0x0748-74B", "海岸灯模式 + RGB"),
-                ("BIOS_CTRL_1 · 0x074E", "bit4 Fn 锁"),
-                ("AP_BIOS_BYTE · 0x07A4", "bit3 Fn+Esc 快捷键"),
-                ("CTRL_4 · 0x07A6", "bit6 触控板 / bit1 超频动态温控"),
-                ("BIOS_CTRL_3 · 0x07A3", "bit5 降占空比 / bit6 常转"),
-                ("0x043E/044F · 0x046C/0464", "CPU/GPU 温度与转速（只读监视）"),
-                ("0x1804/1809", "PWM 遥测（禁写：会停转风扇）"),
-            ]
-            ForEach(rows, id: \.0) { k, v in
-                HStack(alignment: .top, spacing: 8) {
-                    Text(k).font(.system(size: 10).monospacedDigit())
-                        .frame(width: 178, alignment: .leading)
-                    Text(v).font(.system(size: 10)).foregroundStyle(Theme.dim2)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            Text("实测无效区：PL1/2/4（0x0783-85）与 SUPPORT_5（0x0742）被 EC 秒级还原；0x07AC-AE + 0x07B0-B2 为静态码表死数据；0x0786-78A 为 EC 默认 PWM 阶梯（只读）。")
-                .font(.system(size: 10)).foregroundStyle(Theme.dim2)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.top, 2)
-        }
-    }
-
-    // MARK: - 外观（2.7.5 已并入「外观与通用」卡，这里只保留取值逻辑）
 
     // MARK: - 版本信息（2026-10-19：版本号搬进系统页，方便核对装的是哪一版）
     // AppVersion 已提到文件作用域（MacConsoleApp.swift），侧边栏头部共用
@@ -216,6 +108,7 @@ struct MiscView: View {
                 Text("开关实时生效。点开图标弹出该传感器的详细读数（温度 / 占用 / 转速 / 寿命等）。")
                     .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
                     .padding(.top, 2)
+                    .cardNote()
             }
         }
     }
@@ -342,6 +235,7 @@ private struct MenuBarDiskPicker: View {
                 Text("切换浅色 / 深色界面；「随系统」跟随 macOS 的外观设置自动切换。")
                     .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
                     .fixedSize(horizontal: false, vertical: true)
+                    .cardNote()
 
                 Divider().overlay(Theme.line)
 
@@ -351,17 +245,22 @@ private struct MenuBarDiskPicker: View {
                             Text("开机自动启动").font(.system(size: 12.5, weight: .medium))
                             Text("登录后自动打开 Mac控制台（菜单栏常驻 + 硬件后台服务）")
                                 .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
+                                .cardNote()
                         }
                     }
                     .toggleStyle(.switch)
-                    .onChange(of: launchAtLogin) { _, on in
-                        setLaunchAtLogin(on)
+                    .onChange(of: launchAtLogin) { _, _ in
+                        applyAutostart()
                     }
+
                     if let note = launchNote {
                         Text(note).font(.system(size: 10.5)).foregroundStyle(Theme.amber)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     Text("与系统设置 → 通用 → 登录项 中的「Mac控制台」同步。")
                         .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .cardNote()
                 } else {
                     Text("开机自动启动需要 macOS 13 或更高版本。")
                         .font(.system(size: 11)).foregroundStyle(Theme.dim)
@@ -370,22 +269,25 @@ private struct MenuBarDiskPicker: View {
         }
     }
 
+    @available(macOS 13.0, *)
     private func refreshLaunchState() {
-        if #available(macOS 13.0, *) {
-            launchAtLogin = SMAppService.mainApp.status == .enabled
-        }
+        let mainOn = SMAppService.mainApp.status == .enabled
+        launchAtLogin = mainOn
     }
 
-    private func setLaunchAtLogin(_ on: Bool) {
+    /// 开机自启只走 mainApp 一条登录项（静默启动已删除，2.8.15）。
+    private func applyAutostart() {
         guard #available(macOS 13.0, *) else { return }
         do {
-            if on {
-                removeLegacyAutostart()  // 清掉旧版 LaunchAgent，避免双重自启
-                try SMAppService.mainApp.register()
+            removeLegacyAutostart()
+            let main = SMAppService.mainApp
+            if launchAtLogin {
+                if main.status != .enabled { try main.register() }
             } else {
-                try SMAppService.mainApp.unregister()
+                if main.status == .enabled { try main.unregister() }
             }
             launchNote = nil
+            ToastCenter.shared.show(launchAtLogin ? "已开启 · 开机自启" : "已关闭 · 开机自启")
         } catch {
             launchNote = "设置失败：\(error.localizedDescription)"
             refreshLaunchState()  // 回滚开关到真实状态

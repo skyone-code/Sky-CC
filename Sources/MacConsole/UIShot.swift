@@ -48,11 +48,14 @@ enum UIShot {
             ("02-性能", AnyView(page(MonitorView()))),
             ("03-控制", AnyView(page(ControlView()))),
             ("04-灯效", AnyView(page(RGBView()))),
-            ("05-设置", AnyView(page(MiscView()))),
+            ("05-实验性", AnyView(page(ExperimentalView()))),
+            ("06-设置", AnyView(page(MiscView()))),
         ]
 
         for (name, view) in items {
-            guard let img = snapshot(view, size: CGSize(width: 1180, height: 2100)),
+            // 2.8.6：改成主窗口的真实尺寸（1180×760）再留一点余量 ——
+            // 之前用 2100 高渲染，卡片会被撑成一整屏，看不出真实窗口里「有没有留空」。
+            guard let img = snapshot(view, size: CGSize(width: 1180, height: 800)),
                   let tiff = img.tiffRepresentation,
                   let rep = NSBitmapImageRep(data: tiff),
                   let png = rep.representation(using: .png, properties: [:]) else {

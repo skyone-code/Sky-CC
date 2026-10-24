@@ -15,4 +15,10 @@ final class EditLocks: ObservableObject {
     func lock(_ key: String, _ sec: Double = 2.6) {
         until[key] = Date().addingTimeInterval(sec)
     }
+
+    /// 立刻解锁：写操作被硬件拒绝时用，让下一次轮询马上把真实状态刷回来
+    /// （否则界面会拿着用户点错的值硬撑 2.6 秒，观感就是「点了没反应还不弹回去」）。
+    func unlock(_ key: String) {
+        until.removeValue(forKey: key)
+    }
 }

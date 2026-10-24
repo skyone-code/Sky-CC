@@ -4,7 +4,7 @@
 //
 //  对应 Python 版 python后端/hid.py。
 //
-//  用途：打开 ITE 8291 (0x048d:0xce00) 键盘灯控制器，收发 HID Feature /
+//  用途：打开 ITE 8291 (048d:6004/6006/600B/CE00) 键盘灯控制器，收发 HID Feature /
 //  Output 报告。该设备挂的是通用 AppleUserHIDDevice，没有被系统事件驱动
 //  独占，用户态可以直接 open + 写报告。
 //
@@ -94,7 +94,10 @@ enum NativeHID {
     private static let propKeys = ["VendorID", "ProductID", "Product", "Manufacturer",
                                    "PrimaryUsagePage", "PrimaryUsage", "MaxFeatureReportSize",
                                    "MaxOutputReportSize", "MaxInputReportSize",
-                                   "ReportDescriptor", "Transport", "LocationID", "Built-In"]
+                                   "ReportDescriptor", "Transport", "LocationID", "Built-In",
+                                   // 2.7.7：触控板锁定要靠它区分「VoodooInput 的虚拟设备」
+                                   // 与真实硬件（虚拟设备 serial = "Voodoo Magic Trackpad 2 Simulator"）
+                                   "SerialNumber"]
 
     /// 枚举 HID 设备，可按 VID/PID/UsagePage 过滤
     static func findDevices(vendorID: Int? = nil, productID: Int? = nil,

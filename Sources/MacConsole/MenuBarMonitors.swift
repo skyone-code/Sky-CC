@@ -49,13 +49,18 @@ enum MenuBarIconKind: String, CaseIterable, Identifiable {
     }
 
     /// SF Symbols（「系统」页开关行用；菜单栏里按 Stats 风格不放图标）
+    ///
+    /// ⚠ 2.8.8 修 bug：原来网络用的是 `arrow.down.arrow.up`，这个符号名在
+    /// SF Symbols 里**不存在**（正确的是 `arrow.up.arrow.down`），
+    /// `Image(systemName:)` 拿不到图就直接留白 —— 用户看到的就是
+    /// 「网络前面没有图标」。改名字前先用 NSImage(systemSymbolName:) 验一遍。
     var symbol: String {
         switch self {
         case .cpu: return "cpu"
         case .mem: return "memorychip"
         case .gpu: return "bolt.horizontal.fill"
         case .disk: return "internaldrive"
-        case .net: return "arrow.down.arrow.up"
+        case .net: return "arrow.up.arrow.down"
         }
     }
 
@@ -219,7 +224,7 @@ final class MenuBarMonitors: NSObject {
         NotificationCenter.default.addObserver(
             forName: UserDefaults.didChangeNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.syncEnabledStates() }
+            Task { @MainActor in self?.rebuild() }
         }
         MetricsHub.shared.start()
     }
@@ -231,15 +236,6 @@ final class MenuBarMonitors: NSObject {
             let has = items[kind] != nil
             if want && !has { createItem(kind) }
             if !want && has { removeItem(kind) }
-        }
-    }
-
-    /// 只同步启停（UserDefaults.didChange 高频触发，避免整排重建闪动）
-    private func syncEnabledStates() {
-        for kind in MenuBarIconKind.allCases {
-            let want = UserDefaults.standard.bool(forKey: kind.defaultsKey)
-            if want && items[kind] == nil { createItem(kind) }
-            if !want && items[kind] != nil { removeItem(kind) }
         }
     }
 

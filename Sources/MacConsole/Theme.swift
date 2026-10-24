@@ -7,13 +7,48 @@ import AppKit
 /// 之前只有侧边栏会随系统变色、内容区不变，就是这里全部写死浅色的缘故。
 /// 用户可在「系统 → 外观」强制浅色/深色/随系统（UserDefaults "appearance"）。
 /// 注意：键盘灯效页有「白色」颜色选项，所有色块/色板必须带描边，白底上才看得见。
+// MARK: - 卡片说明文字的全局开关（2.8.9）
+//
+// 用户要求：除「实验性」页以外，所有页面的**卡片标题后缀、分组说明、开关副标题、
+// 底部小字注释**一律隐藏（代码保留，不删）。
+// 默认 true = 隐藏；ExperimentalView 里 `.environment(\.hideCardSubs, false)` 单独放行。
+private struct HideCardSubsKey: EnvironmentKey {
+    static let defaultValue = true
+}
+
+extension EnvironmentValues {
+    var hideCardSubs: Bool {
+        get { self[HideCardSubsKey.self] }
+        set { self[HideCardSubsKey.self] = newValue }
+    }
+}
+
+/// 卡片说明文字的通用开关：`hideCardSubs = true`（默认）时整段不渲染。
+/// 用法：`Text("…").font(…).foregroundStyle(Theme.dim2).cardNote()`
+private struct CardNoteModifier: ViewModifier {
+    @Environment(\.hideCardSubs) private var hideCardSubs
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if hideCardSubs { EmptyView() } else { content }
+    }
+}
+
+extension View {
+    /// 2.8.9：把一段「说明文字」接到全局隐藏开关上（代码保留，只是不显示）
+    func cardNote() -> some View { modifier(CardNoteModifier()) }
+}
+
 enum Theme {
     // 底色系（浅色 / 深色）
-    static let bg = Theme.dyn(light: 0xf6f7f9, dark: 0x17191d)        // 页面底
-    static let panel = Theme.dyn(light: 0xffffff, dark: 0x22252a)     // 卡片
-    static let panel2 = Theme.dyn(light: 0xeef0f4, dark: 0x2c3037)    // 控件底 / 磁贴内
-    static let line = Theme.dyn(light: 0xe0e3e9, dark: 0x3a3f47)      // 描边
-    static let barBg = Theme.dyn(light: 0xe6e9ee, dark: 0x383d45)     // 进度条底
+    // 2.8.11（用户要求）：深色下页面底太黑，按系统设置（macOS 深色）的观感整体提亮：
+    //   页面底 ≈ 系统 windowBackground，卡片比底色略亮一档，控件再亮一档。
+    //   原来是 0x17191d / 0x22252a / 0x2c3037，确实压得太死。
+    static let bg = Theme.dyn(light: 0xf6f7f9, dark: 0x1e1f21)        // 页面底
+    static let panel = Theme.dyn(light: 0xffffff, dark: 0x2a2b2e)     // 卡片
+    static let panel2 = Theme.dyn(light: 0xeef0f4, dark: 0x34353a)    // 控件底 / 磁贴内
+    static let line = Theme.dyn(light: 0xe0e3e9, dark: 0x3e3f44)      // 描边
+    static let barBg = Theme.dyn(light: 0xe6e9ee, dark: 0x3a3b40)     // 进度条底
 
     // 文字系（灰阶；深色下整体提亮，不用纯白）
     static let txt = Theme.dyn(light: 0x2a2f37, dark: 0xe8eaef)       // 主文字
@@ -105,11 +140,23 @@ struct Card<Content: View>: View {
     var trailing: (() -> AnyView)? = nil
     @ViewBuilder var content: Content
 
+    /// 2.8.9：卡片标题里 " · " 之后都是我写给排障用的寄存器说明（如
+    /// 「散热模式 · EC 0X0751 / 0X07AB」）。默认整段隐藏，只留主标题；
+    /// 实验性页把环境值设成 false 就连后缀一起显示。
+    @Environment(\.hideCardSubs) private var hideCardSubs
+
+    private var displayTitle: String? {
+        guard let title else { return nil }
+        guard hideCardSubs else { return title }
+        let head = title.components(separatedBy: " · ").first ?? title
+        return head.trimmingCharacters(in: .whitespaces)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if let title {
+            if let t = displayTitle {
                 HStack {
-                    Text(title.uppercased())
+                    Text(t.uppercased())
                         .font(.system(size: 10.5, weight: .semibold))
                         .foregroundStyle(Theme.dim2)
                         .tracking(1.1)
@@ -123,56 +170,6 @@ struct Card<Content: View>: View {
             Spacer(minLength: 0)
         }
         .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.panel, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 13, style: .continuous)
-            .strokeBorder(Theme.line, lineWidth: 1))
-        .shadow(color: .black.opacity(0.05), radius: 6, y: 2)
-    }
-}
-
-/// 数值磁贴（大数字 + 单位 + 可选进度条）
-struct StatTile: View {
-    var label: String
-    var value: String
-    var unit: String = ""
-    var bar: Double? = nil       // 0...1
-    var barColor: Color = Theme.blue
-    var note: String? = nil
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(label.uppercased())
-                .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(Theme.dim2)
-                .tracking(0.8)
-            HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text(value)
-                    .font(.system(size: 26, weight: .semibold, design: .rounded))
-                    .monospacedDigit()
-                    .foregroundStyle(Theme.txt)
-                if !unit.isEmpty {
-                    Text(unit)
-                        .font(.system(size: 12))
-                        .foregroundStyle(Theme.dim)
-                }
-            }
-            if let bar {
-                GeometryReader { geo in
-                    ZStack(alignment: .leading) {
-                        RoundedRectangle(cornerRadius: 3.5).fill(Theme.barBg)
-                        RoundedRectangle(cornerRadius: 3.5)
-                            .fill(barColor)
-                            .frame(width: geo.size.width * min(max(bar, 0), 1))
-                    }
-                }
-                .frame(height: 7)
-            }
-            if let note {
-                Text(note).font(.system(size: 11)).foregroundStyle(Theme.dim2)
-            }
-        }
-        .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Theme.panel, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 13, style: .continuous)
@@ -283,6 +280,74 @@ struct PageHeader: View {
     }
 }
 
+// MARK: - kext 门控（2.8.12）
+//
+// 用户要求：所有「需要 TongfangFan.kext 才能调」的项，在没检测到 kext 时必须
+// **禁用置灰**，而不是整块消失或显示一行「需要 kext」把控件顶掉。
+// 做法：保留原控件（布局不跳），`.disabled(!ok)` 让 SwiftUI 环境里 isEnabled=false，
+// 子控件全部不吃点击，再压一层透明度当视觉提示；卡片里另配一行
+// `KextRequiredHint()`，把「为什么灰着」和「立即安装」一起说清楚。
+
+extension View {
+    /// 未加载时整块禁用 + 置灰
+    func kextGated(_ ok: Bool) -> some View {
+        self
+            .disabled(!ok)
+            .opacity(ok ? 1 : 0.42)
+    }
+}
+
+/// 「这一项需要 kext」提示条（带一键安装）
+struct KextRequiredHint: View {
+    @EnvironmentObject var backend: BackendService
+    /// 自定义说明（默认泛指这一块）
+    var text: String = "需要 TongfangFan.kext 才能调整"
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "lock.fill").font(.system(size: 10.5))
+            Text(text).font(.system(size: 11.5))
+            Spacer(minLength: 6)
+            if backend.kextInstalling {
+                ProgressView().scaleEffect(0.55).frame(width: 14, height: 14)
+                Text("安装中…").font(.system(size: 11))
+            } else {
+                KextInstallButton()
+            }
+        }
+        .foregroundStyle(Theme.dim)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(Theme.amber.opacity(0.10),
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .strokeBorder(Theme.amber.opacity(0.32), lineWidth: 1))
+    }
+}
+
+/// 通用「立即安装」按钮（kext 已内嵌在 app bundle，点了弹系统密码框）
+struct KextInstallButton: View {
+    @EnvironmentObject var backend: BackendService
+
+    var body: some View {
+        Button {
+            Task { await backend.installKextIfNeeded() }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "square.and.arrow.down").font(.system(size: 10.5, weight: .semibold))
+                Text("立即安装").font(.system(size: 12, weight: .semibold))
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 11)
+            .padding(.vertical, 5.5)
+            .background(Theme.amber, in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .disabled(backend.kextInstalling)
+        .help("把 app 自带的 TongfangFan.kext 装进 /Library/Extensions 并加载（需要管理员密码）")
+    }
+}
+
 /// kext 未装横幅
 struct KextBanner: View {
     @EnvironmentObject var backend: BackendService
@@ -295,35 +360,29 @@ struct KextBanner: View {
                 Text("散热内核扩展未加载")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(Theme.txt)
-                Text("风扇、性能模式、充电阈值、海岸灯等硬件功能暂不可用。点击右侧按钮自动安装（需要管理员密码）。")
+                Text(backend.kextInstalling
+                     ? "正在安装 TongfangFan.kext（请在系统弹窗里输入管理员密码）…"
+                     : "风扇、散热模式、功耗档、充电阈值、海岸灯等硬件功能暂不可用。kext 已内嵌在本 app 里，点右侧按钮一键安装。")
                     .font(.system(size: 11.5))
                     .foregroundStyle(Theme.dim)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let e = backend.lastError, !e.isEmpty, !backend.kextInstalling {
+                    Text("上次安装：\(e)")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(Theme.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             Spacer()
             if backend.kextInstalling {
                 ProgressView().scaleEffect(0.8)
             } else {
-                SecondaryButton(title: "自动安装", icon: "lock.shield", isActive: true) {
-                    Task { await backend.installKextIfNeeded() }
-                }
+                KextInstallButton()
             }
         }
         .padding(14)
         .background(Theme.amber.opacity(0.10), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
             .strokeBorder(Theme.amber.opacity(0.4), lineWidth: 1))
-    }
-}
-
-/// 不可用占位（kext 未装时的功能卡）
-struct UnavailableCard: View {
-    var title: String
-    var body: some View {
-        Card(title: title) {
-            HStack(spacing: 8) {
-                Image(systemName: "lock.fill").foregroundStyle(Theme.dim2)
-                Text("需要 TongfangFan.kext").font(.system(size: 12.5)).foregroundStyle(Theme.dim)
-            }
-        }
     }
 }

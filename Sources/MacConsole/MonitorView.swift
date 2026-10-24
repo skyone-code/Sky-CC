@@ -3,7 +3,11 @@ import SwiftUI
 // MARK: - 性能页（2.7.0 重写）
 //
 // 与「概览」页的分工：概览给一眼看全的即时值与曲线，这里给逐项深挖——
-// 每核占用、内存分项、双显卡、每块卷、每块盘 SMART、每路风扇、电池全字段、进程 Top。
+// 每核占用、内存分项、双显卡、每块卷、每块盘 SMART、每路风扇、电池全字段。
+//
+// 2.7.6（2026-10-22 用户要求）：删掉「进程 · CPU 占用 Top 10」卡片（连同 processRow）。
+// 数据仍在：store.processes 照旧由快照下发，AllDataView 的原始数据页里还能看到，
+// 只是性能页不再渲染这张卡。
 //
 // 数据全部来自 MonitorStore 的同一份 /api/snapshot（1 秒一次、一次 XPC 往返），
 // 页面本身不再发任何请求；曲线由 store.history 里的 90 点环形缓冲直接画。
@@ -34,14 +38,19 @@ struct MonitorView: View {
                         batteryCard.gridEqual()
                         sensorCard.gridEqual()
                     }
-                    GridRow {
-                        processCard.gridEqual().gridCellColumns(2)
-                    }
                 }
             }
             .padding(22)
         }
         .background(Theme.bg)
+        .onAppear {
+            // 2.8.15：本页显示实时转速 → 声明需求，helper 才按租约读 EC。
+            // 切走即收回，10 秒后 EC 读取归零。
+            store.demandLiveFan(true)
+        }
+        .onDisappear {
+            store.demandLiveFan(false)
+        }
     }
 
     // MARK: 页头
@@ -49,7 +58,7 @@ struct MonitorView: View {
     private var header: some View {
         PageHeader(
             title: "性能",
-            sub: "每 1 秒刷新 · 一次快照取全 · 风扇值跟随后台 2 秒采样",
+            sub: "每 1 秒刷新 · 一次快照取全 · 风扇转速随页面可见实时刷新",
             trailing: AnyView(
                 LiveBadge(connected: store.connected,
                           updatedAt: store.updatedAt,
@@ -260,7 +269,7 @@ struct MonitorView: View {
                     Text("\(tempPrefix)\(Fmt.celsius(temp))℃")
                         .font(.system(size: 12, weight: .semibold).monospacedDigit())
                         .foregroundStyle(store.tempColor(temp))
-                        .help(isDGPU ? "EC 0x044F 直读独显温度" : "核显与 CPU 同一封装，取封装传感器近似值")
+                        .help(isDGPU ? "NVAccel 上报的 GPU 核心温度（TSENS，PR #323）" : "核显与 CPU 同一封装，取封装传感器近似值")
                 }
             }
             HStack(spacing: 8) {
@@ -287,7 +296,7 @@ struct MonitorView: View {
             return "核显：IOAccelerator 的 Device Utilization %；独显：NVAccel RM 的 GPUMON perfmon（issue #324）。"
         }
         if store.dgpuAvailable {
-            return "核显：IOAccelerator 的 Device Utilization %。独显的 RM 通道已连通，但当前驱动把 util 恒填 0（金属满载实测仍为 0），因此显示「未上报」。"
+            return "核显：IOAccelerator 的 Device Utilization %。独显的 RM 通道已连通，但这次采样四个引擎（GR/FB/NVENC/NVDEC）全为 0，无法区分「真的空闲」与「驱动未上报」。"
         }
         return "核显：IOAccelerator 的 Device Utilization %。未找到 NVAccel 服务，独显利用率不可用。"
     }
@@ -317,10 +326,8 @@ struct MonitorView: View {
                 // 被用户否掉——现在环只当背景仪表，尺度回落到「跟正文同量级」。
                 HStack(spacing: 34) {
                     fanBig("CPU", rpm: BackendService.int(store.live, "rpm_cpu") ?? 0,
-                           pwm: BackendService.int(store.live, "pwm_cpu_pct") ?? 0,
                            temp: BackendService.int(store.live, "temp_cpu") ?? 0)
                     fanBig("独显", rpm: BackendService.int(store.live, "rpm_gpu") ?? 0,
-                           pwm: BackendService.int(store.live, "pwm_gpu_pct") ?? 0,
                            temp: BackendService.int(store.live, "temp_gpu") ?? 0)
                 }
                 .frame(maxWidth: .infinity)
@@ -334,17 +341,13 @@ struct MonitorView: View {
     /// 版面自上而下：风扇名（CPU / 独显）→ 大号 RPM 数字 → RPM 单位 →
     /// 底部一行小字「占空比 · 温度」。上一版把 % 做成 60pt 主数字、环铺满卡片，
     /// 视线全被环和百分比抓走，跟「风扇看的是转速」这件事相反。
-    private func fanBig(_ name: String, rpm: Int, pwm: Int, temp: Int) -> some View {
-        let color = pwm > 70 ? Theme.amber : Theme.cyan
+    /// 风扇环（2.8.15）：2.7.2 起环是「占空比」背景，现在 PWM 不再采集，
+    /// 环退回纯装饰底环，主角只有转速 + 温度。
+    private func fanBig(_ name: String, rpm: Int, temp: Int) -> some View {
         let side: CGFloat = 158
         let lw: CGFloat = 9.5
         return ZStack {
             Circle().stroke(Theme.barBg, lineWidth: lw)
-            Circle()
-                .trim(from: 0, to: CGFloat(min(max(pwm, 0), 100)) / 100)
-                .stroke(color, style: StrokeStyle(lineWidth: lw, lineCap: .round))
-                .rotationEffect(.degrees(-90))
-                .animation(.easeOut(duration: 0.4), value: pwm)
             VStack(spacing: 0) {
                 Text(name)
                     .font(.system(size: 10.5, weight: .semibold))
@@ -363,10 +366,6 @@ struct MonitorView: View {
                     .foregroundStyle(Theme.dim2)
                     .tracking(1.1)
                 HStack(spacing: 5) {
-                    Text("\(pwm)%")
-                        .font(.system(size: 10, weight: .medium).monospacedDigit())
-                        .foregroundStyle(Theme.dim)
-                    Circle().fill(Theme.dim2.opacity(0.5)).frame(width: 2.5, height: 2.5)
                     Text("\(temp)℃")
                         .font(.system(size: 10.5, weight: .semibold).monospacedDigit())
                         .foregroundStyle(store.tempColor(Double(temp)))
@@ -379,18 +378,31 @@ struct MonitorView: View {
     }
 
     private var fanModeText: String {
-        switch BackendService.int(store.fan, "modeindex") {
-        case 0x11: return "专业"
-        case 0x22: return "平衡"
-        case 0x33: return "省电"
-        default: break
-        }
+        // 2.7.10：两组分开显示 —— 功耗档（0x7AB 高半字节）+ 散热档（低半字节）。
+        // 以前只看 modeindex 三档，把散热档信息整个丢了。
+        let power: String? = {
+            switch BackendService.int(store.fan, "modeindex") {
+            case 0x11: return "高性能"
+            case 0x22: return "平衡"
+            case 0x33: return "节能"
+            default: return nil
+            }
+        }()
+        let thermal: String? = {
+            switch BackendService.int(store.fan, "thermal_level") {
+            case 1: return "散热性能"
+            case 2: return "散热标准"
+            case 3: return "散热安静"
+            default: return nil
+            }
+        }()
+        if let p = power { return thermal.map { "\(p) · \($0)" } ?? p }
         switch BackendService.string(store.fan, "actual") ?? "" {
-        case "normal": return "自动"
-        case "boost": return "基准·最大"
+        case "normal": return thermal ?? "交给 EC"
+        case "boost": return "基准模式"
         case "custom": return "手动"
         case "curve": return "曲线"
-        default: return "—"
+        default: return thermal ?? "—"
         }
     }
 
@@ -619,6 +631,21 @@ struct MonitorView: View {
 
     // MARK: - 电池
 
+    /// 循环次数是否真的读到了（0 既可能是「真 0 次」也可能是「平台没上报」）
+    private var cycleAvailable: Bool {
+        if let b = store.battery["cycle_count_available"] as? Bool { return b }
+        return (BackendService.int(store.battery, "cycle_count") ?? 0) > 0
+    }
+
+    /// 读得到就显示「次数 / 设计次数」，读不到就显示「— / 设计次数」，
+    /// 避免把「读不到」直接显示成「0」让人误以为电池是新的。
+    private var cycleValueText: String {
+        let c = BackendService.int(store.battery, "cycle_count") ?? 0
+        let design = BackendService.int(store.battery, "design_cycle_count") ?? 0
+        if cycleAvailable { return design > 0 ? "\(c) / \(design)" : "\(c)" }
+        return design > 0 ? "— / \(design)" : "—"
+    }
+
     private var batteryCard: some View {
         let pct = BackendService.double(store.battery, "percent") ?? 0
         let state = BackendService.string(store.battery, "state") ?? "—"
@@ -638,7 +665,7 @@ struct MonitorView: View {
                     TightRow(label: "功耗", value: Fmt.watts(BackendService.double(store.battery, "power_w")))
                     TightRow(label: "温度", value: String(format: "%.1f ℃",
                              BackendService.double(store.battery, "temperature_c") ?? 0))
-                    TightRow(label: "循环次数", value: "\(BackendService.int(store.battery, "cycle_count") ?? 0)")
+                    TightRow(label: "循环次数", value: cycleValueText)
                     TightRow(label: "健康度", value: health ?? "—",
                              color: (health ?? "").contains("Good") ? Theme.green : Theme.txt)
                     TightRow(label: "满容量", value: "\(BackendService.int(store.battery, "max_capacity") ?? 0) mAh")
@@ -646,6 +673,13 @@ struct MonitorView: View {
                         TightRow(label: "剩余时间", value: Fmt.minutes(m))
                     }
                 }
+            }
+            if !cycleAvailable {
+                Text("循环次数读不到：本机 ACPI 电池信息没有这个字段（SMC B0CT=0），EC 侧也只有充电阈值 0x07B9。"
+                     + "真实值存在电池的 SBS EEPROM，macOS 访问不到 —— 第三方程序（Stats）同样显示 0。")
+                    .font(.system(size: 9.5))
+                    .foregroundStyle(Theme.dim2)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -721,64 +755,6 @@ struct MonitorView: View {
                     }
                 }
             }
-        }
-    }
-
-    // MARK: - 进程
-
-    private var processCard: some View {
-        Card(title: "进程 · CPU 占用 Top 10",
-             trailing: { AnyView(Text("ps -Ao … -r").font(.system(size: 9.5).monospacedDigit()).foregroundStyle(Theme.dim2)) }) {
-            if store.processes.isEmpty {
-                HStack(spacing: 8) {
-                    Image(systemName: "checkmark.circle").foregroundStyle(Theme.green)
-                    Text("当前无高占用进程").font(.system(size: 12.5)).foregroundStyle(Theme.dim)
-                }
-            } else {
-                let top = Array(store.processes.prefix(10))
-                let maxCpu = max(top.compactMap { BackendService.double($0, "cpu") }.max() ?? 1, 1)
-                VStack(spacing: 0) {
-                    ForEach(Array(top.enumerated()), id: \.offset) { i, p in
-                        processRow(i, p, maxCpu)
-                    }
-                }
-            }
-        }
-    }
-
-    private func processRow(_ i: Int, _ p: [String: Any], _ maxCpu: Double) -> some View {
-        let cpu = BackendService.double(p, "cpu") ?? 0
-        let mem = BackendService.double(p, "mem") ?? 0
-        return HStack(spacing: 10) {
-            Text("\(i + 1)")
-                .font(.system(size: 10.5).monospacedDigit())
-                .foregroundStyle(Theme.dim2)
-                .frame(width: 18, alignment: .trailing)
-            Text(BackendService.string(p, "name") ?? "")
-                .font(.system(size: 12))
-                .foregroundStyle(Theme.txt)
-                .lineLimit(1)
-                .frame(width: 190, alignment: .leading)
-            MiniBar(value: cpu / maxCpu,
-                    color: cpu > 50 ? Theme.red : (cpu > 20 ? Theme.amber : Theme.blue),
-                    height: 6)
-            Text(String(format: "%.1f%%", cpu))
-                .font(.system(size: 11, weight: .medium).monospacedDigit())
-                .foregroundStyle(Theme.dim)
-                .frame(width: 52, alignment: .trailing)
-            Text(String(format: "%.1f%%", mem))
-                .font(.system(size: 10.5).monospacedDigit())
-                .foregroundStyle(Theme.dim2)
-                .frame(width: 48, alignment: .trailing)
-            Text(BackendService.string(p, "user") ?? "")
-                .font(.system(size: 10))
-                .foregroundStyle(Theme.dim2)
-                .frame(width: 46, alignment: .leading)
-                .lineLimit(1)
-        }
-        .padding(.vertical, 4)
-        .overlay(alignment: .bottom) {
-            Rectangle().fill(Theme.line.opacity(0.5)).frame(height: 0.5)
         }
     }
 

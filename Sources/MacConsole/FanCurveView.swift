@@ -365,6 +365,7 @@ struct FanCurveView: View {
             }
             Text("编辑只改本地草稿（自动保存防丢）；点「应用曲线」才写入 EC 并激活曲线模式。低于首点温度保持最低档，高于末点保持最高档；≥\(draft.failsafeTemp)°C 强制全速。")
                 .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
+                .cardNote()
         }
     }
 

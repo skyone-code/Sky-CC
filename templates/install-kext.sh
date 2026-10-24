@@ -8,24 +8,40 @@
 #
 # 特性：
 #   - 幂等：kext 已加载 → 直接退出；重复运行安全
-#   - 日志：/tmp/macconsole-kext-install.log
+#   - 日志：/tmp/macconsole-kext-install.log（同时保留 stdout，供 app 读取失败原因）
 #   - 非 root 调用时内部自动套 sudo（例如有人手动 bash 它）
 #
-# 与桌面版「安装散热控制.command」同一套命令，失败排查方式一致。
+# 2.8.12：kext 不再单独放 DMG，只有 app 内嵌这一份；app 里点「立即安装」调用本脚本。
 # ============================================================================
 set -u
 
-HERE="$(cd "$(dirname "$0")/.." && pwd)"     # Resources/
+HERE="$(cd "$(dirname "$0")/.." && pwd)"     # Resources/native
 KEXT_SRC="$HERE/TongfangFan.kext"
 KEXT_DST="/Library/Extensions/TongfangFan.kext"
 DAEMON_PLIST="/Library/LaunchDaemons/com.macconsole.TongfangFan.plist"
+# 2.8.15：开机加载器用我们自己的二进制，不再让守护直接 exec /usr/bin/kmutil
+# （那样「系统设置 → 登录项」里会显示成一条来路不明的 "kmutil"）。
+# 放 app 自己的支持库：/Library/PrivilegedHelperTools 与 /usr/local/bin 在本机
+# 被 SIP 挡住（root 都 EACCES），只有支持库可写。
+# 注意：本脚本以 root 运行，$HOME 是 /var/root，必须从控制台用户反查真实家目录。
+LOADER_SRC="$HERE/bin/Mac控制台散热扩展"
+CONSOLE_USER="$(stat -f %Su /dev/console 2>/dev/null)"
+USER_HOME=""
+if [[ -n "$CONSOLE_USER" && -d "/Users/$CONSOLE_USER" ]]; then
+  USER_HOME="/Users/$CONSOLE_USER"
+else
+  USER_HOME="${HOME:-/var/root}"
+fi
+LOADER_DST="$USER_HOME/Library/Application Support/MacConsole/bin/Mac控制台散热扩展"
 LOG="/tmp/macconsole-kext-install.log"
 
-exec >>"$LOG" 2>&1
+# 既写日志又把输出留给调用方（osascript 只回传 stdout，全导进日志的话
+# app 拿不到任何原因，只能报「未知」）
+exec > >(tee -a "$LOG") 2>&1
 echo "=== $(date '+%Y-%m-%d %H:%M:%S') install-kext 开始 (euid=$(id -u)) ==="
 
 if [[ ! -d "$KEXT_SRC" ]]; then
-  echo "✗ bundle 内找不到 kext：$KEXT_SRC"
+  echo "✗ app 内找不到 kext：$KEXT_SRC（安装包可能不完整，请重新拷贝 app）"
   exit 1
 fi
 
@@ -52,7 +68,39 @@ $SUDO chown -R root:wheel "$KEXT_DST"
 echo "→ 2/4 立即加载"
 $SUDO kmutil load -p "$KEXT_DST" 2>&1 | sed 's/^/    /'
 
-echo "→ 3/4 安装开机自动加载 LaunchDaemon"
+echo "→ 3/4 安装开机自动加载（LaunchDaemon + 自有加载器）"
+# 2.8.15：先把自己这一份加载器放到控制台的支持库，再让守护指向它。
+# 这样「登录项」里显示的是「Mac控制台散热扩展」而不是来路不明的 kmutil。
+#
+# 2.8.15 修正：原来这里 mkdir 的是 /Library/PrivilegedHelperTools，而拷贝目标是
+# 用户支持库 —— 新机器上那个目录还不存在，cp 静默失败后 DAEMON_PROG 指向不存在的
+# 路径，表现是「装完 kext 能跑，但重启后不再自动加载」。现在按目标父目录建。
+if [[ -x "$LOADER_SRC" ]]; then
+  $SUDO mkdir -p "$(dirname "$LOADER_DST")"
+  $SUDO cp "$LOADER_SRC" "$LOADER_DST" 2>/dev/null
+  $SUDO chown root:wheel "$LOADER_DST" 2>/dev/null
+  $SUDO chmod 755 "$LOADER_DST" 2>/dev/null
+fi
+
+if [[ -x "$LOADER_DST" ]]; then
+  echo "    加载器 → $LOADER_DST"
+  DAEMON_PROG="$LOADER_DST"
+  DAEMON_ARGS=""
+  # 加载器放在用户 home 里：FileVault 开启时开机阶段 home 未解锁，守护读不到它。
+  if fdesetup status 2>/dev/null | grep -q "FileVault is On"; then
+    echo "    ⚠️ 检测到 FileVault 已开启：开机时 home 未解锁，kext 可能不会自动加载。"
+    echo "       如遇重启后散热失效，请关闭 FileVault 或在控制台里重新点「立即安装」。"
+  fi
+else
+  # 兜底：加载器缺失/拷贝失败时退回 kmutil（功能正常，只是登录项里显示 kmutil）
+  echo "    ⚠️ 加载器不可用（缺失或拷贝失败），退回 kmutil 方式"
+  DAEMON_PROG="/usr/bin/kmutil"
+  DAEMON_ARGS="<string>load</string><string>-p</string><string>$KEXT_DST</string>"
+fi
+
+# 先卸掉旧守护，避免 label 冲突导致新 ProgramArguments 不生效
+$SUDO launchctl bootout "system/com.macconsole.TongfangFan" 2>/dev/null || true
+
 $SUDO tee "$DAEMON_PLIST" >/dev/null <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -62,10 +110,8 @@ $SUDO tee "$DAEMON_PLIST" >/dev/null <<PLIST
 	<string>com.macconsole.TongfangFan</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/usr/bin/kmutil</string>
-		<string>load</string>
-		<string>-p</string>
-		<string>$KEXT_DST</string>
+		<string>$DAEMON_PROG</string>
+		$DAEMON_ARGS
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
@@ -78,6 +124,7 @@ $SUDO tee "$DAEMON_PLIST" >/dev/null <<PLIST
 PLIST
 $SUDO chown root:wheel "$DAEMON_PLIST"
 $SUDO chmod 644 "$DAEMON_PLIST"
+$SUDO launchctl bootstrap system "$DAEMON_PLIST" 2>/dev/null || true
 
 echo "→ 4/4 验证"
 sleep 1

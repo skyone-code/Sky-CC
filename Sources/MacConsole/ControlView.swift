@@ -1,281 +1,348 @@
 import SwiftUI
+import AppKit
 
-/// 控制页：散热模式 / 手动档位 / 性能模式 / 充电阈值 / 海岸灯 / 屏幕亮度 / 音量 / 防休眠
+/// 控制页：散热模式 / 系统功耗设置 / 系统调整 / 充电阈值 / 防休眠
+///
+/// 【术语映射（用户明确指定，别改）】
+///   · 本页「散热模式」= 原厂 Windows 控制台的「散热模式」（EC 0x7AB 低半字节，性能/标准/安静）
+///   · 本页「系统功耗设置」= 原厂同名项（EC 0x7AB 高半字节，高性能/平衡/节能）
+///   · 本页「系统调整」= 原厂 FastSwitch 页那几个开关
+///
+/// 【2.8.3 用户要求】
+///   · 删掉「显示屏性能」（macOS 没有显示驱动通路，留着只是假开关）
+///   · 删掉屏幕亮度卡与输出音量卡（系统自带控件更顺手，本页不再重复）
+///   · 删掉「其他 EC 位 · 非原厂实验能力」整卡
+///   · 系统功耗三按钮去掉图标，只留文字
+///   · 海岸灯整卡搬到灯效页
+///   · 重新排版，卡片填满，不留大片空白
+///
+/// 【硬性约束：点进标签页只读不写】
+///   本页所有写硬件的动作必须由用户真实操作产生。程序化回读一律直接改 @State，
+///   绝不走 onChange —— 否则「回读把 thermal 从 2 改成 1」会被当成用户点了
+///   「性能」，进页面就凭空写一次 EC。分段的 selection 全部换成自定义 Binding。
 struct ControlView: View {
     @EnvironmentObject var backend: BackendService
     @EnvironmentObject var store: MonitorStore
 
-    // 散热模式本地选择（与 EC 回读同步后更新）
-    @State private var fanMode: String = "normal"     // normal / boost / custom
-    @State private var fanLevel: Double = 0
-    @State private var perfIndex: Int = 0x11          // 0x11 / 0x22 / 0x33
+    // 散热模式：1 性能 / 2 标准 / 3 安静（EC 0x7AB 低半字节）
+    @State private var thermal: String = "2"
+    // 基准模式（EC 0x741 手动门 + 0x751=0x40）
+    @State private var benchmark = false
+    // 系统功耗设置：0x11 / 0x22 / 0x33（EC 0x7AB 高半字节）
+    @State private var perfIndex: Int = 0x11
+
     @State private var chargeThreshold: Double = 80
-    @State private var brightness: Double = 50
-    @State private var brightnessDebounce: Task<Void, Never>? = nil
-    @State private var volume: Double = 50
-    @State private var muted = false
     @State private var caffeinateOn = false
 
-    // 键盘 / 触控板 / 风扇行为（EC 0x074E / 0x07A4 / 0x07A6 / 0x07A3，qc71 交叉验证）
-    @State private var fnLock = false
-    @State private var fnLockSwitch = false
-    @State private var touchpadOn = true
-    @State private var overboostDynTemp = true
-    @State private var fanReducedDuty = false
-    @State private var fanAlwaysOn = false
+    // 系统调整（原厂 FastSwitch 页）
+    @State private var kbBacklight = true
+    @State private var winLock = false
+    @State private var osd = true
+    @State private var silentMode = false
+    @State private var passiveCoolingDisabled = false
 
-    // 海岸灯
-    @State private var lbMode: String = "cycle"       // cycle / static / off
-    @State private var lbColor: Color = .blue
+    // 交互锁：2.8.8 起界面以「软件记忆」为准，不再需要锁窗口防回读覆盖
 
-    @State private var toast: String?
-
-    // 交互锁：用户刚操作过的项，锁定期内不被 1s 轮询回读覆盖
-    // （否则点完「基准·最大」下一秒就被刷回「自动」，观感就是"跳回去"）
-    @StateObject private var locks = EditLocks()
-    @State private var lbColorDebounce: Task<Void, Never>?
+    /// 2.8.9：卡片说明/副标题默认隐藏（实验性页放行）
+    @Environment(\.hideCardSubs) private var hideCardSubs
 
     private var kextOK: Bool { backend.kextLoaded }
+    /// 快照读回来了没有 —— 没读回来之前不显示「标准 / 高性能」这类可能骗人的高亮
+    private var synced: Bool { !store.fan.isEmpty }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                if !kextOK { KextBanner() }
-                header
-                // 2.7.1 重排：原来是 8 张卡竖着堆三屏，找东西要滚。
-                // 2.7.5：散热模式与性能模式合并成一张（两者都是 EC 散热策略，本来就是一路设置），
-                //        海岸灯 / 休眠抑制上移补到原性能模式的位置，开关矩阵垫底。
-                Grid(horizontalSpacing: 14, verticalSpacing: 14) {
-                    GridRow {
-                        thermalCard.gridEqual()
+        // 2.8.8（用户要求）版式：
+        //   左列 = 散热模式 ／ 电池充电阈值（充电阈值挪到散热模式下方）
+        //   右列 = 系统调整（原「电源休眠抑制」并入这张卡，占原来充电阈值的位置）
+        // 两列都不加 maxHeight / 固定下限：卡片按内容自然高度排，靠右列的项目数
+        // 把两列拉到差不多高，卡片内部不留空洞。
+        GeometryReader { geo in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    if !kextOK { KextBanner() }
+                    header
+
+                    HStack(alignment: .top, spacing: 14) {
                         VStack(spacing: 14) {
+                            // 两张卡都按内容高度排（fixedSize），多余高度交给下面的
+                            // Spacer —— 否则 Card 内部的 Spacer 会把卡片撑到窗口底部，
+                            // 卡片里空出一整块，比留背景更难看。
+                            thermalCard
+                                .fixedSize(horizontal: false, vertical: true)
                             chargeCard
-                            brightnessCard
-                            volumeCard
+                                .fixedSize(horizontal: false, vertical: true)
+                            Spacer(minLength: 0)
                         }
-                        .gridEqual()
-                    }
-                    GridRow {
-                        lightbarCard.gridEqual()
-                        sleepCard.gridEqual()
-                    }
-                    GridRow {
-                        miscCard.gridEqual().gridCellColumns(2)
+                        .frame(maxWidth: .infinity, alignment: .top)
+
+                        systemCard
+                            .frame(width: 420)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
+                .padding(22)
+                .frame(minHeight: geo.size.height, alignment: .top)
             }
-            .padding(22)
         }
         .background(Theme.bg)
         .onAppear {
-            syncFromBackend()
-            syncVolume()
-            syncCaffeinate()
-            Task { await loadBrightness() }
+            // 2.8.15（用户要求）：进控制页**读一次**当前设置（只这一次，不轮询）。
+            // /api/fan/refresh 读模式组 + 开关组 + 充电阈值，不续转速采样租约。
+            // 读完把真值合进 store.fan，再 syncFromBackend 让 UI 对齐硬件真值。
+            Task {
+                if let fresh = try? await backend.getJSON("/api/fan/refresh") as? [String: Any],
+                   !fresh.isEmpty {
+                    var f = store.fan
+                    for k in ["live", "thermal_level", "power_level", "modeindex",
+                              "benchmark", "misc", "charge", "actual", "actual_level"] {
+                        if let v = fresh[k] { f[k] = v }
+                    }
+                    store.fan = f
+                }
+                syncFromBackend()
+                syncCaffeinateIfNeeded()
+            }
         }
         .onChange(of: store.updatedAt) { _, _ in
             syncFromBackend()
-            syncVolume()
-            syncCaffeinate()
         }
-        .overlay(alignment: .bottom) {
-            if let toast {
-                Text(toast)
-                    .font(.system(size: 12.5, weight: .medium))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 16).padding(.vertical, 9)
-                    .background(.black.opacity(0.75), in: Capsule())
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-                    .padding(.bottom, 20)
-            }
-        }
-        .animation(.easeOut(duration: 0.2), value: toast != nil)
+        .toastOverlay()
     }
 
     private var header: some View {
-        PageHeader(title: "控制", sub: "散热 / 性能模式 / 充电阈值 / 亮度 / 音量 · 所有开关以硬件真实回读为准")
+        PageHeader(title: "控制",
+                   sub: "散热模式 / 系统功耗设置 / 系统调整 / 充电阈值 · 所有开关以硬件真实回读为准",
+                   trailing: AnyView(
+                    HStack(spacing: 10) {
+                        if !synced {
+                            Text("读取中…").font(.system(size: 11)).foregroundStyle(Theme.dim2)
+                        } else {
+                            Text("\(thermalLabel) · \(powerLabel)\(benchmark ? " · 基准" : "")")
+                                .font(.system(size: 11.5))
+                                .foregroundStyle(Theme.dim)
+                                .padding(.horizontal, 9).padding(.vertical, 5)
+                                .background(Theme.panel, in: Capsule())
+                                .overlay(Capsule().strokeBorder(Theme.line, lineWidth: 1))
+                        }
+                    }))
     }
 
-    // MARK: - 从后端回读同步本地状态（用户红线：按钮高亮必须反映真实状态；
-    //        但用户刚操作过的项在锁定期内不被回读覆盖，否则"点完就跳回去"）
+    // MARK: - 从后端回读同步本地状态
+    //
+    // 2.8.8（用户要求）：**EC 只在启动初始化阶段读一次**，之后界面所有值都来自
+    // 软件记忆（UIControlPrefs），不再每轮跟硬件对账。
+    // 之前「点完 1 秒后被回读刷回去」的观感就是每轮读 EC 造成的；EC 里这些字节
+    // 本来就是持久项，软件自己留一份权威副本更稳。
     private func syncFromBackend() {
         guard !store.fan.isEmpty else { return }
-        let actual = BackendService.string(store.fan, "actual") ?? BackendService.string(store.fan, "mode") ?? "normal"
-        if !locks.locked("fanMode") {
-            // 优先用保存的模式（曲线模式下 EC 实际态是 custom，必须以保存态判定分段高亮）
-            let saved = BackendService.string(store.fan, "mode") ?? actual
-            let valid = ["normal", "boost", "custom", "curve"]
-            fanMode = valid.contains(saved) ? saved : "normal"
+        // 本次启动的第一次有效快照：EC → 记忆（只此一次）
+        UIControlPrefs.seedIfNeeded(store.fan)
+
+        // 2.8.11（用户要求）：**散热模式 / 系统功耗设置这两项不走记忆，直接读 EC**。
+        //   原厂逻辑是「动功耗 → 散热档跟着走；只动散热 → 功耗档不动」，
+        //   两组是同一个字节 0x7AB 的高低半字节，必须显示硬件真值才不会错位。
+        if let t = BackendService.int(store.fan, "thermal_level"), (1...3).contains(t) {
+            thermal = String(t)
         }
-        if !locks.locked("fanLevel") {
-            fanLevel = Double(BackendService.int(store.fan, "actual_level") ?? 0)
-        }
-        if !locks.locked("perf"),
-           let mi = BackendService.int(store.fan, "modeindex"), [0x11, 0x22, 0x33].contains(mi) {
+        if let mi = BackendService.int(store.fan, "modeindex"), [0x11, 0x22, 0x33].contains(mi) {
             perfIndex = mi
         }
-        if !locks.locked("charge"), let ch = BackendService.int(store.fan, "charge") {
-            chargeThreshold = Double(ch)
-        }
-        // 键盘/触控板/风扇行为：以 EC 回读为准（锁定期内不被轮询覆盖）
-        if let misc = store.fan["misc"] as? [String: Any] {
-            if !locks.locked("fnLock"), let v = BackendService.bool(misc, "fn_lock") { fnLock = v }
-            if !locks.locked("fnLockSwitch"), let v = BackendService.bool(misc, "fn_lock_switch") { fnLockSwitch = v }
-            if !locks.locked("touchpad"), let v = BackendService.bool(misc, "touchpad_off") { touchpadOn = !v }
-            if !locks.locked("overboost"), let v = BackendService.bool(misc, "overboost_dyn_temp_off") { overboostDynTemp = !v }
-            if !locks.locked("fanReducedDuty"), let v = BackendService.bool(misc, "fan_reduced_duty") { fanReducedDuty = v }
-            if !locks.locked("fanAlwaysOn"), let v = BackendService.bool(misc, "fan_always_on") { fanAlwaysOn = v }
-        }
-        if !locks.locked("lb"), store.lightbar["available"] as? Bool == true {
-            lbMode = BackendService.string(store.lightbar, "mode") ?? "cycle"
-            if let hex = BackendService.string(store.lightbar, "hex"), hex.count == 6 {
-                lbColor = Color(hex: UInt32(hex, radix: 16) ?? 0)
-            }
-        }
-    }
+        // 其余开关仍以记忆为准
+        if let b = UIControlPrefs.bool(UIControlPrefs.K.benchmark) { benchmark = b }
+        if let ch = UIControlPrefs.int(UIControlPrefs.K.charge) { chargeThreshold = Double(ch) }
+        if let v = UIControlPrefs.bool(UIControlPrefs.K.kbBacklight) { kbBacklight = v }
+        if let v = UIControlPrefs.bool(UIControlPrefs.K.winLock) { winLock = v }
+        if let v = UIControlPrefs.bool(UIControlPrefs.K.osd) { osd = v }
+        if let v = UIControlPrefs.bool(UIControlPrefs.K.silentMode) { silentMode = v }
+        if let v = UIControlPrefs.bool(UIControlPrefs.K.passiveCooling) { passiveCoolingDisabled = v }
+        if let v = UIControlPrefs.bool(UIControlPrefs.K.caffeinate) { caffeinateOn = v }
 
-    private func syncVolume() {
-        guard !store.volume.isEmpty else { return }
-        if !locks.locked("volume"), let v = BackendService.int(store.volume, "volume") {
-            volume = Double(v)
-        }
-        if !locks.locked("muted") {
-            muted = BackendService.bool(store.volume, "muted") ?? false
-        }
-    }
-
-    /// 屏幕亮度初值：读系统亮度（PWM 模式下原生链路即真相源），而不是写死 50%
-    private func loadBrightness() async {
-        let r = await backend.post("/api/control", ["action": "brightness_get"])
-        if let p = BackendService.double(r, "percent") {
-            brightness = min(max(p, 0), 100)
-            locks.lock("brightness")
+        // 2.8.11：本次启动的第一次对账 —— 除散热/功耗外，如果 EC 与记忆不一致，
+        // 就把记忆值写回 EC（让硬件回到用户上次的设置）。只跑一次。
+        for (key, value) in UIControlPrefs.mismatches(store.fan) {
+            Task { _ = await backend.post("/api/fan", [key: value]) }
         }
     }
 
     private func showToast(_ s: String) {
-        toast = s
-        Task {
-            try? await Task.sleep(nanoseconds: 2200_000_000)
-            if toast == s { toast = nil }
-        }
+        ToastCenter.shared.show(s)
     }
 
-    // MARK: - 散热模式（点击即切换，无「应用」按钮）
-    // MARK: - 散热与性能模式（2.7.5 合并）
+    // MARK: - 散热模式（= 原厂「散热模式」，EC 0x7AB 低半字节）
     //
-    // EC 0x0751（FAN_CTRL 档位）与 0x07AB（FAN_MODE_INDEX 性能模式）本来就是
-    // 同一套散热策略的两个旋钮——分开两张卡时，下面那张的三行说明还被用户嫌长。
-    // 现在一张卡从上到下：散热模式段选 →（手动档位 / 曲线）→ 当前实际态 →
-    // 分隔线 → 性能模式三钮，不再跟说明文字。
+    // 两者共用同一个字节 0x7AB：高半字节 = 功耗档，低半字节 = 散热档。
+    // 原厂点「系统功耗设置」是「功耗 + 散热两组一起写」，单独切散热时只有低半字节变。
     private var thermalCard: some View {
-        Card(title: "散热与性能模式 · EC 0x0751 / 0x07AB") {
-            if !kextOK {
-                Text("需要 TongfangFan.kext").font(.system(size: 12.5)).foregroundStyle(Theme.dim)
-            } else {
-                SegmentedPicker(
-                    options: [("normal", "自动"), ("boost", "基准 · 最大"), ("custom", "手动"), ("curve", "曲线")],
-                    selection: $fanMode)
-                    .onChange(of: fanMode) { _, m in
-                        locks.lock("fanMode")
-                        Task { await applyFanMode(m) }
-                    }
-                if fanMode == "custom" {
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack {
-                            Text("手动档位").font(.system(size: 12)).foregroundStyle(Theme.dim)
-                            Spacer()
-                            Text("L\(Int(fanLevel)) · \(Int(24 + fanLevel * 4.14))% 占空比")
-                                .font(.system(size: 12, weight: .medium).monospacedDigit())
+        Card(title: "散热模式 · EC 0x0751 / 0x07AB") {
+            // 2.8.12（用户要求）：kext 未检测到时**禁用置灰**，不再把控件整块换掉。
+            // 置灰靠 .kextGated（disabled 会传染给所有子控件），顶部给「立即安装」。
+            if !kextOK { KextRequiredHint() }
+
+            Group {
+                SegmentedPicker(options: [("1", "性能"), ("2", "标准"), ("3", "安静")],
+                                selection: thermalBinding)
+                    .disabled(benchmark)
+                    .opacity(benchmark ? 0.5 : 1)
+
+                // 2.8.8（用户要求）：「禁用被动散热模式」从「系统调整」搬到这个位置
+                // （原来放「启用基准模式」的地方）。它也是 BIOS 持久项，属于散热大类。
+                HStack(alignment: .top, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("禁用被动散热模式").font(.system(size: 13, weight: .medium))
+                        if !hideCardSubs {
+                            Text("EC 0x7A3 bit6，BIOS 持久设置项（三次实测双向确认）")
+                                .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
-                        Slider(value: $fanLevel, in: 0...7, step: 1)
-                            .tint(Theme.blue)
-                            .onChange(of: fanLevel) { _, v in
-                                locks.lock("fanLevel")
-                                Task { await applyLevel(Int(v)) }
-                            }
-                        Text("L0-L7 对应 24%→53% 占空比（FAN_CTRL = 0x80+档位，需先经 CTRL_1 手动门 EC 0x0741 bit0 开启手动权）；重启后按保存的状态自动恢复")
-                            .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
                     }
-                    .padding(.top, 4)
-                } else if fanMode == "curve" {
-                    FanCurveView()
-                        .padding(.top, 4)
+                    Spacer(minLength: 4)
+                    Toggle("", isOn: passiveCoolingBinding)
+                        .toggleStyle(.switch)
+                        .tint(Theme.blue)
+                        .labelsHidden()
                 }
-                Text("当前：\(modeLabel(BackendService.string(store.fan, "actual") ?? "—"))")
-                    .font(.system(size: 11.5)).foregroundStyle(Theme.dim2)
-                    .padding(.top, 4)
+                .disabled(benchmark)
+                .opacity(benchmark ? 0.45 : 1)
+                .padding(.top, 2)
 
-                Divider().overlay(Theme.line).padding(.top, 6)
+                Divider().overlay(Theme.line).padding(.top, 2)
 
-                GroupTitle(text: "性能模式", sub: "FAN_MODE_INDEX 0x11 / 0x22 / 0x33")
+                GroupTitle(text: "系统功耗设置", sub: "FAN_MODE_INDEX 0x11 / 0x22 / 0x33")
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 3),
                           spacing: 10) {
-                    // 平衡的图标不能用 scale.medium——该符号名在当前系统
-                    // 不被识别，Image(systemName:) 静默渲染为空白，导致这个
-                    // 按钮少一行内容、与另两个大小不一（2026-10-17 用户截图发现）。
-                    // scale.3d 是同语义且各版本都存在的天秤符号。
-                    perfButton("专业", "0x11", "cpu", Theme.red)
-                    perfButton("平衡", "0x22", "scale.3d", Theme.blue)
-                    perfButton("省电", "0x33", "leaf", Theme.green)
+                    perfButton("高性能", 0x11, Theme.red)
+                    perfButton("平衡", 0x22, Theme.blue)
+                    perfButton("节能", 0x33, Theme.green)
+                }
+                .disabled(benchmark)
+                .opacity(benchmark ? 0.5 : 1)
+
+                // 2.8.8（用户要求）：「启用基准模式」挪到「系统功耗设置」下方。
+                // 基准模式是顶层覆盖态：原厂此时把「散热模式」与「系统功耗设置」整组置灰。
+                // 放行会把 0x751 从 0x40 打回，增压失效但门还开着。
+                HStack(alignment: .top, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("启用基准模式").font(.system(size: 13, weight: .medium))
+                        if !hideCardSubs {
+                            Text("0x741 手动门 + 0x751=0x40，实测 5600 RPM；开启期间上面的散热档与功耗档会被接管")
+                                .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    Spacer(minLength: 4)
+                    Toggle("", isOn: benchmarkBinding)
+                        .toggleStyle(.switch)
+                        .tint(Theme.amber)
+                        .labelsHidden()
+                }
+                .padding(.top, 2)
+            }
+            .kextGated(kextOK)
+
+            Divider().overlay(Theme.line).padding(.top, 2)
+
+            // 2.8.8：手动档位 / 曲线 / ESC 功能键锁定 / EC 探针这些「非原厂能力」
+            // 已整体搬到「实验性」页，这里只留一个入口，免得抢原厂功能的视觉位置。
+            // 2.8.12：入口本身不需要 kext，所以不跟着置灰（否则 kext 没装时连「怎么装」都点不进去）。
+            HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("手动风扇 / 温控曲线 / EC 探针").font(.system(size: 12.5, weight: .medium))
+                    if !hideCardSubs {
+                        Text("原厂 UI 没有入口的能力，已移到「实验性」页")
+                            .font(.system(size: 11)).foregroundStyle(Theme.dim2)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                Spacer(minLength: 4)
+                SecondaryButton(title: "去实验性页", icon: "arrow.up.right", tint: Theme.amber) {
+                    NotificationCenter.default.post(name: .mcGotoPage, object: "experimental")
                 }
             }
         }
     }
 
-    private func modeLabel(_ m: String) -> String {
-        switch m {
-        case "normal": return "自动"
-        case "boost": return "基准·最大"
-        case "custom": return "手动 L\(Int(fanLevel))"
-        default: return m
+    // MARK: - 只读回读时绝不触发的 Binding（2.8.3）
+    private var thermalBinding: Binding<String> {
+        Binding(get: { thermal }, set: { v in
+            thermal = v
+            UIControlPrefs.set(UIControlPrefs.K.thermal, v)   // 先记软件记忆
+            Task { await applyThermal(Int(v) ?? 2) }
+        })
+    }
+
+    private var benchmarkBinding: Binding<Bool> {
+        Binding(get: { benchmark }, set: { v in
+            benchmark = v
+            UIControlPrefs.set(UIControlPrefs.K.benchmark, v)
+            Task { await applyBenchmark(v) }
+        })
+    }
+
+    /// 禁用被动散热（2.8.8 从「系统调整」搬进「散热模式」卡）
+    private var passiveCoolingBinding: Binding<Bool> {
+        Binding(get: { passiveCoolingDisabled }, set: { v in
+            passiveCoolingDisabled = v
+            UIControlPrefs.set(UIControlPrefs.K.passiveCooling, v)
+            Task { await applySystem("passive_cooling_disabled", v, "禁用被动散热") }
+        })
+    }
+
+    private var thermalLabel: String {
+        ["1": "散热 性能", "2": "散热 标准", "3": "散热 安静"][thermal] ?? "散热 —"
+    }
+
+    private var powerLabel: String {
+        switch perfIndex {
+        case 0x11: return "功耗 高性能"
+        case 0x22: return "功耗 平衡"
+        case 0x33: return "功耗 节能"
+        default: return "功耗 —"
         }
     }
 
-    private func applyFanMode(_ mode: String) async {
-        var body: [String: Any] = [:]
-        switch mode {
-        case "normal": body["mode"] = "normal"
-        case "boost": body["mode"] = "boost"
-        case "curve":
-            body["mode"] = "curve"
-            // 曲线配置以磁盘为唯一真相（helper 和应用两侧都是读它、写它），
-            // 不再从本进程的 FanCurveController 取 —— 那个控制器已搬进后台 helper。
-            let cfg = FanCurveStore.load() ?? .default
-            body["source"] = cfg.source
-            body["failsafe"] = cfg.failsafeTemp
-            body["points"] = cfg.points.map { ["temp": $0.temp, "level": $0.level] }
-        default: body["mode"] = "custom"; body["level"] = Int(fanLevel)
-        }
-        let r = await backend.post("/api/fan", body)
-        if r["ok"] as? Bool != true {
+    private func applyThermal(_ level: Int) async {
+        let r = await backend.post("/api/fan", ["thermal": level])
+        if r["ok"] as? Bool == true {
+            showToast("已切换到散热 \(["", "性能", "标准", "安静"][max(1, min(3, level))])")
+        } else {
             showToast("失败：\(BackendService.string(r, "error") ?? "未知")")
+            // 被基准模式拒了：把记忆与界面一起弹回上一个值，别让界面骗人
+            if let prev = BackendService.int(r, "thermal_level"), (1...3).contains(prev) {
+                UIControlPrefs.set(UIControlPrefs.K.thermal, String(prev))
+            }
+            syncFromBackend()
         }
-        // 广播给菜单栏：立即刷新散热模式显示（不等 1s 轮询）
         NotificationCenter.default.post(name: .macConsoleStateChanged, object: nil)
     }
 
-    private func applyLevel(_ lv: Int) async {
-        _ = await backend.post("/api/fan", ["mode": "custom", "level": lv])
+    private func applyBenchmark(_ on: Bool) async {
+        let r = await backend.post("/api/fan", ["benchmark": on])
+        if r["ok"] as? Bool == true {
+            showToast(on ? "基准模式已开启 · 5600 RPM" : "基准模式已关闭 · 回到 \(thermalLabel)")
+        } else {
+            showToast("失败：\(BackendService.string(r, "error") ?? "未知")")
+            UIControlPrefs.set(UIControlPrefs.K.benchmark, !on)
+            syncFromBackend()
+        }
+        NotificationCenter.default.post(name: .macConsoleStateChanged, object: nil)
     }
 
-    // MARK: - 性能模式三钮（2.7.5 起并入 thermalCard）
-    private func perfButton(_ title: String, _ code: String, _ icon: String, _ tint: Color) -> some View {
-        let active = perfIndex == Int(code.dropFirst(2), radix: 16)
+    // MARK: - 系统功耗设置三钮（高性能 / 平衡 / 节能，无图标，只有文字）
+    private func perfButton(_ title: String, _ code: Int, _ tint: Color) -> some View {
+        let active = perfIndex == code
+        let hex = String(format: "0x%02X", code)
         return Button {
-            let v = Int(code.dropFirst(2), radix: 16) ?? 0x11
-            locks.lock("perf")
-            perfIndex = v
-            Task { await applyPerf(v) }
+            perfIndex = code
+            UIControlPrefs.set(UIControlPrefs.K.perfIndex, code)
+            Task { await applyPerf(code) }
         } label: {
-            VStack(spacing: 6) {
-                Image(systemName: icon).font(.system(size: 17))
-                Text(title).font(.system(size: 13, weight: .semibold))
-                Text(code).font(.system(size: 9.5).monospacedDigit()).opacity(0.7)
+            VStack(spacing: 4) {
+                Text(title).font(.system(size: 13.5, weight: .semibold))
+                Text(hex).font(.system(size: 9.5).monospacedDigit()).opacity(0.65)
             }
             .foregroundStyle(active ? .white : Theme.dim)
             .frame(maxWidth: .infinity)
-            .padding(.vertical, 14)
+            .padding(.vertical, 16)
             .background(RoundedRectangle(cornerRadius: 11, style: .continuous)
                 .fill(active ? tint : Theme.panel2))
             .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous)
@@ -285,308 +352,230 @@ struct ControlView: View {
     }
 
     private func applyPerf(_ code: Int) async {
+        // 原厂这一下是「功耗 + 散热两组一起写」，不带 thermal_level 时
+        // helper 用该功耗档的默认散热档（高性能→性能 / 平衡→标准 / 节能→安静）。
         let r = await backend.post("/api/fan", ["modeindex": code])
         if r["ok"] as? Bool == true {
-            var msg = "已切换到\(["专业", "平衡", "省电"][[0x11, 0x22, 0x33].firstIndex(of: code) ?? 0])"
+            let names = [0x11: "高性能", 0x22: "平衡", 0x33: "节能"]
+            var msg = "已切换到\(names[code] ?? "")"
             if r["curve_stopped"] as? Bool == true { msg += "（已退出曲线模式）" }
             showToast(msg)
+            // 原厂这一下同时带散热档，记忆里的散热档也要跟着更新
+            if let t = BackendService.int(r, "thermal_level"), (1...3).contains(t) {
+                thermal = String(t)
+                UIControlPrefs.set(UIControlPrefs.K.thermal, String(t))
+            }
         } else {
             showToast("失败：\(BackendService.string(r, "error") ?? "未知")")
+            syncFromBackend()
         }
         NotificationCenter.default.post(name: .macConsoleStateChanged, object: nil)
     }
 
-    // MARK: - 键盘与风扇行为（EC 0x074E / 0x07A4 / 0x07A6 / 0x07A3）
-    private var miscCard: some View {
-        Card(title: "键盘与风扇行为") {
-            if !kextOK {
-                Text("需要 TongfangFan.kext").font(.system(size: 12.5)).foregroundStyle(Theme.dim)
-            } else {
-                VStack(alignment: .leading, spacing: 12) {
-                    MiscToggleRow(title: "Fn 锁", sub: "BIOS_CTRL_1 bit4（EC 0x074E）：开启后 F1-F12 直接触发功能键，无需按住 Fn",
-                                  on: $fnLock) {
-                        locks.lock("fnLock")
-                        Task { await applyMisc("fn_lock", fnLock) }
+    // MARK: - 系统调整（原厂 FastSwitch 页 + 电源休眠抑制，竖向单列）
+    //
+    //   发光灯效：键盘背光（0x7C4 bit6）/ 海岸灯（已移到灯效页）
+    //   显示屏　：显示屏电源（macOS 侧走 pmset displaysleepnow，不经 EC）
+    //   其他设置：Win 键锁定（0x767 bit0 → 0x768 bit0）、OSD 显示（0x7A4 bit3）
+    //   散热相关：安静模式（0x767 bit3 → 0x45B）
+    //   电源休眠：caffeinate（原「电源休眠抑制」整卡并入，2.8.8 用户要求）
+    private var systemCard: some View {
+        Card(title: "系统调整 · 原厂 FastSwitch 页") {
+            // 2.8.12：这张卡里只有「键盘背光 / Win 键锁定 / OSD / 安静模式」要 EC，
+            // 「显示屏电源」与「保持唤醒」是 macOS 本机能力 —— 所以按行门控，不整卡灰。
+            if !kextOK { KextRequiredHint(text: "灰着的几项需要 TongfangFan.kext") }
+            VStack(alignment: .leading, spacing: 11) {
+                    GroupTitle(text: "发光灯效", sub: "0x07C4 bit6")
+                    MiscToggleRow(title: "键盘背光",
+                                  sub: "开 = 重发一次灯效（只改亮度点不亮，X15 实测），关 = CTRL_OFF",
+                                  on: $kbBacklight) {
+                        Task { await applySystem("keyboard_backlight", kbBacklight, "键盘背光") }
                     }
-                    MiscToggleRow(title: "Fn+Esc 快捷键", sub: "AP_BIOS_BYTE bit3（EC 0x07A4）：允许用 Fn+Esc 组合键切换 Fn 锁",
-                                  on: $fnLockSwitch) {
-                        locks.lock("fnLockSwitch")
-                        Task { await applyMisc("fn_lock_switch", fnLockSwitch) }
+                    .kextGated(kextOK)
+                    HStack(spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("海岸灯").font(.system(size: 13, weight: .medium))
+                            if !hideCardSubs {
+                                Text("轮换 / 固定色 / 总开关都在「灯效」页")
+                                    .font(.system(size: 11)).foregroundStyle(Theme.dim2)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                        Spacer(minLength: 4)
+                        SecondaryButton(title: "去灯效页", icon: "arrow.up.right", tint: Theme.purple) {
+                            NotificationCenter.default.post(name: .mcGotoPage, object: "lighting")
+                        }
                     }
-                    MiscToggleRow(title: "触控板", sub: "CTRL_4 bit6（EC 0x07A6）：关闭 = 禁用触控板",
-                                  on: $touchpadOn) {
-                        locks.lock("touchpad")
-                        Task { await applyMisc("touchpad", touchpadOn) }
+
+                    Divider().overlay(Theme.line)
+
+                    GroupTitle(text: "显示屏", sub: "不经 EC")
+                    HStack(spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("显示屏电源").font(.system(size: 13, weight: .medium))
+                            if !hideCardSubs {
+                                Text("单击关闭内屏，动鼠标或按任意键恢复")
+                                    .font(.system(size: 11)).foregroundStyle(Theme.dim2)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                        Spacer(minLength: 4)
+                        SecondaryButton(title: "关屏", icon: "moon.zzz", tint: Theme.purple) {
+                            Task { await displaySleep() }
+                        }
                     }
-                    MiscToggleRow(title: "超频动态温控", sub: "CTRL_4 bit1（EC 0x07A6）：关闭后超频不受动态温度限制",
-                                  on: $overboostDynTemp) {
-                        locks.lock("overboost")
-                        Task { await applyMisc("overboost_dyn_temp", overboostDynTemp) }
+
+                    Divider().overlay(Theme.line)
+
+                    GroupTitle(text: "其他设置", sub: "0x767 触发位 / 0x7A4 bit3")
+                    MiscToggleRow(title: "Win 键锁定",
+                                  sub: "0x767 bit0 触发 → 0x768 bit0 回读，状态 ~600ms 才跟上",
+                                  on: $winLock) {
+                        Task { await applySystem("win_lock", winLock, "Win 键锁定") }
                     }
-                    Divider()
-                    MiscToggleRow(title: "风扇降低占空比", sub: "BIOS_CTRL_3 bit5（EC 0x07A3）：降低占空比换取更安静",
-                                  on: $fanReducedDuty) {
-                        locks.lock("fanReducedDuty")
-                        Task { await applyMisc("fan_reduced_duty", fanReducedDuty) }
+                    .kextGated(kextOK)
+                    MiscToggleRow(title: "OSD 显示",
+                                  sub: "EC 0x7A4 bit3：关闭功能键的图片提示",
+                                  on: $osd) {
+                        Task { await applySystem("osd", osd, "OSD 显示") }
                     }
-                    MiscToggleRow(title: "风扇常转", sub: "BIOS_CTRL_3 bit6（EC 0x07A3）：低负载下风扇也不停转",
-                                  on: $fanAlwaysOn) {
-                        locks.lock("fanAlwaysOn")
-                        Task { await applyMisc("fan_always_on", fanAlwaysOn) }
+                    .kextGated(kextOK)
+
+                    Divider().overlay(Theme.line)
+
+                    GroupTitle(text: "散热相关", sub: "与「散热档 安静」是两回事")
+                    MiscToggleRow(title: "安静模式",
+                                  sub: "0x767 bit3 触发 → 0x45B 回读，降转速更安静",
+                                  on: $silentMode) {
+                        Task { await applySystem("silent_mode", silentMode, "安静模式") }
+                    }
+                    .kextGated(kextOK)
+
+                    Divider().overlay(Theme.line)
+
+                    // 2.8.8：原「电源休眠抑制」整卡并入本卡（用户要求），样式与其它开关一致
+                    GroupTitle(text: "电源休眠抑制", sub: "caffeinate")
+                    MiscToggleRow(title: "保持唤醒",
+                                  sub: "阻止显示器与系统休眠，长实验用",
+                                  on: caffeinateBinding) { }
+
+                    if !hideCardSubs {
+                        Text("开关即时生效；0x7A3 / 0x7A4 / 0x7A6 位很密，写位类操作全部走读-改-写 + 写后回读校验（EC 会丢第一笔）。")
+                            .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.top, 2)
                     }
                 }
-                Text("开关即时生效；读-改-写不影响同寄存器其他位。与 Windows 控制台同路径（qc71 开源驱动交叉验证）。重启后回硬件默认。")
-                    .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
-                    .padding(.top, 2)
-            }
         }
     }
 
-    private func applyMisc(_ key: String, _ value: Bool) async {
-        let r = await backend.post("/api/fan", [key: value])
-        if r["ok"] as? Bool != true {
-            showToast("失败：\(BackendService.string(r, "error") ?? "未知")")
+    private func applySystem(_ key: String, _ value: Bool, _ name: String) async {
+        // 先写软件记忆（界面立即以记忆为准），再写 EC
+        if let prefKey = UIControlPrefs.prefKey(forFanKey: key) {
+            UIControlPrefs.set(prefKey, value)
         }
-        // 广播给菜单栏：立即刷新（不等 1s 轮询）
+        let r = await backend.post("/api/fan", [key: value])
+        if r["ok"] as? Bool == true {
+            ToastCenter.shared.showSwitch(name, value)
+        } else {
+            showToast("失败：\(BackendService.string(r, "error") ?? "未知")")
+            // 硬件没认（触发位 toggle 语义下最容易翻反）→ 记忆回滚到相反值
+            if let prefKey = UIControlPrefs.prefKey(forFanKey: key) {
+                UIControlPrefs.set(prefKey, !value)
+            }
+            syncFromBackend()
+        }
         NotificationCenter.default.post(name: .macConsoleStateChanged, object: nil)
     }
 
-    // MARK: - 充电阈值
+    private func displaySleep() async {
+        let r = await backend.post("/api/control", ["action": "display_sleep"])
+        if r["ok"] as? Bool == true {
+            showToast("已关屏（动鼠标或按任意键恢复）")
+        } else {
+            showToast("关屏失败：\(BackendService.string(r, "error") ?? "未知")")
+        }
+    }
+
+    // MARK: - 充电阈值（2.8.8：挪到「散热模式」卡下方，横向排布更紧凑）
     private var chargeCard: some View {
         Card(title: "电池充电阈值 · BATT_CHARGE_CTRL · EC 0x07B9") {
-            if !kextOK {
-                Text("需要 TongfangFan.kext").font(.system(size: 12.5)).foregroundStyle(Theme.dim)
-            } else {
-                HStack {
-                    Text("充至").font(.system(size: 12.5)).foregroundStyle(Theme.dim)
-                    Text("\(Int(chargeThreshold))%")
-                        .font(.system(size: 20, weight: .semibold, design: .rounded)).monospacedDigit()
-                    Text("停止充电").font(.system(size: 12.5)).foregroundStyle(Theme.dim)
-                    Spacer()
+            if !kextOK { KextRequiredHint() }
+            Group {
+                HStack(spacing: 10) {
+                    HStack(spacing: 6) {
+                        Text("充至").font(.system(size: 12.5)).foregroundStyle(Theme.dim)
+                        Text("\(Int(chargeThreshold))%")
+                            .font(.system(size: 22, weight: .semibold, design: .rounded)).monospacedDigit()
+                        Text("停止").font(.system(size: 12.5)).foregroundStyle(Theme.dim)
+                    }
                     if let reached = BackendService.bool(store.fan, "charge_reached") {
                         Text(reached ? "已到达" : "充电中")
                             .font(.system(size: 11.5))
                             .foregroundStyle(reached ? Theme.amber : Theme.green)
                     }
+                    Spacer(minLength: 8)
+                    HStack(spacing: 6) {
+                        ForEach([60, 70, 80, 90, 100], id: \.self) { v in
+                            Button("\(v)%") {
+                                chargeThreshold = Double(v)
+                                Task { await applyCharge() }
+                            }
+                            .font(.system(size: 11.5, weight: Int(chargeThreshold) == v ? .semibold : .regular))
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+                    }
                 }
                 Slider(value: $chargeThreshold, in: 0...100, step: 5) { editing in
-                    if !editing {
-                        locks.lock("charge")
-                        Task { await applyCharge() }
-                    }
+                    if !editing { Task { await applyCharge() } }
                 }
                 .tint(Theme.green)
-                HStack(spacing: 8) {
-                    ForEach([60, 70, 80, 90, 100], id: \.self) { v in
-                        Button("\(v)%") {
-                            locks.lock("charge")
-                            chargeThreshold = Double(v)
-                            Task { await applyCharge() }
-                        }
-                        .font(.system(size: 11.5, weight: Int(chargeThreshold) == v ? .semibold : .regular))
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                    }
-                }
-                Text("BATT_CHARGE_CTRL bit0-6 = 截止百分比（0 = 100% 不限制），bit7 = 已到达自动停充")
-                    .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
             }
+            .kextGated(kextOK)
         }
     }
 
     private func applyCharge() async {
-        let r = await backend.post("/api/fan", ["charge": Int(chargeThreshold)])
+        let target = Int(chargeThreshold)
+        UIControlPrefs.set(UIControlPrefs.K.charge, target)
+        let r = await backend.post("/api/fan", ["charge": target])
         if r["ok"] as? Bool != true {
             showToast("失败：\(BackendService.string(r, "error") ?? "未知")")
+            syncFromBackend()
         }
     }
 
-    // MARK: - 海岸灯（点击即切换）
-    private var lightbarCard: some View {
-        Card(title: "海岸灯 · LIGHTBAR_CTRL · EC 0x0748-0x074B") {
-            if !kextOK || !(store.lightbar["available"] as? Bool ?? false) {
-                Text("需要 TongfangFan.kext").font(.system(size: 12.5)).foregroundStyle(Theme.dim)
-            } else {
-                SegmentedPicker(options: [("cycle", "多彩轮换"), ("static", "固定色"), ("off", "关闭")],
-                                selection: $lbMode)
-                    .onChange(of: lbMode) { _, m in
-                        locks.lock("lb")
-                        Task { await applyLightbar(m) }
-                    }
-                if lbMode == "static" {
-                    HStack {
-                        ColorPicker("颜色", selection: $lbColor, supportsOpacity: false)
-                            .onChange(of: lbColor) { _, _ in
-                                // 拖动取色会连续触发，防抖 200ms 只发最后一次
-                                lbColorDebounce?.cancel()
-                                lbColorDebounce = Task {
-                                    try? await Task.sleep(nanoseconds: 200_000_000)
-                                    locks.lock("lb")
-                                    await applyLightbar(nil)
-                                }
-                            }
-                        Spacer()
-                        Text(BackendService.string(store.lightbar, "hex")?.uppercased() ?? "")
-                            .font(.system(size: 12).monospacedDigit()).foregroundStyle(Theme.dim)
-                    }
-                }
-                Text("LIGHTBAR_CTRL bit2 = 关灯 / bit7 = 轮换动画，R/G/B = EC 0x0749-0x074B；多彩轮换 = EC 自动循环，固定色 = 常亮指定颜色（前端三值均已肉眼验证）")
-                    .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
-            }
-        }
+
+    private var caffeinateBinding: Binding<Bool> {
+        Binding(get: { caffeinateOn }, set: { v in
+            caffeinateOn = v
+            UIControlPrefs.set(UIControlPrefs.K.caffeinate, v)   // 先记软件记忆，再下发
+            Task { await applyCaffeinate(v) }
+        })
     }
 
-    private func applyLightbar(_ mode: String?) async {
-        let m = mode ?? lbMode
-        var body: [String: Any] = ["ctrl": m]
-        if m == "static" {
-            body["hex"] = lbColor.toHex()
-        } else {
-            body["hex"] = "000000"
+    /// 保持唤醒：**以软件记忆为准**（2.8.10）。只有记忆里还没有值时才去问一次
+    /// caffeinate 进程（首次启动），之后进页面不再探进程、更不读 EC。
+    private func syncCaffeinateIfNeeded() {
+        if let v = UIControlPrefs.bool(UIControlPrefs.K.caffeinate) {
+            caffeinateOn = v
+            return
         }
-        let r = await backend.post("/api/lightbar", body)
-        if r["ok"] as? Bool != true {
-            showToast("海岸灯失败：\(BackendService.string(r, "error") ?? "未知")")
-        }
-    }
-
-    // MARK: - 屏幕亮度（初值 = 硬件真实值；拖动即调）
-    private var brightnessCard: some View {
-        Card(title: "屏幕亮度 · 原生链路") {
-            HStack {
-                Image(systemName: "sun.min")
-                Text("亮度").font(.system(size: 12.5)).foregroundStyle(Theme.dim)
-                Spacer()
-                Text("\(Int(brightness))%")
-                    .font(.system(size: 15, weight: .semibold).monospacedDigit())
-            }
-            Slider(value: $brightness, in: 0...100, step: 1) { editing in
-                if editing {
-                    // 拖动中实时跟随（50ms 防抖），不再等松手（v2.3.3 用户要求）
-                    locks.lock("brightness")
-                    scheduleBrightnessApply()
-                } else {
-                    locks.lock("brightness")
-                    brightnessDebounce?.cancel()
-                    Task { await applyBrightness() }
-                }
-            }
-            .tint(Theme.amber)
-            HStack(spacing: 8) {
-                Button("10%") { setBrightness(10) }
-                Button("30%") { setBrightness(30) }
-                Button("50%") { setBrightness(50) }
-                Button("70%") { setBrightness(70) }
-                Button("100%") { setBrightness(100) }
-            }
-            .controlSize(.small)
-            Text("写入系统亮度，macOS 原生链路驱动面板（PWM 模式，自带原生渐变）；auxbright 守护保持模式，睡眠唤醒自动恢复。")
-                .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
-        }
-    }
-
-    private func setBrightness(_ v: Int) {
-        locks.lock("brightness")
-        brightness = Double(v)
-        Task { await applyBrightness() }
-    }
-
-    private func applyBrightness(broadcast: Bool = true) async {
-        let r = await backend.post("/api/control", ["action": "brightness", "value": Int(brightness)])
-        if r["ok"] as? Bool != true {
-            showToast("亮度失败：\(BackendService.string(r, "error") ?? "未知")")
-        }
-        // 广播给菜单栏：刷新其亮度显示（MenuBarExtra content 不会自动跟随）。
-        // 拖动中的连续下发不广播，避免 50ms 一次的全量刷新风暴
-        if broadcast {
-            NotificationCenter.default.post(name: .macConsoleStateChanged, object: nil)
-        }
-    }
-
-    /// 拖动中实时下发（50ms 防抖合并，避免每像素打一次后端）
-    private func scheduleBrightnessApply() {
-        brightnessDebounce?.cancel()
-        brightnessDebounce = Task {
-            try? await Task.sleep(nanoseconds: 50_000_000)
-            guard !Task.isCancelled else { return }
-            await applyBrightness(broadcast: false)
-        }
-    }
-
-    // MARK: - 音量
-    private var volumeCard: some View {
-        Card(title: "输出音量") {
-            HStack {
-                Image(systemName: muted ? "speaker.slash" : "speaker.wave.2")
-                Text("音量").font(.system(size: 12.5)).foregroundStyle(Theme.dim)
-                Spacer()
-                Text("\(Int(volume))%").font(.system(size: 15, weight: .semibold).monospacedDigit())
-            }
-            Slider(value: $volume, in: 0...100, step: 1) { editing in
-                if !editing {
-                    locks.lock("volume")
-                    Task { await applyVolume() }
-                }
-            }
-            .tint(Theme.purple)
-            HStack {
-                SecondaryButton(title: muted ? "取消静音" : "静音",
-                                icon: muted ? "speaker.wave.2" : "speaker.slash",
-                                isActive: muted) {
-                    locks.lock("muted")
-                    let target = !muted
-                    muted = target
-                    Task {
-                        let r = await backend.post("/api/control", ["action": target ? "mute" : "unmute"])
-                        if r["ok"] as? Bool != true {
-                            showToast("失败：\(BackendService.string(r, "error") ?? "未知")")
-                        }
-                    }
-                }
-                Spacer()
-            }
-        }
-    }
-
-    private func applyVolume() async {
-        _ = await backend.post("/api/control", ["action": "volume", "value": Int(volume)])
-    }
-
-    // MARK: - 防休眠
-    private var sleepCard: some View {
-        Card(title: "电源休眠抑制 · caffeinate") {
-            HStack {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("保持唤醒").font(.system(size: 13, weight: .medium))
-                    Text("阻止显示器与系统休眠，长实验用").font(.system(size: 11)).foregroundStyle(Theme.dim2)
-                }
-                Spacer()
-                Toggle("", isOn: Binding(
-                    get: { caffeinateOn },
-                    set: { v in
-                        locks.lock("caffeinate")
-                        caffeinateOn = v
-                        Task { await applyCaffeinate(v) }
-                    }))
-                .toggleStyle(.switch)
-                .tint(Theme.blue)
-                .labelsHidden()
-            }
-        }
-    }
-
-    /// caffeinate 真实运行状态（按钮高亮必须反映真实状态，不是上次点了什么）
-    private func syncCaffeinate() {
-        if locks.locked("caffeinate") { return }
         Task {
             let r = await backend.post("/api/control", ["action": "caffeinate"])
-            if let on = r["on"] as? Bool { caffeinateOn = on }
+            if let on = r["on"] as? Bool {
+                caffeinateOn = on
+                UIControlPrefs.set(UIControlPrefs.K.caffeinate, on)
+            }
         }
     }
 
     private func applyCaffeinate(_ on: Bool) async {
         let r = await backend.post("/api/control", ["action": "caffeinate", "on": on])
-        if r["ok"] as? Bool != true {
+        if r["ok"] as? Bool == true {
+            ToastCenter.shared.showSwitch("保持唤醒", on)
+        } else {
             showToast("失败：\(BackendService.string(r, "error") ?? "未知")")
         }
     }
@@ -598,14 +587,20 @@ private struct MiscToggleRow: View {
     let sub: String
     @Binding var on: Bool
     let action: () -> Void
+    /// 2.8.9：副标题默认隐藏（实验性页放行）
+    @Environment(\.hideCardSubs) private var hideCardSubs
 
     var body: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 3) {
+        HStack(alignment: .top, spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(.system(size: 13, weight: .medium))
-                Text(sub).font(.system(size: 11)).foregroundStyle(Theme.dim2)
+                // 副标题（寄存器说明）默认不显示；代码保留
+                if !hideCardSubs {
+                    Text(sub).font(.system(size: 11)).foregroundStyle(Theme.dim2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
-            Spacer()
+            Spacer(minLength: 4)
             Toggle("", isOn: Binding(
                 get: { on },
                 set: { v in on = v; action() }))

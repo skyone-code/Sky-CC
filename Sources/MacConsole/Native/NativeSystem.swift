@@ -985,6 +985,25 @@ enum NativeSystem {
         if let t = timeToEmpty { raw += "；剩余 \(t / 60):\(String(format: "%02d", t % 60))" }
         if let t = timeToFull { raw += "；充满需 \(t / 60):\(String(format: "%02d", t % 60))" }
 
+        // 循环次数：主路径就是 AppleSmartBattery 的 CycleCount（Stats 等第三方程序同源）。
+        // 只有该键「完全不存在」时才回退到 SMC 的 B0CT（VirtualSMC 的电池键），
+        // 这样在已有该键的机器上不会每次轮询都多开一个 AppleSMC 连接。
+        //
+        // 本机（OpenCore + VirtualSMC 1.3.8 + SMCBatteryManager 1.3.8）实测：
+        //   AppleSmartBattery.CycleCount = 0
+        //   BatteryData.CycleCount       = 0
+        //   SMC B0CT                     = 0（ui16，键存在）
+        //   IOReport Battery/BatteryCycleCount = 0
+        //   IOPS 电源描述里连 Cycle Count 这个键都没有（只有 DesignCycleCount=1000）
+        // 也就是说整条链路（ACPI 电池 → SMCBatteryManager → AppleSmartBattery → IOReport/IOPS）
+        // 都是 0：这台机器的 ACPI 电池信息里没有循环次数字段，EC 侧也没有对应寄存器
+        // （qc71 的 EC 只暴露 0x07B9 充电阈值）。真实值存在电池的 SBS EEPROM
+        // （SMBus 命令 0x17），macOS 无法访问。属于平台限制，不是读取代码的问题。
+        var cycleCountInt: Int? = (d["CycleCount"] as? NSNumber)?.intValue
+        if cycleCountInt == nil, let smc = try? SMC(), let v = smc.readValue("B0CT") {
+            cycleCountInt = Int(v)
+        }
+
         let temp = d["Temperature"]
         var out: [String: Any] = [
             "percent": percent as Any,
@@ -998,7 +1017,10 @@ enum NativeSystem {
             "voltage_mv": d["Voltage"] as Any,
             "amperage_ma": d["Amperage"] as Any,
             "temperature_c": (temp != nil && temp != 0) ? (Double(temp!) / 100 * 10).rounded() / 10 : NSNull(),
-            "cycle_count": d["CycleCount"] as Any,
+            "cycle_count": cycleCountInt ?? 0,
+            // 0 既可能是「真 0 次」也可能是「平台没上报」，用这个标志区分，
+            // 前端据此决定显示数字还是「—」+ 说明。
+            "cycle_count_available": (cycleCountInt ?? 0) > 0,
             "design_capacity": d["DesignCapacity"] as Any,
             "max_capacity": d["MaxCapacity"] as Any,
             "raw_max_capacity": d["AppleRawMaxCapacity"] as Any,

@@ -74,7 +74,6 @@ enum SmcError: Error {
 final class SMC {
     static let kernelIndexSMC: UInt32 = 2
     static let cmdReadBytes: UInt8 = 5
-    static let cmdReadIndex: UInt8 = 8
     static let cmdReadKeyInfo: UInt8 = 9
 
     private var connect: io_connect_t = 0

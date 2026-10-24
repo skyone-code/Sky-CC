@@ -7,6 +7,14 @@ import AppKit
 /// 必须显式通知（这是「菜单栏显示与实际不符」bug 的修复核心之一）。
 extension Notification.Name {
     static let macConsoleStateChanged = Notification.Name("MacConsoleStateChanged")
+    /// 请求把主窗口叫出来（后台静默启动时，用户双击 app 或点菜单栏「打开控制台」）
+    static let macConsoleShowMain = Notification.Name("MacConsoleShowMain")
+    /// 请求切到某个标签页（object 传 Page.rawValue）。
+    /// 2.8.3：控制页的「去灯效页」按钮（海岸灯搬去灯效页后留的入口）用它跳转。
+    static let mcGotoPage = Notification.Name("MacConsoleGotoPage")
+    /// **跨进程**：第二个实例被单实例锁挡住时，用它请已在运行的实例把主窗口叫出来。
+    /// 必须走 DistributedNotificationCenter（本地 NotificationCenter 出不了进程）。
+    static let mcShowMainFromOther = Notification.Name("MacConsoleShowMainFromOther")
 }
 
 /// Bundle 版本号（侧边栏头部与「系统 → 版本」卡共用）
@@ -18,20 +26,7 @@ enum AppVersion {
         (Bundle.main.infoDictionary?["CFBundleVersion"] as? String) ?? "—"
     }
     /// 硬件后端形态：2.5.0 起为进程内原生服务（无 Python 子进程）。
-    /// 保留探测逻辑是为了升级过渡——旧版随包有 python-version.txt。
-    static var backend: String {
-        let roots = [
-            Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/python").path,
-        ]
-        for r in roots {
-            let p = (r as NSString).appendingPathComponent("python-version.txt")
-            if let s = try? String(contentsOfFile: p, encoding: .utf8),
-               !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return "Python \(s.trimmingCharacters(in: .whitespacesAndNewlines))"
-            }
-        }
-        return "原生（进程内服务）"
-    }
+    static var backend: String { "原生（进程内服务）" }
 }
 
 /// 激活策略：Info.plist 里 LSUIElement=1（agent，默认无 Dock、无主菜单）。
@@ -41,9 +36,13 @@ enum AppVersion {
 enum AppPolicy {
     static func toRegular() {
         if NSApp.activationPolicy() != .regular { NSApp.setActivationPolicy(.regular) }
+        // 2.7.8：setActivationPolicy 会重新向 WindowServer 注册进程，把已挂上的
+        // Carbon 热键打掉 —— 每次改完策略必须重挂，否则触控板手势会静默失效
+        GestureHotkey.shared.reregister(reason: "toRegular")
     }
     static func toAccessory() {
         if NSApp.activationPolicy() != .accessory { NSApp.setActivationPolicy(.accessory) }
+        GestureHotkey.shared.reregister(reason: "toAccessory")
     }
     /// 主窗口判定：可见、不是面板、宽度够大（菜单栏面板只有 300 左右）
     static var noMainWindow: Bool {
@@ -54,9 +53,34 @@ enum AppPolicy {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // 卸载器用：注销后台 helper 的 LaunchAgent 注册（SMAppService 的注册
-        // 记录存在系统数据库里，光 bootout 或删 plist 是清不掉的）
+        // 卸载器用：一次清掉**全部** SMAppService 注册。
+        // 这些记录在系统的后台任务数据库里，光 bootout 进程、删 LaunchAgents 里的
+        // plist 都清不掉；不注销的话「系统设置 → 通用 → 登录项」会留下幽灵条目。
+        //   ① com.macconsole.helper     后台硬件守护（LaunchAgent）
+        //   ② com.macconsole.autostart  静默启动（LaunchAgent）
+        //   ③ mainApp                   旧「开机自启动」登录项（macOS 13+）
+        if CommandLine.arguments.contains("--unregister-all") {
+            var out: [String] = []
+            if #available(macOS 13.0, *) {
+                let helper = SMAppService.agent(plistName: mcHelperAgentPlist)
+                do { try helper.unregister(); out.append("helper=已注销") }
+                catch { out.append("helper=\(error.localizedDescription)") }
+
+                let auto = SMAppService.agent(plistName: "com.macconsole.autostart.plist")
+                do { try auto.unregister(); out.append("autostart=已注销") }
+                catch { out.append("autostart=\(error.localizedDescription)") }
+
+                do { try SMAppService.mainApp.unregister(); out.append("mainApp=已注销") }
+                catch { out.append("mainApp=\(error.localizedDescription)") }
+            } else {
+                out.append("macOS < 13，无 SMAppService 注册")
+            }
+            print("unregister-all: " + out.joined(separator: " | "))
+            exit(0)
+        }
+        // 卸载器用：只注销后台 helper 的 LaunchAgent 注册（保留兼容旧脚本）
         if CommandLine.arguments.contains("--unregister-helper") {
             let svc = SMAppService.agent(plistName: mcHelperAgentPlist)
             do {
@@ -69,11 +93,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // 开发用：--ui-shots <dir> 离屏渲染各页后退出（见 UIShot.swift）
         if UIShot.handleIfRequested() { return }
+        // 2.8.11：登录项自愈（避免开机拉起两个实例）
+        if #available(macOS 13.0, *) { AutostartHeal.run() }
         // v2.4.3：恢复用户选的外观（浅色/深色/随系统，默认随系统）
         AppAppearance.current.apply()
+        // 2.8.15：静默启动已删除，常规进入 regular 策略
         DispatchQueue.main.async { AppPolicy.toRegular() }
         // 菜单栏监控图标（AppKit 状态项，Stats 同款）：开关在「系统」页
         MenuBarMonitors.shared.start()
+        // 2.7.8：接管触控板左上角双击手势（固件合成 Ctrl+Cmd+F13，见 GestureHotkey.swift）
+        // 必须常驻后台也能生效 —— 所以放在 delegate 而不是某个页面的 onAppear 里
+        GestureHotkey.shared.start()
         // v2.5.x：服务随 app 启动即激活，不依赖主窗口弹出。
         // 否则开机自启（LSUIElement agent，主窗口不自动打开）后不点开界面，
         // helper 连接与菜单栏实时数据都不激活。start()/attach() 内部已幂等，
@@ -81,6 +111,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { @MainActor in
             await BackendService.shared.start()
             await BackendService.shared.checkKext()
+            // 2.8.12：kext 状态看门狗（未加载 2s / 已加载 20s）。用户装完 kext
+            // 不必重启 app，界面自己从「需要 TongfangFan.kext」变成可用。
+            BackendService.shared.startKextWatch()
             MonitorStore.shared.attach(BackendService.shared)
         }
         NotificationCenter.default.addObserver(
@@ -93,6 +126,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     /// 关窗口不退出（菜单栏继续常驻）
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    /// 静默启动时主窗口不存在，用户双击 app 图标 / 从 Dock 唤起要把窗口叫出来。
+    /// 真正建窗口的动作在 MenuBarLabel 里（它常驻，能拿到 openWindow 环境值）。
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            NotificationCenter.default.post(name: .macConsoleShowMain, object: nil)
+        }
+        return true
+    }
+}
+
+/// 登录项自愈（2.8.11）
+///
+/// 2.8.15：静默启动已删除，autostart agent 不再使用。
+/// 保留这段清理：老版本升级上来的机器可能还残留着 com.macconsole.autostart
+/// 这条登录项，一旦它 enabled 就注销，避免它按老逻辑拉起进程。
+enum AutostartHeal {
+    @available(macOS 13.0, *)
+    static func run() {
+        let agent = SMAppService.agent(plistName: "com.macconsole.autostart.plist")
+        if agent.status == .enabled {
+            try? agent.unregister()
+            print("[autostart] 已注销残留的静默启动登录项（2.8.15 起废弃）")
+        }
+    }
 }
 
 @main
@@ -106,22 +164,7 @@ struct MacConsoleApp: App {
     var body: some Scene {
         // 主窗口：关闭后 app 不退出，继续在菜单栏后台运行；
         // 重新打开走菜单栏图标的「打开控制台」（openWindow id: main）
-        WindowGroup(id: "main") {
-            RootView()
-                .environmentObject(backend)
-                .environmentObject(store)
-                .frame(minWidth: 1020, minHeight: 660)
-                .onAppear {
-                    Task { await backend.start() }
-                    Task { await backend.checkKext() }
-                    store.attach(backend)
-                    // 主窗口可见 → 切回 regular，菜单栏出现程序名/关闭/退出
-                    AppPolicy.toRegular()
-                    NSApp.activate(ignoringOtherApps: true)
-                }
-        }
-        .windowStyle(.titleBar)
-        .defaultSize(width: 1180, height: 760)
+        windowGroup
 
         // 菜单栏常驻图标：窗口关掉后控制台仍在后台运行，硬件状态实时可见
         MenuBarExtra {
@@ -138,34 +181,69 @@ struct MacConsoleApp: App {
         .menuBarExtraStyle(.window)
 
     }
+
+    // 主窗口场景。
+    private var windowGroup: some Scene {
+        WindowGroup(id: "main") {
+            RootView()
+                .environmentObject(backend)
+                .environmentObject(store)
+                .frame(minWidth: 1020, minHeight: 660)
+                .onAppear {
+                    Task { await backend.start() }
+                    Task { await backend.checkKext() }
+                    store.attach(backend)
+                    // 主窗口可见 → 切回 regular，菜单栏出现程序名/关闭/退出
+                    AppPolicy.toRegular()
+                    NSApp.activate(ignoringOtherApps: true)
+                }
+        }
+        .windowStyle(.titleBar)
+        .defaultSize(width: 1180, height: 760)
+    }
 }
 
 
 // MARK: - 菜单栏图标（风扇 + CPU 温度）
 struct MenuBarLabel: View {
     @EnvironmentObject var store: MonitorStore
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         // 2026-10-19：温度改由「系统」页开关控制的监控图标显示，这里只留状态图标
         Image(systemName: store.connected ? "fanblades.fill" : "fanblades")
             .accessibilityLabel(store.connected ? "Mac控制台 · 已连接" : "Mac控制台 · 连接中断")
+            // 静默启动时主窗口没被创建，双击 app 图标要靠这里把窗口叫出来。
+            // 放在菜单栏图标上是因为它常驻实例化，能拿到 openWindow 环境值。
+            .onReceive(NotificationCenter.default.publisher(for: .macConsoleShowMain)) { _ in
+                openWindow(id: "main")
+                AppPolicy.toRegular()
+                NSApp.activate(ignoringOtherApps: true)
+            }
+            // 2.8.4：第二个实例（比如两条登录项各拉起一个）抢锁失败时，
+            // 会在这里发一条跨进程通知，把已有实例的窗口叫出来 ——
+            // 用户看到的就是「点一下，窗口出来了」，而不是「双开」或「点了没反应」。
+            .onReceive(DistributedNotificationCenter.default().publisher(for: .mcShowMainFromOther)) { _ in
+                openWindow(id: "main")
+                AppPolicy.toRegular()
+                NSApp.activate(ignoringOtherApps: true)
+            }
     }
 }
 
 // MARK: - 菜单栏弹出面板（.window 风格）
 // 2026-10-19 v2.4.2 按用户要求重整：删掉 CPU温度/显卡温度/散热三格与亮度滑块，
 // 只保留两类——「散热模式」（补上「手动」档，手动时带 L0-L7 滑条）和
-// 「性能模式」（原「整机性能档」全局改名，三档按钮）。
+// 「系统功耗设置」（原「整机性能档」，三档按钮；2.7.10 按原厂 Windows 术语改名）。
 struct MenuBarView: View {
     @EnvironmentObject var backend: BackendService
     @EnvironmentObject var store: MonitorStore
     @Environment(\.openWindow) private var openWindow
 
-    @State private var fanMode: String = "normal"
-    @State private var fanLevel: Double = 0
+    // 2.7.10：与原厂术语对齐 —— 散热模式 1 性能 / 2 标准 / 3 安静，基准模式独立开关
+    @State private var thermal: String = "2"
+    @State private var benchmark = false
     @State private var perfIndex: Int = 0x11          // 0x11 / 0x22 / 0x33
-    /// 乐观更新截止时刻：用户点了控件后 4 秒内以本地选择为准（后端轮询有 1s 延迟）
-    @State private var overrideUntil: Date? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -181,40 +259,40 @@ struct MenuBarView: View {
                 .controlSize(.small)
             }
 
-            // 散热模式（v2.4.2：新增「手动」；手动时给 L0-L7 档位滑条）
+            // 散热模式（= 原厂「散热设置」：0x7AB 低半字节 1/2/3）
             VStack(alignment: .leading, spacing: 6) {
-                Text("散热模式")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                Picker("散热模式", selection: fanModeBinding) {
-                    Text("自动").tag("normal")
-                    Text("基准 · 最大").tag("boost")
-                    Text("手动").tag("custom")
-                    Text("曲线").tag("curve")
+                HStack {
+                    Text("散热模式")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    if benchmark {
+                        Text("基准中")
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundStyle(Theme.amber)
+                    }
+                }
+                Picker("散热模式", selection: thermalBinding) {
+                    Text("性能").tag("1")
+                    Text("标准").tag("2")
+                    Text("安静").tag("3")
                 }
                 .labelsHidden()
                 .pickerStyle(.segmented)
-                if currentFanMode == "custom" {
-                    HStack {
-                        Text("手动档位").font(.system(size: 11)).foregroundStyle(.secondary)
-                        Spacer()
-                        Text("L\(Int(fanLevel)) · \(Int(24 + fanLevel * 4.14))% 占空比")
-                            .font(.system(size: 11, weight: .medium).monospacedDigit())
-                    }
-                    Slider(value: $fanLevel, in: 0...7, step: 1) { editing in
-                        if !editing {
-                            overrideUntil = Date().addingTimeInterval(4)
-                            Task { await applyLevel(Int(fanLevel)) }
-                        }
-                    }
-                    .controlSize(.small)
+                .disabled(benchmark)
+                .opacity(benchmark ? 0.5 : 1)
+
+                Toggle(isOn: benchmarkBinding) {
+                    Text("基准模式").font(.system(size: 11))
                 }
+                .toggleStyle(.switch)
+                .controlSize(.mini)
             }
 
-            // 性能模式（v2.4.2 新增类目；原「整机性能档」改名，EC 0x07AB）
+            // 系统功耗设置（= 原厂同名卡片：0x7AB 高半字节 0x11/0x22/0x33）
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
-                    Text("性能模式")
+                    Text("系统功耗设置")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                     Spacer()
@@ -223,10 +301,12 @@ struct MenuBarView: View {
                         .foregroundStyle(.secondary)
                 }
                 HStack(spacing: 8) {
-                    perfButton("专业", 0x11, Theme.red)
+                    perfButton("高性能", 0x11, Theme.red)
                     perfButton("平衡", 0x22, Theme.blue)
-                    perfButton("省电", 0x33, Theme.green)
+                    perfButton("节能", 0x33, Theme.green)
                 }
+                .disabled(benchmark)
+                .opacity(benchmark ? 0.5 : 1)
             }
 
             Divider()
@@ -262,8 +342,8 @@ struct MenuBarView: View {
     private func perfButton(_ title: String, _ code: Int, _ tint: Color) -> some View {
         let active = perfIndex == code
         return Button {
-            overrideUntil = Date().addingTimeInterval(4)
             perfIndex = code
+            UIControlPrefs.set(UIControlPrefs.K.perfIndex, code)
             Task { await applyPerf(code) }
         } label: {
             VStack(spacing: 3) {
@@ -283,69 +363,70 @@ struct MenuBarView: View {
         .buttonStyle(.plain)
     }
 
-    private var currentFanMode: String {
-        if let until = overrideUntil, Date() < until { return fanMode }
-        let saved = BackendService.string(store.fan, "mode") ?? ""
-        if saved == "curve" { return "curve" }
-        let actual = BackendService.string(store.fan, "actual")
-            ?? saved
-        return (actual == "boost" || actual == "custom") ? actual : "normal"
+    /// 当前散热档（0x7AB 低半字节）。乐观更新窗口内以本地选择为准。
+    ///
+    /// 2.8.8：EC 只在启动时读一次，之后统一取软件记忆（UIControlPrefs），
+    /// 与主窗口控制页共用同一份，两个界面不会互相打架。
+    private var currentThermal: String {
+        if let t = UIControlPrefs.string(UIControlPrefs.K.thermal) { return t }
+        return thermal
     }
 
-    private var fanModeBinding: Binding<String> {
+    private var thermalBinding: Binding<String> {
         Binding(
-            get: { currentFanMode },
+            get: { currentThermal },
             set: { newValue in
-                fanMode = newValue
-                overrideUntil = Date().addingTimeInterval(4)
-                Task { await applyFanMode(newValue) }
+                thermal = newValue
+                UIControlPrefs.set(UIControlPrefs.K.thermal, newValue)
+                Task { await applyThermal(Int(newValue) ?? 2) }
             }
         )
     }
 
-    /// 当前性能模式名（EC 0x07AB 回读优先，绝不反映"上次点了什么"）
+    /// 基准模式（0x741 手动门）。软件记忆优先。
+    private var benchmarkBinding: Binding<Bool> {
+        Binding(
+            get: { UIControlPrefs.bool(UIControlPrefs.K.benchmark) ?? benchmark },
+            set: { v in
+                benchmark = v
+                UIControlPrefs.set(UIControlPrefs.K.benchmark, v)
+                Task { await applyBenchmark(v) }
+            }
+        )
+    }
+
+    /// 当前性能模式名（软件记忆优先，绝不反映"上次点了什么"以外的猜测）
     private var perfName: String {
-        if let until = overrideUntil, Date() < until { return perfLabel(perfIndex) }
-        if let mi = BackendService.int(store.fan, "modeindex"), [0x11, 0x22, 0x33].contains(mi) {
-            return perfLabel(mi)
-        }
+        if let mi = UIControlPrefs.int(UIControlPrefs.K.perfIndex) { return perfLabel(mi) }
         return perfLabel(perfIndex)
     }
 
     private func perfLabel(_ code: Int) -> String {
         switch code {
-        case 0x11: return "专业"
+        case 0x11: return "高性能"
         case 0x22: return "平衡"
-        case 0x33: return "省电"
+        case 0x33: return "节能"
         default: return "—"
         }
     }
 
     private func syncFromBackend() {
-        fanMode = currentFanMode
-        fanLevel = Double(BackendService.int(store.fan, "actual_level") ?? 0)
-        if let mi = BackendService.int(store.fan, "modeindex"), [0x11, 0x22, 0x33].contains(mi) {
+        // EC 只在启动时读一次 → 播种软件记忆；之后一律读记忆
+        UIControlPrefs.seedIfNeeded(store.fan)
+        if let t = UIControlPrefs.string(UIControlPrefs.K.thermal) { thermal = t }
+        if let mi = UIControlPrefs.int(UIControlPrefs.K.perfIndex), [0x11, 0x22, 0x33].contains(mi) {
             perfIndex = mi
         }
+        if let b = UIControlPrefs.bool(UIControlPrefs.K.benchmark) { benchmark = b }
     }
 
-    private func applyFanMode(_ m: String) async {
-        var body: [String: Any] = ["mode": m]
-        if m == "custom" { body["level"] = Int(fanLevel) }
-        if m == "curve" {
-            // 曲线配置以磁盘为唯一真相（helper 和应用两侧都是读它、写它），
-            // 不再从本进程的 FanCurveController 取 —— 那个控制器已搬进后台 helper。
-            let cfg = FanCurveStore.load() ?? .default
-            body["source"] = cfg.source
-            body["failsafe"] = cfg.failsafeTemp
-            body["points"] = cfg.points.map { ["temp": $0.temp, "level": $0.level] }
-        }
-        _ = await backend.post("/api/fan", body)
+    private func applyThermal(_ level: Int) async {
+        _ = await backend.post("/api/fan", ["thermal": level])
         NotificationCenter.default.post(name: .macConsoleStateChanged, object: nil)
     }
 
-    private func applyLevel(_ lv: Int) async {
-        _ = await backend.post("/api/fan", ["mode": "custom", "level": lv])
+    private func applyBenchmark(_ on: Bool) async {
+        _ = await backend.post("/api/fan", ["benchmark": on])
         NotificationCenter.default.post(name: .macConsoleStateChanged, object: nil)
     }
 
@@ -375,13 +456,13 @@ struct VisualEffectBackground: NSViewRepresentable {
 // 现在按「看」与「改」两分：
 //   监测 · 概览（身份 + 6 个关键指标 + 系统）
 //   监测 · 性能（每核 / 内存分项 / 双显卡 / 每卷 / SMART / 风扇 / 电池 / 进程）
-//   硬件 · 控制（散热模式、性能模式、充电阈值、亮度、音量、休眠——全部写 EC）
+//   硬件 · 控制（散热模式、系统功耗设置、系统调整、充电阈值、亮度、音量、休眠——全部写 EC）
 //   硬件 · 灯效（键盘 RGB、白平衡、灯效保存）
 //   系统 · 全部信息（原生采集的每个字段，排查用）
 //   系统 · 设置（外观、菜单栏图标、版本、能力边界）
 struct RootView: View {
     enum Page: String, CaseIterable, Identifiable {
-        case overview, performance, control, lighting, alldata, settings
+        case overview, performance, control, lighting, experimental, alldata, settings
         var id: String { rawValue }
 
         var title: String {
@@ -390,6 +471,7 @@ struct RootView: View {
             case .performance: return "性能"
             case .control: return "控制"
             case .lighting: return "灯效"
+            case .experimental: return "实验性"
             case .alldata: return "全部信息"
             case .settings: return "设置"
             }
@@ -398,8 +480,9 @@ struct RootView: View {
             switch self {
             case .overview: return "设备 · 关键指标 · 系统"
             case .performance: return "曲线 · 温度 · 风扇 · 磁盘"
-            case .control: return "散热 / 性能 / 充电 / 亮度"
-            case .lighting: return "键盘 RGB / 白平衡"
+            case .control: return "散热 / 功耗 / 系统调整 / 充电"
+            case .lighting: return "键盘 RGB / 逐键投影 / 海岸灯"
+            case .experimental: return "手动风扇 / 非常规通路 / EC 探针"
             case .alldata: return "原生采集的每个字段"
             case .settings: return "版本 / 外观 / 菜单栏"
             }
@@ -410,6 +493,7 @@ struct RootView: View {
             case .performance: return "waveform.path.ecg"
             case .control: return "slider.horizontal.3"
             case .lighting: return "keyboard"
+            case .experimental: return "flask"
             case .alldata: return "list.bullet.rectangle"
             case .settings: return "gearshape"
             }
@@ -420,6 +504,7 @@ struct RootView: View {
             case .performance: return Theme.cyan
             case .control: return Theme.amber
             case .lighting: return Theme.purple
+            case .experimental: return Theme.red
             case .alldata: return Theme.green
             case .settings: return Theme.dim
             }
@@ -428,7 +513,7 @@ struct RootView: View {
         var group: String {
             switch self {
             case .overview, .performance: return "监测"
-            case .control, .lighting: return "硬件"
+            case .control, .lighting, .experimental: return "硬件"
             case .alldata, .settings: return "系统"
             }
         }
@@ -475,6 +560,12 @@ struct RootView: View {
         } detail: {
             detailView
                 .navigationTitle(page.title)
+        }
+        // 跨页跳转（控制页「去灯效页」）
+        .onReceive(NotificationCenter.default.publisher(for: .mcGotoPage)) { note in
+            if let raw = note.object as? String, let p = Page(rawValue: raw) {
+                page = p
+            }
         }
     }
 
@@ -562,6 +653,7 @@ struct RootView: View {
         case .performance: MonitorView()
         case .control: ControlView()
         case .lighting: RGBView()
+        case .experimental: ExperimentalView()
         case .alldata: AllDataView()
         case .settings: MiscView()
         }

@@ -19,6 +19,11 @@ struct OverviewView: View {
     @State private var serial: String?
     @State private var dimms: [[String: String]] = []
 
+    /// 硬盘温度看哪一块盘（2.7.6）：空 = 自动（首块 NVMe），否则是 bsd 名（disk0 / disk1）
+    @AppStorage("mc.overview.diskTarget") private var diskTarget: String = ""
+    /// GPU 使用率看哪颗 GPU（2.7.6）：igpu = 核显（IOAccelerator），dgpu = 独显（NVAccel RM）
+    @AppStorage("mc.overview.gpuTarget") private var gpuTarget: String = "igpu"
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
@@ -151,26 +156,29 @@ struct OverviewView: View {
                     series: store.history["mem"] ?? [],
                     note: memLine)
             KPICard(label: "GPU 使用率",
-                    value: Fmt.tridiagonal(BackendService.double(store.overview, "gpu_usage")),
+                    value: Fmt.tridiagonal(gpuUsageValue),
                     unit: "%",
                     icon: "display",
                     tint: Theme.cyan,
-                    series: store.history["gpu"] ?? [],
-                    note: igpuName)
+                    series: gpuUsageSeries,
+                    note: gpuUsageNote,
+                    accessory: AnyView(gpuPicker))
+                .help(gpuUsageHelp)
             KPICard(label: "GPU 温度",
                     value: Fmt.celsius(store.gpuTemp > 0 ? store.gpuTemp : nil),
                     unit: "℃",
                     icon: "thermometer.high",
                     tint: store.tempColor(store.gpuTemp),
                     series: store.history["gpuTemp"] ?? [],
-                    note: dgpuName + " · EC 0x044F")
+                    note: dgpuName + " · NVAccel 核心温度")
             KPICard(label: "硬盘温度",
                     value: Fmt.celsius(store.diskTemp),
                     unit: "℃",
                     icon: "internaldrive",
                     tint: store.tempColor(store.diskTemp ?? 0),
                     series: store.history["diskTemp"] ?? [],
-                    note: diskTempNote)
+                    note: diskTempNote,
+                    accessory: AnyView(diskPicker))
         }
     }
 
@@ -340,7 +348,7 @@ struct OverviewView: View {
         return vrams.isEmpty ? nil : vrams.joined(separator: " + ")
     }
 
-    /// 独显（PCIe 那张）——EC 0x044F 的温度属于它
+    /// 独显（PCIe 那张）——GPU 温度卡片说的就是它（2.7.6 起温度来自 NVAccel，不再读 EC 0x044F）
     private var dgpuName: String {
         let d = store.gpus.first { (BackendService.string($0, "bus") ?? "") == "PCIe" }
         return BackendService.string(d ?? store.gpus.first, "name") ?? "GPU"
@@ -403,11 +411,106 @@ struct OverviewView: View {
 
     /// 硬盘温度口径必须写清楚：nvmetemp 只取第一块支持 SMART 的 NVMe
     private var diskTempNote: String {
+        let list = (BackendService.array(store.overview, "smart") as? [[String: Any]]) ?? []
+        if !diskTarget.isEmpty,
+           let d = list.first(where: { (BackendService.string($0, "bsd") ?? "") == diskTarget }) {
+            if BackendService.bool(d, "ok") != true {
+                return BackendService.string(d, "error") ?? "该盘 SMART 读取失败"
+            }
+            let model = BackendService.string(d, "model") ?? ""
+            return model.isEmpty ? diskTarget : "\(diskTarget) · \(model)"
+        }
         let d = BackendService.dict(store.overview, "disk_temp") ?? [:]
         if (d["ok"] as? Bool) != true {
             return BackendService.string(d, "error") ?? "读取中…"
         }
         return "NVMe SMART · 首块盘"
+    }
+
+    // MARK: - GPU 使用率（2.7.6：可选核显 / 独显）
+
+    /// 核显走 IOAccelerator 的 "Device Utilization %"；独显走 NVAccel RM 的 3D 引擎
+    /// （NV2080_CTRL_CMD_PERF_GET_GPUMON_PERFMON_UTIL_SAMPLES_V2，见 NativeNVAccel）。
+    private var gpuUsageValue: Double? {
+        if gpuTarget == "dgpu" {
+            guard store.dgpuAvailable, store.dgpuReported else { return nil }
+            return store.dgpuUtil
+        }
+        return BackendService.double(store.overview, "gpu_usage")
+    }
+
+    private var gpuUsageSeries: [Double] {
+        gpuTarget == "dgpu" ? (store.history["dgpu"] ?? []) : (store.history["gpu"] ?? [])
+    }
+
+    /// 这个百分比是「引擎占用率」，不是显存占用 —— 用户专门问过，写进 tooltip 里说明清楚。
+    private var gpuUsageHelp: String {
+        if gpuTarget == "dgpu" {
+            return "独显：NVAccel RM 的 GPUMON perfmon（NV2080_CTRL_CMD_PERF_GET_GPUMON_PERFMON_UTIL_SAMPLES_V2），"
+                 + "取 GR（3D 图形引擎）最近一次采样的忙碌时间占比。\n"
+                 + "不是显存占用率。固件 14.4 秒才采一次样，所以数值是跳变的。"
+        }
+        return "核显：IOAccelerator 的 Device Utilization %，GPU 渲染引擎的忙碌时间占比。\n"
+             + "不是显存占用率。显存占用看「显卡」卡片里的 显存 已用 / 总量。"
+    }
+
+    private var gpuUsageNote: String {
+        if gpuTarget == "dgpu" {
+            if !store.dgpuAvailable { return dgpuName + " · NVAccel 未就绪" }
+            return store.dgpuReported ? dgpuName + " · 3D 引擎"
+                                      : dgpuName + " · 驱动未上报利用率"
+        }
+        return igpuName
+    }
+
+    private var gpuPicker: some View {
+        Menu {
+            Button("核显 · \(igpuName)") { gpuTarget = "igpu" }
+            Button("独显 · \(dgpuName)") { gpuTarget = "dgpu" }
+        } label: {
+            HStack(spacing: 2) {
+                Text(gpuTarget == "dgpu" ? "独显" : "核显")
+                Image(systemName: "chevron.down").font(.system(size: 6.5, weight: .semibold))
+            }
+            .font(.system(size: 9.5, weight: .medium))
+            .foregroundStyle(Theme.dim)
+            .padding(.horizontal, 5).padding(.vertical, 2)
+            .background(Theme.barBg, in: Capsule())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+    }
+
+    /// 硬盘温度卡右上角的选盘菜单（2.7.6 用户要求：可以选择显示哪一块硬盘的温度）
+    private var diskPicker: some View {
+        let list = (BackendService.array(store.overview, "smart") as? [[String: Any]]) ?? []
+        return Menu {
+            Button("自动（首块盘）") { diskTarget = "" }
+            ForEach(Array(list.enumerated()), id: \.offset) { _, d in
+                let bsd = BackendService.string(d, "bsd") ?? ""
+                let model = BackendService.string(d, "model") ?? ""
+                let ok = BackendService.bool(d, "ok") == true
+                Button {
+                    diskTarget = bsd
+                } label: {
+                    Text("\(bsd) · \(model.isEmpty ? "未知型号" : model)\(ok ? "" : "（不可读）")")
+                }
+                .disabled(bsd.isEmpty)
+            }
+        } label: {
+            HStack(spacing: 2) {
+                Text(diskTarget.isEmpty ? "首块" : diskTarget)
+                Image(systemName: "chevron.down").font(.system(size: 6.5, weight: .semibold))
+            }
+            .font(.system(size: 9.5, weight: .medium))
+            .foregroundStyle(Theme.dim)
+            .padding(.horizontal, 5).padding(.vertical, 2)
+            .background(Theme.barBg, in: Capsule())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
     }
 
     // MARK: - 一次性探测（序列号 / 内存条）
@@ -509,5 +612,4 @@ enum MacModelInfo {
         "Macmini7,1":     ("Mac mini", "2014"),
     ]
     static func marketingName(_ model: String) -> String? { table[model]?.name }
-    static func year(_ model: String) -> String? { table[model]?.year }
 }

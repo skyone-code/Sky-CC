@@ -1,27 +1,31 @@
 //
 //  NativeRGB.swift
-//  Mac控制台 —— ITE 8291 (048d:ce00) 键盘灯控制器 · 原生移植
+//  Mac控制台 —— ITE 8291 键盘灯控制器 · 按 Windows 原厂复刻版重写
 //
-//  对应 Python 版 python后端/rgbkb.py。
+//  权威来源：GamingCenter.Replica（Windows 原厂逆向复刻）
+//    Core/Lighting/Ite8291.cs      —— 协议、固件码表、ColorIndex、行缓冲布局
+//    Core/Lighting/WkdColor.cs     —— 原厂颜色补偿（本目录 NativeWkdColor.swift）
+//    DefaultRGBKB.exe 反编译        —— Translate_ITE_EffectIndex / HID_Set_* 原文
 //
-//  协议逆向来源（三份证据互相印证）:
-//    1. OEM Control Center keyboard.dll 导出符号:
-//       HID_Get_FirmwareVersion_80H / HID_Set_Effect_Type_08H /
-//       HID_Set_Picture_12H / HID_Set_Color_14H / HID_Set_RowIndex_16H
-//    2. rodgomesc/avell-unofficial-control-center (rev 0.03，同为 048d:ce00)
-//       bmRequestType=0x21, bRequest=0x09, wValue=0x0300 → USB SET_REPORT
-//    3. kirainmoe/tongfang-macos issue #28 与 gitlab it829x-reversing
+//  报文（IOHIDDeviceSetReport 的 buffer **不含** ReportID，reportID 单独传 0）：
+//    0x08 SET_EFFECT      [0x08, ctrl, effect, speed, light, colorIndex, dir, save]
+//                          ctrl: 0x01=熄灯 0x02=应用
+//    0x09 SET_BRIGHTNESS  [0x09, 0x02, light]                亮度 0..50
+//    0x14 SET_PALETTE     [0x14, 0x00, slot, R, G, B, 0, 0]  slot 1..7
+//    0x16 SET_ROW_INDEX   [0x16, 0x00, row, 0, 0, 0, 0, 0]   选行后发 64 字节行数据
+//    0x80 GET_FW_VERSION / 0x88 GET_EFFECT
 //
-//  8 字节 Feature 报告结构:
-//    [0] 0x08 命令码  [1] 0x02 下发 / 0x01 熄灯
-//    [2] 效果码       [3] 速度 01-0A (1 最快)
-//    [4] 亮度 08/16/24/32  [5] 颜色码 01-08
-//    [6] 附加(部分效果需要) [7] 保存 00/01
+//  行数据（64 字节，去掉 ReportID 后）：
+//    [0] = 0，[1..21] = B，[22..42] = G，[43..63] = R
+//    ⚠ 旧实现按 [0..20]=B 排布，整行横向错一位 —— 本次按原厂 IL 修正。
 //
-//  颜色下发（rev 0.03 真实方式）:
-//    enable user mode -> 08 02 33 00 <亮度> 00 00 <保存>
-//    然后逐行: 16 00 <row> + 64 字节「分平面」行缓冲
-//              [0..20] 蓝 [21..41] 绿 [42..62] 红 [63] 填充
+//  颜色必须先过 WkdColor（原厂在组 0x14 报文之前就做）。本文件所有写颜色
+//  的入口统一过补偿，纯白因此是 255,50,170（Liteon）而不是 255,255,255。
+//
+//  灯效下发顺序（原厂 Set_ITE_Effect_Type_FwMode）：
+//    ① 先写 N 个调色板槽（0x14，每笔 Sleep(1)）
+//    ② 再发 0x08，color 字节 = ColorIndex（None 0 / Single 1 / Circular 8）
+//    ⚠ 绝不能把「颜色个数」当 color 发（发 7 会让芯片只认最后一个槽）。
 //
 
 import Foundation
@@ -31,23 +35,207 @@ import IOKit.hid
 // MARK: - 协议常量
 
 private let rgbVID = 0x048d
-private let rgbPID = 0xce00
+/// 原厂 PID 白名单（包内 `Ite8291.ProductIds`）：0x6004 / 0x6006 / 0x600B / 0xCE00。
+/// 本机（LAPQC71D）实测枚举出来的是 **0x6006**，只认 0xCE00 会直接「检测不到键盘」。
+private let rgbPIDs: [Int] = [0x6004, 0x6006, 0x600B, 0xCE00]
 
-private let brightnessMap: [Int: UInt8] = [1: 0x08, 2: 0x16, 3: 0x24, 4: 0x32]
+/// 亮度量程上限（芯片原始值，**不是百分比**）。
+///
+/// 两款键盘固件的量程不一样（包内 2026-10-23 X15 实测）：
+///   · QC71 原装键盘 固件 19.x → 0…50
+///   · X15 键盘      固件 22.x → 0…100（发 101+ 会被固件钳到 0x64）
+/// 写死 50 的后果：X15 上拖到最亮也只有一半。固件读不到时保守取 50。
+/// 版本响应 `[0x80, major, minor, buildHi, buildLo, …]`，major ≥ 20 判 X15。
+private var brightnessMaxCache: UInt8?
 
-private let programs: [String: UInt8] = [
-    "breathing": 0x02, "wave": 0x03, "random": 0x04, "reactive": 0x04,
-    "rainbow": 0x05, "ripple": 0x06, "reactiveripple": 0x07,
-    "marquee": 0x09, "raindrop": 0x0A, "aurora": 0x0E,
-    "reactiveaurora": 0x0E, "fireworks": 0x11,
-]
+private func brightnessMax() -> UInt8 {
+    if let v = brightnessMaxCache { return v }
+    var maxV: UInt8 = 50
+    if let kb = try? KeyboardRGB().open() {
+        let fw = kb.getFirmware()
+        kb.close()
+        if let bytes = fw["version_bytes"] as? [UInt8], let major = bytes.first {
+            maxV = major >= 20 ? 100 : 50
+        }
+    }
+    brightnessMaxCache = maxV
+    return maxV
+}
+
+/// 亮度百分比 0…100 → 0x08 / 0x09 报文的 light 字节（按固件量程等比换算）。
+///
+/// 2.8.3（用户要求）：界面上不再用 L1…L4 四档，改成 0…100 的滑条。
+/// 芯片量程仍是 0…50（QC71）/ 0…100（X15），换算后发原始值。
+private func rawFromPct(_ pct: Int) -> UInt8 {
+    let m = Int(brightnessMax())
+    let p = max(0, min(100, pct))
+    return UInt8(clamping: (p * m + 50) / 100)
+}
+
+/// 芯片原始值 → 百分比（回读用）。
+private func pctFromRaw(_ raw: UInt8) -> Int {
+    let m = max(1, Int(brightnessMax()))
+    return max(0, min(100, (Int(raw) * 100 + m / 2) / m))
+}
+
+/// 老存档迁移：2.8.2 及以前 profile 里存的是 1…4 等级，换算成 25 / 50 / 75 / 100。
+/// 新值本身可能是 1…100 的百分比，只有 ≤4 才当旧等级处理（1% 这种极端值不值得区分）。
+private func normalizePct(_ v: Int) -> Int {
+    v <= 4 ? v * 25 : max(0, min(100, v))
+}
 
 private let numRows = 6
 private let numCols = 21
 private let rowLen = 64
-private let planeBlue = 0
-private let planeGreen = numCols      // 21
-private let planeRed = 2 * numCols    // 42
+// 64 字节行缓冲（不含 ReportID）：[0]=0，B 从 1 起，G 从 22 起，R 从 43 起
+private let planeBlue = 1
+private let planeGreen = 1 + numCols     // 22
+private let planeRed = 1 + 2 * numCols   // 43
+
+// MARK: - 固件灯效码（原厂 Translate_ITE_EffectIndex 全表）
+
+enum KeyboardEffect: UInt8, CaseIterable {
+    case single    = 0x01   // 单色常亮 Static
+    case breathing = 0x02   // 呼吸
+    case wave      = 0x03   // 波浪
+    case reactive  = 0x04   // 按下响应
+    case rainbow   = 0x05   // 彩虹
+    case ripple    = 0x06   // 涟漪
+    case marquee   = 0x09   // 跑马灯
+    case raindrop  = 0x0A   // 雨滴
+    case stack     = 0x0C   // 堆叠
+    case impact    = 0x0D   // 冲击
+    case aurora    = 0x0E   // 极光
+    case neon      = 0x0F   // 霓虹
+    case spark     = 0x11   // 火花
+    case flash     = 0x12   // 闪烁
+    case mix       = 0x13   // 混合
+    case rippleO   = 0x16   // 扩散涟漪 RippleO
+    case music     = 0x22   // 音乐律动
+    case userMode  = 0x33   // 逐键自定义
+
+    var title: String {
+        switch self {
+        case .single: return "单色常亮"
+        case .breathing: return "呼吸"
+        case .wave: return "波浪"
+        case .reactive: return "按下响应"
+        case .rainbow: return "彩虹"
+        case .ripple: return "涟漪"
+        case .marquee: return "跑马灯"
+        case .raindrop: return "雨滴"
+        case .stack: return "堆叠"
+        case .impact: return "冲击"
+        case .aurora: return "极光"
+        case .neon: return "霓虹"
+        case .spark: return "火花"
+        case .flash: return "闪烁"
+        case .mix: return "混合"
+        case .rippleO: return "扩散涟漪"
+        case .music: return "音乐律动"
+        case .userMode: return "逐键自定义"
+        }
+    }
+}
+
+/// `0x08` 第 6 字节 —— 原厂 ColorIndex（颜色方案编号），合法值只有 0/1/8。
+enum ColorIndex: UInt8 {
+    case none = 0       // 不用色：彩虹 / 音乐 / 逐键
+    case single = 1     // 单色：只取调色板槽 1
+    case circular = 8   // 循环：按整排调色板跑动效
+}
+
+enum KeyboardCatalog {
+    /// 原厂 ME 变体在界面上真正提供的 15 个灯效（Flash/Mix/RippleO 只在 FourZone 提供）。
+    static let meEffects: [KeyboardEffect] = [
+        .single, .breathing, .wave, .reactive, .rainbow, .ripple, .raindrop,
+        .marquee, .aurora, .spark, .music, .userMode, .neon, .stack, .impact,
+    ]
+
+    /// 原厂 7 色默认调色板（ME 变体，寄存器模板逐字节核对）。
+    static let defaultPalette: [(Int, Int, Int)] = [
+        (255, 0, 0), (243, 152, 0), (255, 241, 0), (0, 255, 0),
+        (0, 0, 255), (0, 255, 255), (255, 0, 255),
+    ]
+
+    /// 这个灯效要用几个颜色（原厂 ColorBlock）。0/1/3/7。
+    static func colorCount(_ e: KeyboardEffect) -> Int {
+        switch e {
+        case .rainbow, .music, .userMode: return 0
+        case .single: return 1
+        case .stack, .impact: return 3
+        default: return 7
+        }
+    }
+
+    /// 这个灯效该往 `0x08` 的 color 字节写什么。
+    static func colorIndex(_ e: KeyboardEffect) -> ColorIndex {
+        switch colorCount(e) {
+        case 0: return .none
+        case 1: return .single
+        default: return .circular
+        }
+    }
+
+    static func supportsDirection(_ e: KeyboardEffect) -> Bool {
+        switch e {
+        case .wave, .marquee, .aurora: return true
+        default: return false
+        }
+    }
+
+    /// 名称 → 灯效（兼容旧版 API 的灯效名）。
+    static func effect(forName name: String) -> KeyboardEffect? {
+        switch name.lowercased() {
+        case "single", "static", "color", "mono": return .single
+        case "breathing", "breath": return .breathing
+        case "wave": return .wave
+        case "reactive": return .reactive
+        case "rainbow", "random": return .rainbow
+        case "ripple": return .ripple
+        case "marquee": return .marquee
+        case "raindrop": return .raindrop
+        case "stack": return .stack
+        case "impact": return .impact
+        case "aurora": return .aurora
+        case "neon": return .neon
+        case "spark", "fireworks": return .spark
+        case "flash": return .flash
+        case "mix": return .mix
+        case "rippleo", "diffuseripple": return .rippleO
+        case "music": return .music
+        case "usermode", "user": return .userMode
+        // 旧版命名不再对应原厂灯效，给最接近的
+        case "reactiveripple": return .ripple
+        case "reactiveaurora": return .aurora
+        default: return nil
+        }
+    }
+
+    /// 灯效 → 稳定 key（`effect(forName:)` 的反向，界面用）。
+    static func key(for e: KeyboardEffect) -> String {
+        switch e {
+        case .single: return "single"
+        case .breathing: return "breathing"
+        case .wave: return "wave"
+        case .reactive: return "reactive"
+        case .rainbow: return "rainbow"
+        case .ripple: return "ripple"
+        case .marquee: return "marquee"
+        case .raindrop: return "raindrop"
+        case .stack: return "stack"
+        case .impact: return "impact"
+        case .aurora: return "aurora"
+        case .neon: return "neon"
+        case .spark: return "spark"
+        case .flash: return "flash"
+        case .mix: return "mix"
+        case .rippleO: return "rippleo"
+        case .music: return "music"
+        case .userMode: return "usermode"
+        }
+    }
+}
 
 // MARK: - 键盘灯配置持久化位置
 
@@ -73,18 +261,37 @@ private let timeFormatter: DateFormatter = {
 
 final class KeyboardRGB {
     static let vid = rgbVID
-    static let pid = rgbPID
+    /// 原厂 PID 白名单（包内 `Ite8291.ProductIds`）。**不能只认 0xCE00**：
+    /// 本机实测是真机 PID = 0x6006，写成 0xCE00 就会「控制台检测不到键盘」。
+    static let pids = rgbPIDs
+    /// 灯效接口的 usage page（原厂按 0xFF03 那一层发包）
+    static let rgbUsagePage = 0xFF03
 
     private var dev: HIDDevice?
 
-    static func available() -> Bool {
-        !NativeHID.findDevices(vendorID: vid, productID: pid).isEmpty
+    /// 枚举所有白名单 PID，优先取 usage page = 0xFF03 的那个接口。
+    static func findDevice() -> HIDDevice? {
+        var candidates: [HIDDevice] = []
+        for pid in pids {
+            candidates += NativeHID.findDevices(vendorID: vid, productID: pid)
+        }
+        if candidates.isEmpty { return nil }
+        // PrimaryUsagePage 决定这是不是灯效接口（本机实测 0xFF03）
+        if let rgb = candidates.first(where: { $0.usagePage == rgbUsagePage }) {
+            return rgb
+        }
+        // 退化：有 Feature 报文长度 8 的那个（0xFF03 接口的特征）
+        if let feat = candidates.first(where: { ($0.maxFeatureReportSize ?? 0) == 8 }) { return feat }
+        return candidates.first
     }
 
+    static func available() -> Bool { findDevice() != nil }
+
     init() throws {
-        guard let d = NativeHID.findDevices(vendorID: Self.vid, productID: Self.pid).first else {
+        guard let d = Self.findDevice() else {
             throw NSError(domain: "KeyboardRGB", code: -1,
-                          userInfo: [NSLocalizedDescriptionKey: "未找到 ITE 8291 键盘灯设备 (048d:ce00)"])
+                          userInfo: [NSLocalizedDescriptionKey:
+                            "未找到 ITE 8291 键盘灯设备（048d:6004/6006/600B/CE00 都不在）"])
         }
         dev = d
     }
@@ -100,7 +307,7 @@ final class KeyboardRGB {
 
     func info() -> [String: Any] {
         guard let d = dev else { return [:] }
-        var out: [String: Any] = [
+        return [
             "product": d.product ?? NSNull(),
             "manufacturer": d.manufacturer ?? NSNull(),
             "vendor_id": String(format: "%#06x", d.vendorID ?? 0),
@@ -108,20 +315,21 @@ final class KeyboardRGB {
             "usage_page": String(format: "%#06x", d.usagePage ?? 0),
             "feature_report_size": d.maxFeatureReportSize ?? NSNull(),
             "output_report_size": d.maxOutputReportSize ?? NSNull(),
+            "led_vendor": WkdColor.vendor.label,
+            "support_byte5": WkdColor.rawSupportByte5.map { String(format: "%#04x", $0) } ?? NSNull(),
         ]
-        return out
     }
 
     // MARK: 底层
 
-    /// 发送 8 字节 Feature 报告 (report id = 0)
+    /// 发送 8 字节 Feature 报告（buffer 不含 ReportID，reportID 传 0）
     private func feature(_ payload8: [UInt8]) -> Int {
         var pkt = payload8 + [UInt8](repeating: 0, count: max(0, 8 - payload8.count))
         pkt = Array(pkt.prefix(8))
         return Int(dev?.setReport(pkt, reportType: kIOHIDReportTypeFeature, reportID: 0) ?? -1)
     }
 
-    /// 发送 Output 报告（颜色向量走这里）
+    /// 发送 Output 报告（行颜色走这里，64 字节）
     private func output(_ payload: [UInt8], _ length: Int) -> Int {
         var pkt = payload + [UInt8](repeating: 0, count: max(0, length - payload.count))
         pkt = Array(pkt.prefix(length))
@@ -134,96 +342,170 @@ final class KeyboardRGB {
         return [UInt8](data)
     }
 
+    // MARK: 供应商探测
+
+    /// 读 EC 0x742 判 LED 供应商（原厂静态构造同款）。
+    static func detectLedVendor() -> LedVendor {
+        guard let r = FanControl.shared.ecRead(0x742), r.ok else {
+            return WkdColor.detect(rawSupportByte5: nil)
+        }
+        return WkdColor.detect(rawSupportByte5: UInt8(r.result & 0xFF))
+    }
+
     // MARK: 查询
 
-    /// 0x80 查询固件版本
     func getFirmware() -> [String: Any] {
         _ = feature([0x80, 0, 0, 0, 0, 0, 0, 0])
         usleep(200_000)
-        guard let d = readFeature(8) else {
-            return ["raw": NSNull(), "version_bytes": NSNull()]
-        }
+        guard let d = readFeature(8) else { return ["raw": NSNull(), "version_bytes": NSNull()] }
         if d[0] == 0x80 {
             return ["raw": hexOf(d), "version_bytes": Array(d[1..<5])]
         }
         return ["raw": hexOf(d), "version_bytes": NSNull()]
     }
 
-    /// 读回当前灯效状态字节
-    func getState() -> [String: Any]? {
+    /// 回读当前灯效状态。
+    ///
+    /// ⚠ 2.8.8 修 bug（用户反馈「调完亮度滑条又跳回 0% / 1%」）：
+    /// 芯片**不会**自己刷新 feature 缓冲，`readFeature` 拿到的其实就是「上一笔
+    /// 写下去的那条报文」。而一笔灯效要连发 1…7 条 `0x14` 调色板报文，最后一条
+    /// 形如 `[0x14, 0x00, slot, R, G, B, 0, 0]` —— 这时 `d[4]` 是**颜色的 G 通道**，
+    /// 不是亮度！纯红 `(255,0,0)` 的 G=0，于是亮度被读成 0%，纯绿某档读成 1%。
+    ///
+    /// 只有 `d[0] == 0x08`（SET_EFFECT 报文）时 `d[4]` 才是亮度字节。
+    /// 其它情况一律回落到 `fallbackBrightness`（调用方传存档里的真实值）。
+    func getState(fallbackBrightness: Int? = nil) -> [String: Any]? {
         guard let d = readFeature(8) else { return nil }
+        let isEffectReport = (d[0] == 0x08)
+        let pct: Int?
+        if isEffectReport {
+            pct = pctFromRaw(d[4])
+        } else if let f = fallbackBrightness {
+            pct = normalizePct(f)
+        } else {
+            pct = nil
+        }
         var st: [String: Any] = [
             "raw": hexOf(d),
             "command": d[0],
             "mode": d[1],
             "program": d[2],
             "speed": d[3],
+            // 亮度字节只在 0x08 报文里有效；别的报文下这里照原样给出，仅供排障
             "brightness_raw": d[4],
+            "brightness_max": brightnessMax(),
+            "brightness_valid": isEffectReport,
+            "brightness_source": isEffectReport ? "hid" : (pct == nil ? "unknown" : "profile"),
             "colour": d[5],
-            "program2": d[6],
+            "direction": d[6],
         ]
-        for (lvl, raw) in brightnessMap where raw == d[4] {
-            st["brightness_level"] = lvl
-        }
+        if let p = pct { st["brightness_pct"] = p }
+        // 老键名保留：菜单栏 / 旧调用还在读 brightness_level（1…4）
+        st["brightness_level"] = max(1, min(4, ((pct ?? 75) + 12) / 25))
         st["off"] = (d[0] == 0x08 && d[1] == 0x01)
+        st["led_vendor"] = WkdColor.vendor.label
         return st
     }
 
     // MARK: 控制
 
     /// 熄灯
-    func disable() -> Int {
-        feature([0x08, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+    func disable() -> Int { feature([0x08, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]) }
+
+    /// 单独调亮度（不改灯效）。pct = 0…100 百分比，芯片值按固件量程换算
+    func setBrightness(_ pct: Int) throws -> Int {
+        let raw = rawFromPct(pct)
+        return feature([0x09, 0x02, raw, 0x00, 0x00, 0x00, 0x00, 0x00])
     }
 
-    /// 单独调亮度（不改灯效）
-    func setBrightness(_ level: Int) throws -> Int {
-        guard let raw = brightnessMap[level] else {
-            throw NSError(domain: "KeyboardRGB", code: -1,
-                          userInfo: [NSLocalizedDescriptionKey: "亮度等级取值 1-4"])
-        }
-        return feature([0x08, 0x02, 0x33, 0x00, raw, 0x00, 0x00, 0x00])
-    }
-
-    /// 直接下发效果包
+    /// 原始 0x08 下发（内部用；effect 为固件码，brightness 是百分比）
     func setEffect(_ programCode: UInt8, speed: Int, brightness: Int,
                    colour: UInt8, program2: UInt8, save: Int) -> Int {
         feature([0x08, 0x02, programCode,
-                 UInt8(clamping: speed) & 0xFF, brightnessMap[brightness] ?? 0x24,
+                 UInt8(clamping: speed) & 0xFF, rawFromPct(brightness),
                  colour & 0xFF, program2 & 0xFF, UInt8(clamping: save) & 0xFF])
     }
 
-    /// 命令 0x14：把一个 RGB 写进「命名色」槽位（槽位 1-7）
-    func setNamedColor(slot: Int, r: Int, g: Int, b: Int) -> Int {
-        let s = max(1, min(7, slot))
-        return feature([0x14, 0x00, UInt8(s) & 0xFF,
-                        UInt8(clamping: r) & 0xFF, UInt8(clamping: g) & 0xFF,
-                        UInt8(clamping: b) & 0xFF, 0x00, 0x00])
+    /// 按灯效语义下发一次 0x08。
+    func apply(_ effect: KeyboardEffect, speed: Int, brightness: Int,
+               colorIndex: ColorIndex, direction: Int, save: Int) -> Int {
+        setEffect(effect.rawValue, speed: speed, brightness: brightness,
+                  colour: colorIndex.rawValue, program2: UInt8(clamping: direction),
+                  save: save)
     }
 
-    /// 按名称设置预设灯效。给了 rgb 就先写命名色槽位再让 colour 指向它。
-    func setStyle(name: String, brightness: Int = 3, speed: Int = 5, save: Int = 1,
-                  rgb: [Int]? = nil, slot: Int = 1) throws -> Int {
-        guard let prog = programs[name] else {
+    /// 0x14：把一个 RGB 写进命名色槽位（槽位 1..7）。颜色过原厂补偿。
+    func setNamedColor(slot: Int, r: Int, g: Int, b: Int, compensate: Bool = true) -> Int {
+        let s = max(1, min(7, slot))
+        let (rr, gg, bb) = compensate
+            ? WkdColor.convert(r, g, b)
+            : (r, g, b)
+        return feature([0x14, 0x00, UInt8(s) & 0xFF,
+                        UInt8(clamping: rr) & 0xFF, UInt8(clamping: gg) & 0xFF,
+                        UInt8(clamping: bb) & 0xFF, 0x00, 0x00])
+    }
+
+    /// 写一整组调色板槽 1…n（最多 7 个）。
+    @discardableResult
+    func setNamedPalette(_ colors: [[Int]]) -> Int {
+        var written = 0
+        for (i, c) in colors.prefix(7).enumerated() {
+            let r = c.count > 0 ? c[0] : 0
+            let g = c.count > 1 ? c[1] : 0
+            let b = c.count > 2 ? c[2] : 0
+            _ = setNamedColor(slot: i + 1, r: r, g: g, b: b)
+            usleep(1_000)
+            written += 1
+        }
+        return written
+    }
+
+    /// 按名称设置预设灯效（保留旧 API 签名）。
+    ///
+    /// 原厂流程：先写 N 个 0x14 调色板槽，再发 0x08；color 字节用 ColorIndex，
+    /// 不是颜色个数。多色灯效靠 ColorIndex=8（循环）让芯片跑整排调色板。
+    /// direction 只对 Wave/Marquee/Aurora 有效：1 右 / 2 左 / 3 上 / 4 下（原厂默认 1）。
+    func setStyle(name: String, brightness: Int = 75, speed: Int = 5, save: Int = 1,
+                  rgb: [Int]? = nil, slot: Int = 1, palette: [[Int]]? = nil,
+                  direction: Int = 1) throws -> Int {
+        guard let effect = KeyboardCatalog.effect(forName: name) else {
             throw NSError(domain: "KeyboardRGB", code: -1,
                           userInfo: [NSLocalizedDescriptionKey: "未知灯效: \(name)"])
         }
-        var colour: UInt8 = 0x08
-        var prog2: UInt8 = 0x00
-        switch name {
-        case "rainbow": colour = 0x00
-        case "marquee": colour = 0x08
-        case "wave": colour = 0x00; prog2 = 0x01
-        case "reactive", "reactiveaurora", "fireworks": prog2 = 0x01
-        default: break
+        let slots = KeyboardCatalog.colorCount(effect)
+        let ci = KeyboardCatalog.colorIndex(effect)
+        let spd = max(0, min(10, speed))
+        let rawDir = (1...4).contains(direction) ? direction : 1
+        let dir = KeyboardCatalog.supportsDirection(effect) ? rawDir : 0
+
+        if effect == .userMode {
+            // 原厂 Set_ITE_Effect_Type_UserMode：speed=0、color=0、direction=0
+            return setEffect(effect.rawValue, speed: 0, brightness: brightness,
+                             colour: ColorIndex.none.rawValue, program2: 0, save: save)
         }
-        if let rgb = rgb {
-            setNamedColor(slot: slot, r: rgb[0], g: rgb[1], b: rgb[2])
-            usleep(50_000)
-            colour = UInt8(slot & 0xFF)
+
+        // ① 先写调色板
+        if ci != .none {
+            if ci == .single {
+                let c = rgb ?? (palette?.first ?? [255, 255, 255])
+                _ = setNamedColor(slot: 1, r: c[0], g: c.count > 1 ? c[1] : 0, b: c.count > 2 ? c[2] : 0)
+            } else {
+                let colors: [[Int]]
+                if let pal = palette, !pal.isEmpty {
+                    colors = pal
+                } else if let c = rgb {
+                    colors = [c]
+                } else {
+                    colors = KeyboardCatalog.defaultPalette.map { [$0.0, $0.1, $0.2] }
+                }
+                _ = setNamedPalette(Array(colors.prefix(max(1, slots))))
+            }
+            usleep(2_000)
         }
-        return setEffect(prog, speed: speed, brightness: brightness,
-                         colour: colour, program2: prog2, save: save)
+
+        // ② 再发灯效
+        return apply(effect, speed: spd, brightness: brightness,
+                     colorIndex: ci, direction: dir, save: save)
     }
 
     /// 0x16 选择要写入的行 (0-5)
@@ -231,7 +513,8 @@ final class KeyboardRGB {
         feature([0x16, 0x00, UInt8(row) & 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00])
     }
 
-    /// 构造一行 64 字节的平面缓冲：蓝平面21 + 绿平面21 + 红平面21 + 填充
+    /// 构造一行 64 字节缓冲（不含 ReportID）：
+    /// [0]=0，[1..21]=B，[22..42]=G，[43..63]=R
     static func buildRowBuffer(r: Int, g: Int, b: Int) -> [UInt8] {
         var arr = [UInt8](repeating: 0, count: rowLen)
         for i in 0..<numCols {
@@ -242,37 +525,85 @@ final class KeyboardRGB {
         return arr
     }
 
-    /// 进入用户自定义颜色模式 = 效果码 0x33
-    func userMode(save: Int = 1, brightness: Int = 3) -> Int {
-        feature([0x08, 0x02, 0x33, 0x00,
-                 brightnessMap[brightness] ?? 0x24, 0x00, 0x00, UInt8(save) & 0xFF])
+    /// 构造一行 **逐键** 64 字节缓冲：同一行的 21 个位置可以是 21 种不同颜色。
+    ///
+    /// 2.8.8（用户要求「逐键自定义要有键盘投影，能选哪个键点亮哪个颜色」）：
+    /// 逐键模式（固件码 0x33）下，芯片按行锁存 21 个位置的 RGB 三平面，
+    /// 所以逐键自定义 = 6 行 × 21 列 = 126 个可独立配色的位置。
+    /// 颜色与 `setZoneColors` 一致，先过原厂补偿再写。
+    static func buildRowBuffer(colors: [[Int]]) -> [UInt8] {
+        var arr = [UInt8](repeating: 0, count: rowLen)
+        for i in 0..<numCols {
+            let c = i < colors.count ? colors[i] : [0, 0, 0]
+            let (r, g, b) = WkdColor.convert(c.count > 0 ? c[0] : 0,
+                                             c.count > 1 ? c[1] : 0,
+                                             c.count > 2 ? c[2] : 0)
+            arr[planeBlue + i] = UInt8(clamping: b) & 0xFF
+            arr[planeGreen + i] = UInt8(clamping: g) & 0xFF
+            arr[planeRed + i] = UInt8(clamping: r) & 0xFF
+        }
+        return arr
     }
 
-    /// 按行下发颜色（键盘 6 行 × 21 列）
+    /// 进入逐键自定义模式 = 固件码 0x33
+    func userMode(save: Int = 1, brightness: Int = 75) -> Int {
+        setEffect(KeyboardEffect.userMode.rawValue, speed: 0, brightness: brightness,
+                  colour: ColorIndex.none.rawValue, program2: 0, save: save)
+    }
+
+    /// 逐键矩阵下发（6 行 × 21 列，每个位置独立颜色）。
+    ///
+    /// 流程与原厂 UserMode 一致：
+    ///   ① 0x08 + 固件码 0x33 进入逐键模式（必须先切，否则行数据不生效）
+    ///   ② 每行：0x16 选行 → Sleep(1ms) → 64 字节 Output 行数据（21×RGB 三平面）
+    /// 回读只会清行锁存，所以整段过程**绝不回读**。
+    ///
+    /// - Parameter rows: 6 行，每行 21 个 `[r,g,b]`；不足的位置按黑色补齐。
+    func setKeyMatrix(_ rows: [[[Int]]], brightness: Int = 75, save: Int = 1) throws -> Int {
+        guard rows.count == numRows else {
+            throw NSError(domain: "KeyboardRGB", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "逐键矩阵需要 \(numRows) 行，收到 \(rows.count)"])
+        }
+        _ = userMode(save: save, brightness: brightness)
+        usleep(3_000)
+        var last = -1
+        for row in 0..<numRows {
+            let arr = KeyboardRGB.buildRowBuffer(colors: rows[row])
+            // 原厂顺序：先选行、再写行数据；中间不能插回读
+            _ = setRowIndex(row)
+            usleep(1_000)
+            last = output(arr, rowLen)
+        }
+        return last
+    }
+
+    /// 按行下发颜色（键盘 6 行 × 21 列），颜色过原厂补偿。
     func setZoneColors(_ zones: [[Int]], repeat count: Int = 1, save: Int = 1) throws -> Int {
         guard !zones.isEmpty else {
             throw NSError(domain: "KeyboardRGB", code: -1,
                           userInfo: [NSLocalizedDescriptionKey: "zones 不能为空"])
         }
-        let cols = zones.map { RGBGains.apply(($0[0], $0[1], $0[2])) }
+        let cols = zones.map { WkdColor.convert($0[0], $0[1], $0[2]) }
         var last = -1
         for _ in 0..<max(1, count) {
             for row in 0..<numRows {
-                let (r, g, b) = cols[row % cols.count]
-                let arr = KeyboardRGB.buildRowBuffer(r: r, g: g, b: b)
+                let c = cols[row % cols.count]
+                let arr = KeyboardRGB.buildRowBuffer(r: c.0, g: c.1, b: c.2)
+                // 原厂 IL：选行后跟 WriteFeature + Sleep(1)，绝不能回读（回读会清行锁存）
                 _ = setRowIndex(row)
-                usleep(20_000)
+                usleep(1_000)
                 last = output(arr, rowLen)
             }
         }
         return last
     }
 
-    /// 把整个键盘设成单一颜色（完整流程）
-    func setColor(r: Int, g: Int, b: Int, brightness: Int = 4, save: Int = 1, repeat count: Int = 1) throws -> Int {
-        _ = userMode(save: save, brightness: brightness)
-        usleep(50_000)
-        return try setZoneColors([[r, g, b]], repeat: count, save: save)
+    /// 把整个键盘设成单一颜色（完整流程：0x14 槽 1 → 0x08 单色）
+    func setColor(r: Int, g: Int, b: Int, brightness: Int = 75, save: Int = 1, repeat count: Int = 1) throws -> Int {
+        _ = setNamedColor(slot: 1, r: r, g: g, b: b)
+        usleep(2_000)
+        return apply(.single, speed: 0, brightness: brightness,
+                     colorIndex: .single, direction: 0, save: save)
     }
 }
 
@@ -282,11 +613,10 @@ enum RGBUtil {
     static func hexToRgb(_ s: String) -> [Int] {
         let h = s.hasPrefix("#") ? String(s.dropFirst()) : s
         guard h.count == 6 else { return [255, 149, 0] }
-        return [(0, 2), (2, 4), (4, 6)].map { Int(h[$0..<$1], radix: 16) ?? 0 }
-    }
-
-    static func rgbToHex(_ rgb: [Int]) -> String {
-        String(format: "#%02x%02x%02x", rgb[0] & 0xFF, rgb[1] & 0xFF, rgb[2] & 0xFF)
+        let chars = Array(h)
+        return stride(from: 0, to: 6, by: 2).map {
+            Int(String(chars[$0]) + String(chars[$0 + 1]), radix: 16) ?? 0
+        }
     }
 }
 
@@ -313,22 +643,64 @@ enum RGBProfile {
         catch { return false }
     }
 
-    /// 把 server 的 /api/rgb 参数归一化成可保存的 profile
+    /// 逐键矩阵规格：6 行 × 21 列
+    static let keyRows = 6
+    static let keyCols = 21
+
+    /// 把任意来源的「逐键矩阵」归一化成严格的 6×21×3（缺的补黑，多的丢弃）。
+    /// 存档 / XPC 传过来的都是 JSON 解出来的 `[[Any]]`，类型全靠这里兜住，
+    /// 否则上面一层到处写 `as? [[[Int]]]` 会因为桥接差异静默变空。
+    static func normalizeKeymap(_ raw: Any?) -> [[[Int]]] {
+        var out = [[[Int]]](repeating: [[Int]](repeating: [0, 0, 0], count: keyCols),
+                            count: keyRows)
+        guard let rows = raw as? [Any] else { return out }
+        for (r, rowAny) in rows.prefix(keyRows).enumerated() {
+            guard let row = rowAny as? [Any] else { continue }
+            for (c, cellAny) in row.prefix(keyCols).enumerated() {
+                guard let cell = cellAny as? [Any], cell.count >= 3 else { continue }
+                out[r][c] = [clamp8(cell[0]), clamp8(cell[1]), clamp8(cell[2])]
+            }
+        }
+        return out
+    }
+
+    private static func clamp8(_ v: Any) -> Int {
+        let n = (v as? Int) ?? Int((v as? Double) ?? 0)
+        return max(0, min(255, n))
+    }
+
     static func fromParams(_ params: [String: Any]) -> [String: Any] {
         let mode = params["mode"] as? String ?? "color"
         switch mode {
         case "off":
             return ["mode": "off"]
+        case "keymap":
+            return ["mode": "keymap",
+                    "brightness": params["brightness"] as? Int ?? 75,
+                    "rows": normalizeKeymap(params["rows"])]
         case "brightness":
-            return ["mode": "brightness", "brightness": params["level"] as? Int ?? 3]
+            return ["mode": "brightness", "brightness": params["level"] as? Int ?? 75]
         case "effect":
             var prof: [String: Any] = [
                 "mode": "effect",
                 "style": params["style"] as? String ?? "rainbow",
-                "brightness": params["brightness"] as? Int ?? 3,
+                "brightness": params["brightness"] as? Int ?? 75,
                 "speed": params["speed"] as? Int ?? 5,
+                "direction": params["direction"] as? Int ?? 1,
             ]
-            if let hex = params["hex"] as? String {
+            if let colors = params["colors"] as? [[Any]], !colors.isEmpty {
+                let pal = colors.prefix(7).map { c in
+                    [c.count > 0 ? (c[0] as? Int ?? 0) : 0,
+                     c.count > 1 ? (c[1] as? Int ?? 0) : 0,
+                     c.count > 2 ? (c[2] as? Int ?? 0) : 0]
+                }
+                prof["colors"] = pal
+                if let first = pal.first {
+                    prof["rgb"] = first
+                    prof["hex"] = String(format: "%02x%02x%02x",
+                                         first[0] & 0xFF, first[1] & 0xFF, first[2] & 0xFF)
+                }
+            } else if let hex = params["hex"] as? String {
                 var hx = hex.hasPrefix("#") ? String(hex.dropFirst()) : hex
                 if hx.count != 6 { hx = "ff9500" }
                 prof["hex"] = hx
@@ -340,17 +712,16 @@ enum RGBProfile {
             let zones = (params["zones"] as? [[Any]] ?? []).map { z in
                 [z[0] as? Int ?? 0, z[1] as? Int ?? 0, z[2] as? Int ?? 0]
             }
-            return ["mode": "zones", "brightness": params["brightness"] as? Int ?? 4, "zones": zones]
+            return ["mode": "zones", "brightness": params["brightness"] as? Int ?? 75, "zones": zones]
         default:
             var hx = (params["hex"] as? String ?? "#ff9500")
             hx = hx.hasPrefix("#") ? String(hx.dropFirst()) : hx
             var rgb = RGBUtil.hexToRgb(hx)
             if hx.count != 6 || rgb.contains(where: { $0 < 0 }) {
-                hx = "ff9500"
-                rgb = [255, 149, 0]
+                hx = "ff9500"; rgb = [255, 149, 0]
             }
             return ["mode": "color", "hex": hx, "rgb": rgb,
-                    "brightness": params["brightness"] as? Int ?? 4]
+                    "brightness": params["brightness"] as? Int ?? 75]
         }
     }
 
@@ -369,32 +740,42 @@ enum RGBProfile {
         do {
             let kb = try KeyboardRGB().open()
             defer { kb.close() }
+            _ = KeyboardRGB.detectLedVendor()
             switch mode {
             case "off":
                 kr = kb.disable()
             case "brightness":
-                kr = try kb.setBrightness(prof["brightness"] as? Int ?? 3)
+                kr = try kb.setBrightness(normalizePct(prof["brightness"] as? Int ?? 75))
             case "effect":
                 var effRGB: [Int]? = prof["rgb"] as? [Int]
                 if effRGB == nil, let hex = prof["hex"] as? String {
                     effRGB = RGBUtil.hexToRgb(hex)
                 }
+                let palette = (prof["colors"] as? [[Any]])?.map { c in
+                    [c.count > 0 ? (c[0] as? Int ?? 0) : 0,
+                     c.count > 1 ? (c[1] as? Int ?? 0) : 0,
+                     c.count > 2 ? (c[2] as? Int ?? 0) : 0]
+                }
                 kr = try kb.setStyle(name: prof["style"] as? String ?? "rainbow",
-                                     brightness: prof["brightness"] as? Int ?? 3,
+                                     brightness: normalizePct(prof["brightness"] as? Int ?? 75),
                                      speed: prof["speed"] as? Int ?? 5,
                                      save: 1,
                                      rgb: effRGB,
-                                     slot: prof["slot"] as? Int ?? 1)
+                                     slot: prof["slot"] as? Int ?? 1,
+                                     palette: palette,
+                                     direction: prof["direction"] as? Int ?? 1)
             case "zones":
-                _ = try kb.setBrightness(prof["brightness"] as? Int ?? 4)
-                usleep(50_000)
+                _ = try kb.setBrightness(normalizePct(prof["brightness"] as? Int ?? 75))
+                usleep(20_000)
                 let zones = (prof["zones"] as? [[Any]] ?? []).map { z in
                     [z[0] as? Int ?? 0, z[1] as? Int ?? 0, z[2] as? Int ?? 0]
                 }
-                guard !zones.isEmpty else {
-                    return ["ok": false, "error": "配置里的 zones 为空"]
-                }
+                guard !zones.isEmpty else { return ["ok": false, "error": "配置里的 zones 为空"] }
                 kr = try kb.setZoneColors(zones, repeat: 1, save: 1)
+            case "keymap":
+                kr = try kb.setKeyMatrix(normalizeKeymap(prof["rows"]),
+                                         brightness: normalizePct(prof["brightness"] as? Int ?? 75),
+                                         save: 1)
             default:  // color
                 let rgb: [Int]
                 if let r = prof["rgb"] as? [Int], r.count == 3 {
@@ -402,33 +783,38 @@ enum RGBProfile {
                 } else {
                     rgb = RGBUtil.hexToRgb(prof["hex"] as? String ?? "#ff9500")
                 }
-                _ = try kb.setBrightness(prof["brightness"] as? Int ?? 4)
-                usleep(50_000)
-                kr = try kb.setZoneColors([rgb], repeat: 1, save: 1)
-                let (ar, ag, ab) = RGBGains.apply((rgb[0], rgb[1], rgb[2]))
-                appliedRGB = [ar, ag, ab]
+                _ = try kb.setBrightness(normalizePct(prof["brightness"] as? Int ?? 75))
+                usleep(20_000)
+                kr = try kb.setColor(r: rgb[0], g: rgb[1], b: rgb[2],
+                                     brightness: normalizePct(prof["brightness"] as? Int ?? 75), save: 1)
+                let conv = WkdColor.convert(rgb[0], rgb[1], rgb[2])
+                appliedRGB = [conv.0, conv.1, conv.2]
             }
         } catch {
             return ["ok": false, "error": "\(error)", "mode": mode, "profile": prof]
         }
+        let gains = RGBGains.load()
         var out: [String: Any] = [
             "ok": kr == 0, "kr": kr, "mode": mode, "profile": prof,
-            "gains": [RGBGains.load().0, RGBGains.load().1, RGBGains.load().2],
+            "gains": [gains.0, gains.1, gains.2],
+            "led_vendor": WkdColor.vendor.label,
         ]
         if let appliedRGB = appliedRGB { out["applied_rgb"] = appliedRGB }
         return out
     }
 }
 
-// MARK: - 白色光谱校准（对应 rgbkb 的 gains 段）
+// MARK: - 白色微调（原厂补偿之后的二次手工微调）
 
-/// 实测：下发纯白 (255,255,255) 时键盘明显偏蓝 —— 蓝光 LED 效率远高于红/绿。
-/// 让用户指出"纯白指令下肉眼看到的实际颜色"，转到线性光空间后以最弱通道为
-/// 基准反算三通道衰减增益；只衰减过强通道。增益单位千分比，1000 = 不衰减。
+/// 原厂补偿已经把三通道配比拉到接近中性白；这里保留一个二次微调，
+/// 默认 (1000,1000,1000) = 不动。与旧版的区别：旧版用它来"补救"
+/// 缺失的补偿，会在补偿补上之后过度修正，所以旧配置需要重置一次。
 enum RGBGains {
     static func load() -> (Int, Int, Int) {
         guard let data = try? Data(contentsOf: gainURL),
               let d = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              // 只接受 Version 2（补偿上线后的配置）；旧版裸数组直接丢弃
+              (d["Version"] as? Int ?? 0) >= 2,
               let r = d["R"] as? Int, let g = d["G"] as? Int, let b = d["B"] as? Int else {
             return defaultGain
         }
@@ -440,7 +826,7 @@ enum RGBGains {
         let g = (clamp(gr), clamp(gg), clamp(gb))
         let dir = gainURL.deletingLastPathComponent()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        var payload: [String: Any] = ["R": g.0, "G": g.1, "B": g.2]
+        var payload: [String: Any] = ["Version": 2, "R": g.0, "G": g.1, "B": g.2]
         if let observed = observed { payload["observed"] = observed }
         payload["updated"] = timeFormatter.string(from: Date())
         if let data = try? JSONSerialization.data(withJSONObject: payload) {
@@ -455,7 +841,6 @@ enum RGBGains {
         return defaultGain
     }
 
-    /// 把校准增益作用到一个 (r,g,b) 上
     static func apply(_ rgb: (Int, Int, Int)) -> (Int, Int, Int) {
         let (gr, gg, gb) = load()
         return (min(255, (rgb.0 * gr + 500) / 1000),
@@ -470,7 +855,6 @@ enum RGBGains {
         return v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4)
     }
 
-    /// 由「看到的颜色」反算三通道增益。observed 形如 '7f9bff'
     static func calcWhiteGains(_ observedHex: String) -> [String: Any]? {
         var s = observedHex
         if s.hasPrefix("#") { s = String(s.dropFirst()) }
@@ -491,9 +875,6 @@ enum RGBGains {
 
 // MARK: - 滑条端点（让「去蓝强度」滑条可无跳变往返）
 
-/// 滑条只在「中性白(1000,1000,1000)」与一个可变端点之间线性插值：
-///     gain(t) = 1000 - (1000 - end) * t / 100
-/// 默认端点 (1000, 300, 200)；用户做过一次色块标定后端点被替换为标定结果。
 enum RGBSlider {
     static func loadEndpoint() -> (Int, Int, Int) {
         guard let data = try? Data(contentsOf: endURL),
@@ -525,18 +906,15 @@ enum RGBSlider {
         return defaultEnd
     }
 
-    /// 滑条位置 0-100 → 增益三元组（中性白 → 端点 线性插值）
     static func toGains(_ t: Double) -> (Int, Int, Int) {
         let end = loadEndpoint()
         let tt = max(0, min(100, t))
-        // Python round() 是银行家舍入，这里保持同款
         let f = { (e: Int) -> Int in
             Int((1000 - Double(1000 - e) * tt / 100.0).rounded(.toNearestOrEven))
         }
         return (f(end.0), f(end.1), f(end.2))
     }
 
-    /// 增益三元组 → 滑条位置 0-100（取三通道中偏离中性最大的那个）
     static func fromGains(_ gains: (Int, Int, Int)? = nil) -> Int {
         let cur = gains ?? RGBGains.load()
         let end = loadEndpoint()

@@ -3,13 +3,15 @@
 # build-swift.sh —— 一键构建「Mac控制台」SwiftUI 原生 app + DMG 安装器
 #
 # 产物（都在本目录）：
-#   Mac控制台-安装器-2.5.0.dmg   拖拽式安装器
-#     ├─ Mac控制台.app           原生 SwiftUI 主程序（自带原生后端，无 Python）
-#     ├─ 安装散热控制.command     kext 手动安装器（app 首次运行也会自动装）
-#     ├─ 卸载Mac控制台.command    卸载器
-#     ├─ TongfangFan.kext        内核扩展（command 用；app 内置另一份）
+#   Mac控制台-安装器-<版本>-LAPQC71专版.dmg   拖拽式安装器
+#     ├─ Mac控制台.app           原生 SwiftUI 主程序（kext 已内嵌在 bundle 里）
+#     ├─ 卸载Mac控制台.command    彻底卸载器
 #     ├─ 说明.txt
 #     └─ Applications            拖拽目标别名
+#
+# 2.8.12：DMG 顶层不再放 TongfangFan.kext / 安装散热控制.command。
+# 没装 kext 的机器在 app 里点「立即安装」，直接安装 Contents/Resources/native/
+# 里那份（同一份文件，少一次「用户该点哪个文件」的困惑）。
 #
 # 架构（2026-10-20 v2.5.0 起，去 Python 化）：
 #   SwiftUI 原生界面（Sources/MacConsole）+ 原生硬件后端
@@ -19,7 +21,7 @@
 #   Mach service com.macconsole.helper），app 与它只走 NSXPCConnection；
 #   EC/SMC/HID/亮度/风扇曲线只有 helper 读，UI 退出不影响散热。HTTP 与 8787 端口、
 #   内置 web 页面已整体删除。随包只剩三个编译型助手二进制
-#   （auxbright / pwmwake / nvmetemp）与 shell 脚本，全部与 Python 无关。
+#   （nvmetemp / nvmesmart）与 shell 脚本，全部与 Python 无关。
 #
 # 开机自启：app 内「系统 → 通用 → 开机自动启动」开关（SMAppService，macOS 13+）。
 #
@@ -36,64 +38,12 @@ STAGE="${MC_STAGE:-$BUILD/swift-stage}"
 # 内容已与 Python 无关（web 是纯静态前端，bin/ 三个是编译型 C 二进制）。
 PROJ="$BUILD/python后端"
 [ -d "$PROJ" ] || { echo "错误：找不到资源目录 $PROJ" >&2; exit 1; }
-# auxbright v4 二进制（PWM 模式保持器）：按优先级找多个位置，
-# 源码在 NUC9 项目 06-工具源码/auxbright-PWM模式版.c（本包 bin/ 下的是编译产物），
-# 任一存在即可，保证换机/接手后脚本不因写死路径而断。
-# 顺序即优先级：本包自带 > ~/bin > 已安装 app > 构建目录
-AUXBRIGHT_SRC=""
-for cand in \
-    "$PROJ/bin/auxbright" \
-    "$HOME/bin/auxbright" \
-    "/Applications/Mac控制台.app/Contents/Resources/native/bin/auxbright" \
-    "/Applications/Mac控制台.app/Contents/Resources/python/bin/auxbright" \
-    "$BUILD/bin/auxbright"; do
-  if [[ -x "$cand" ]]; then AUXBRIGHT_SRC="$cand"; break; fi
-done
-if [[ -z "$AUXBRIGHT_SRC" ]]; then
-  echo "错误：找不到 auxbright 二进制（试过接手包/~/bin/已安装app/构建目录）" >&2
-  exit 1
-fi
-echo "==> auxbright: $AUXBRIGHT_SRC"
-VERSION="2.7.5"
 
-# pwmwake v5.2（事件驱动 PWM 恢复守护，2026-10-19 起接管亮度兜底）：
-# 源码已收进本包 Tools/pwmwake.c（2026-10-22 从 Documents/亮度修复包-20261020
-# 找回；原先指向 Desktop 与 WorkBuddy 的两个外部路径均已失效，故删除）。
-# 策略：优先复用已安装/随包的二进制；仅当源码比二进制新才重编。
-# 要强制用新源码重编：touch Tools/pwmwake.c 后再构建。
-PWMWAKE_SRC=""
-for cand in \
-    "$HOME/bin/pwmwake" \
-    "/usr/local/bin/pwmwake" \
-    "$PROJ/bin/pwmwake" \
-    "/Applications/Mac控制台.app/Contents/Resources/native/bin/pwmwake" \
-    "/Applications/Mac控制台.app/Contents/Resources/python/bin/pwmwake"; do
-  if [[ -x "$cand" ]]; then PWMWAKE_SRC="$cand"; break; fi
-done
-PWMWAKE_C=""
-if [[ -f "$BUILD/Tools/pwmwake.c" ]]; then PWMWAKE_C="$BUILD/Tools/pwmwake.c"; fi
-# 仅当源码比现有二进制新才重编译，避免每次构建都刷新二进制、白改校验和
-if [[ -n "$PWMWAKE_C" && ( ! -f "$PROJ/bin/pwmwake" || "$PWMWAKE_C" -nt "$PROJ/bin/pwmwake" ) ]]; then
-  TMPW="$(mktemp -t pwmwake)"
-  if clang -O2 -Wall -Wno-deprecated-declarations -Wno-pointer-to-int-cast \
-        -o "$TMPW" "$PWMWAKE_C" \
-        -framework IOKit -framework ApplicationServices -framework CoreFoundation 2>/dev/null; then
-    cp "$TMPW" "$PROJ/bin/pwmwake"
-    chmod 755 "$PROJ/bin/pwmwake"
-    PWMWAKE_SRC="$PROJ/bin/pwmwake"
-    rm -f "$TMPW"
-  else
-    rm -f "$TMPW"
-    echo "警告：pwmwake 编译失败，回退到 $PWMWAKE_SRC" >&2
-  fi
-fi
-if [[ -n "$PWMWAKE_SRC" ]]; then
-  echo "==> pwmwake: $PWMWAKE_SRC"
-else
-  echo "警告：找不到 pwmwake，app 内亮度兜底将回退 auxbright pwm" >&2
-fi
-
-# nvmetemp（NVMe 硬盘温度，SMART）——与 pwmwake 同样策略：有现成二进制就用，
+# 版本号（唯一来源：脚本注入 Info.plist 与 helper 的 BuildVersion.swift）
+VERSION="3.0"
+# 显示版本（侧边栏/设置页文案）：数字版本 + 专用版标识
+DISPLAY_VERSION="$VERSION LAPQC71专版"
+# nvmetemp（NVMe 硬盘温度，SMART）——有现成二进制就用，
 # 源码更新则现场重编。
 # ⚠️ 2026-10-22：该工具的 C 源码全盘已找不到（原先两个外部路径都已失效），
 # 现在 python后端/bin/nvmetemp 这份二进制就是唯一来源，已纳入 git。
@@ -139,6 +89,28 @@ nvmesmart_build() {
   fi
 }
 nvmesmart_build
+
+# 开机 kext 加载器（2.8.15）：取代守护里直接 exec /usr/bin/kmutil ——
+# 那样 launchd 会把它显示成「系统设置 → 登录项」里一条来路不明的 "kmutil"。
+# 用自己的二进制，显示名就变成「Mac控制台散热扩展」。
+# 装到 /Library/PrivilegedHelperTools/（root 属主，不随 app 一起被删）。
+mckextload_build() {
+  local src="$BUILD/Tools/mckextload.c"
+  local out="$PROJ/bin/Mac控制台散热扩展"
+  [[ -f "$src" ]] || { echo "警告：缺少 Tools/mckextload.c，开机将无法自动加载 kext" >&2; return; }
+  if [[ ! -x "$out" || "$src" -nt "$out" ]]; then
+    mkdir -p "$PROJ/bin"
+    if clang -O2 -Wall -o "$out" "$src" 2>/dev/null; then
+      chmod 755 "$out"
+      echo "==> kext 加载器: 已编译 → $out"
+    else
+      echo "警告：kext 加载器编译失败（开机自动加载 kext 会缺失）" >&2
+    fi
+  else
+    echo "==> kext 加载器: $out"
+  fi
+}
+mckextload_build
 
 APP="$STAGE/Applications/Mac控制台.app"
 RES="$APP/Contents/Resources"
@@ -207,10 +179,20 @@ swiftc -O -target x86_64-apple-macosx14.0 \
   "$SWIFT"/Sources/MacConsoleHelper/main.swift \
   "$SWIFT"/Sources/MacConsole/Native/*.swift "$SWIFT"/Sources/MacConsole/FanCurve.swift
 
+# pwmwake（面板 PWM 模式保持器）：2.8.11 起由 MacConsoleHelper 作为子进程托管，
+# 不再注册登录项 com.user.pwmwake。只保持 DPCD 0x721=0x08，不参与亮度调节。
+PWMWAKE_SRC=""
+for cand in "$PROJ/bin/pwmwake" "$HOME/bin/pwmwake" "/usr/local/bin/pwmwake"; do
+  [[ -x "$cand" ]] && PWMWAKE_SRC="$cand" && break
+done
+if [[ -n "$PWMWAKE_SRC" ]]; then
+  echo "==> pwmwake: $PWMWAKE_SRC"
+else
+  echo "警告：找不到 pwmwake，面板 PWM 模式保持会跳过（不影响风扇/灯效）" >&2
+fi
+
 echo "==> 4/8 组装 app bundle（原生资源，无 Python）"
 cp -R "$PROJ/TongfangFan.kext" "$NATIVE/"
-cp "$AUXBRIGHT_SRC" "$NATIVE/bin/auxbright"
-chmod 755 "$NATIVE/bin/auxbright"
 if [[ -n "$PWMWAKE_SRC" ]]; then
   cp "$PWMWAKE_SRC" "$NATIVE/bin/pwmwake"
   chmod 755 "$NATIVE/bin/pwmwake"
@@ -223,6 +205,12 @@ if [[ -x "$PROJ/bin/nvmesmart" ]]; then
   cp "$PROJ/bin/nvmesmart" "$NATIVE/bin/nvmesmart"
   chmod 755 "$NATIVE/bin/nvmesmart"
 fi
+# 开机 kext 加载器：install-kext.sh 会把它装到 /Library/PrivilegedHelperTools/，
+# 由 LaunchDaemon com.macconsole.TongfangFan 以 root 调用
+if [[ -x "$PROJ/bin/Mac控制台散热扩展" ]]; then
+  cp "$PROJ/bin/Mac控制台散热扩展" "$NATIVE/bin/Mac控制台散热扩展"
+  chmod 755 "$NATIVE/bin/Mac控制台散热扩展"
+fi
 cp "$BUILD/templates/install-kext.sh"  "$NATIVE/scripts/install-kext.sh"
 cp "$BUILD/templates/ensure-agents.sh" "$NATIVE/scripts/ensure-agents.sh"
 cp "$PROJ/restore_rgb.sh" "$NATIVE/restore_rgb.sh"
@@ -230,7 +218,9 @@ chmod 755 "$NATIVE/scripts/"*.sh "$NATIVE/restore_rgb.sh"
 cp "$BUILD/icons/AppIcon.icns" "$RES/AppIcon.icns"
 cp "$BUILD/templates/Info.plist" "$APP/Contents/Info.plist"
 # 版本号统一由脚本顶部 VERSION 注入，避免模板硬编码与脚本不同步（2.3.1 曾因此跑偏）
-/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
+# CFBundleVersion 必须保持纯数字：BackendService 用它跟 helper 的 BuildVersion 比对，
+# 带中文后缀会导致「版本不一致 → 反复重启 helper」。专版标识只放 ShortVersionString。
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $DISPLAY_VERSION" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
 
 # 后台 helper 的 LaunchAgent：SMAppService.agent(plistName:) 会到
@@ -250,6 +240,28 @@ cat > "$APP/Contents/Library/LaunchAgents/com.macconsole.helper.plist" <<'PLIST'
   <key>KeepAlive</key><true/>
   <key>ProcessType</key><string>Interactive</string>
   <key>ThrottleInterval</key><integer>2</integer>
+</dict>
+</plist>
+PLIST
+
+# 静默启动用的 LaunchAgent（2.7.6）：系统页「静默启动」打开时，
+# SMAppService.agent(plistName: "com.macconsole.autostart.plist") 注册的就是它，
+# 由它拉起 app 本身并带上 MCCONSOLE_BACKGROUND=1，主窗口就不会出现。
+#
+# 为什么用 EnvironmentVariables 而不是 ProgramArguments 传参：
+# agent plist 里 BundleProgram 已经指定了程序，再给 ProgramArguments 会和它的
+# argv[0] 语义打架；EnvironmentVariables 是独立键，两者可以共存。
+cat > "$APP/Contents/Library/LaunchAgents/com.macconsole.autostart.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.macconsole.autostart</string>
+  <key>BundleProgram</key><string>Contents/MacOS/Mac控制台</string>
+  <key>EnvironmentVariables</key>
+  <dict><key>MCCONSOLE_BACKGROUND</key><string>1</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Interactive</string>
 </dict>
 </plist>
 PLIST
@@ -275,9 +287,9 @@ codesign --verify "$APP" && echo "签名校验通过"
 echo "==> 7/8 组装 DMG 内容"
 mkdir -p "$DMGROOT"
 cp -R "$APP" "$DMGROOT/"
-cp -R "$PROJ/TongfangFan.kext" "$DMGROOT/"
-cp "$PROJ/安装散热控制.command" "$DMGROOT/"
-chmod 755 "$DMGROOT/安装散热控制.command"
+# 2.8.12（用户要求）：kext 与「安装散热控制.command」不再放 DMG 顶层 ——
+# kext 本体已经在 app 的 Contents/Resources/native/ 里，缺 kext 时 app 内
+# 点「立即安装」即可，用户不需要在磁盘映像里找文件。
 cp "$BUILD/templates/卸载.command" "$DMGROOT/卸载Mac控制台.command"
 chmod 755 "$DMGROOT/卸载Mac控制台.command"
 cp "$BUILD/templates/说明.txt" "$DMGROOT/说明.txt"
@@ -292,9 +304,9 @@ fi
 
 echo "==> 8/8 打 DMG"
 hdiutil create -volname "Mac控制台安装器" -srcfolder "$DMGROOT" -ov -format UDZO \
-  "$BUILD/Mac控制台-安装器-$VERSION.dmg" | tail -1
-hdiutil verify "$BUILD/Mac控制台-安装器-$VERSION.dmg" >/dev/null && echo "DMG 校验通过"
+  "$BUILD/Mac控制台-安装器-$VERSION-LAPQC71专版.dmg" | tail -1
+hdiutil verify "$BUILD/Mac控制台-安装器-$VERSION-LAPQC71专版.dmg" >/dev/null && echo "DMG 校验通过"
 
 echo
-echo "完成：$BUILD/Mac控制台-安装器-$VERSION.dmg"
+echo "完成：$BUILD/Mac控制台-安装器-$VERSION-LAPQC71专版.dmg"
 echo "  app 内已无 Python、无 HTTP：硬件后端在 MacConsoleHelper（XPC），助手为 mcutil + 三个编译型二进制"

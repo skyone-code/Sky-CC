@@ -118,6 +118,8 @@ struct KPICard: View {
     var series: [Double] = []
     var note: String? = nil
     var percent: Double? = nil      // 0...1，给了就在底部画细条
+    /// 标题行右侧的附加控件（2.7.6：硬盘温度卡用它在卡片里选看哪块盘）
+    var accessory: AnyView? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -131,6 +133,7 @@ struct KPICard: View {
                     .tracking(0.6)
                     .lineLimit(1)
                 Spacer(minLength: 0)
+                if let accessory { accessory }
             }
             HStack(alignment: .firstTextBaseline, spacing: 3) {
                 Text(value)
@@ -228,13 +231,18 @@ struct StackedBar: View {
 struct GroupTitle: View {
     var text: String
     var sub: String? = nil
+    /// 2.8.9：分组说明默认隐藏（实验性页放行）
+    @Environment(\.hideCardSubs) private var hideCardSubs
+
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(text.uppercased())
                 .font(.system(size: 10.5, weight: .semibold))
                 .foregroundStyle(Theme.dim2)
                 .tracking(1.2)
-            if let sub {
+            // 原说明（注释保留，不删）：
+            //   「0x07C4 bit6」这类寄存器位说明，按用户要求默认不显示
+            if let sub, !hideCardSubs {
                 Text(sub).font(.system(size: 10.5)).foregroundStyle(Theme.dim2.opacity(0.8))
             }
             Spacer()
@@ -271,42 +279,7 @@ struct FieldGrid: View {
     }
 }
 
-/// 圆环仪表
-struct RingGauge: View {
-    var value: Double          // 0...1
-    var text: String
-    var sub: String? = nil
-    var color: Color
-    var lineWidth: CGFloat = 9
-
-    var body: some View {
-        GeometryReader { geo in
-            let side = min(geo.size.width, geo.size.height)
-            let scale = side / 110
-            ZStack {
-                Circle().stroke(Theme.barBg, lineWidth: lineWidth * scale)
-                Circle()
-                    .trim(from: 0, to: CGFloat(min(max(value, 0), 1)))
-                    .stroke(color, style: StrokeStyle(lineWidth: lineWidth * scale, lineCap: .round))
-                    .rotationEffect(.degrees(-90))
-                VStack(spacing: 0) {
-                    Text(text)
-                        .font(.system(size: 24 * scale, weight: .semibold, design: .rounded))
-                        .monospacedDigit()
-                        .foregroundStyle(Theme.txt)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.5)
-                    if let sub {
-                        Text(sub).font(.system(size: 9.5 * scale)).foregroundStyle(Theme.dim2)
-                    }
-                }
-            }
-            .frame(width: side, height: side)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
-        .aspectRatio(1, contentMode: .fit)
-    }
-}
+/// 圆环仪表（已删除 —— 2.8.15 优化时确认无调用点，见 MonitorView.fanBig 自绘圆环）
 
 /// 一行「标签 …… 值」的紧凑行（比 KVRow 矮，用于长列表）
 struct TightRow: View {
@@ -336,10 +309,6 @@ enum Fmt {
         guard let v, v > 0 else { return "—" }
         return String(format: "%.0f", v)
     }
-    static func pct(_ v: Double?) -> String {
-        guard let v else { return "—" }
-        return String(format: "%.1f", v)
-    }
     static func bytes(_ b: Double?) -> String {
         guard let b, b > 0 else { return "0 B" }
         if b >= 1e12 { return String(format: "%.2f TB", b / 1e12) }
@@ -352,10 +321,6 @@ enum Fmt {
         guard let kbs else { return "—" }
         if kbs >= 1024 { return String(format: "%.2f MB/s", kbs / 1024) }
         return String(format: "%.0f KB/s", kbs)
-    }
-    static func uptime(_ s: Double) -> String {
-        let d = Int(s) / 86400, h = (Int(s) % 86400) / 3600, m = (Int(s) % 3600) / 60
-        return d > 0 ? "\(d) 天 \(h) 小时 \(m) 分" : "\(h) 小时 \(m) 分"
     }
     static func watts(_ w: Double?) -> String {
         guard let w else { return "—" }

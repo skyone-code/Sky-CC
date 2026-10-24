@@ -86,6 +86,8 @@ final class HelperService: NSObject, MCHelperProtocol {
             hlog("收到 shutdown 请求，退出以便 launchd 拉起新版本")
             reply(["ok": true])
             DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) {
+                // 顺手收掉 pwmwake 子进程，避免留孤儿抢着写 DPCD
+                PwmKeeper.stop()
                 hlog("exit(0)")
                 exit(0)
             }
@@ -144,6 +146,10 @@ hlog("XPC 监听就绪：\(mcHelperServiceName)")
 // 硬件初始化放后台：startupSequence 会写 EC（风扇模式/键盘灯），阻塞几百毫秒到几秒，
 // 不能挡住 XPC 接客，否则 UI 首帧必然超时。
 DispatchQueue.global(qos: .userInitiated).async {
+    // 2.7.7：触控板锁是「持有 HID 独占句柄」实现的，进程一死句柄就释放，
+    // 所以正常情况下这里无事可做；留着是为了万一将来做成持久化锁，
+    // 重启时能明确放开，不会出现「触控板永久锁死」。
+    TrackpadLock.releaseAll()
     hlog("开始启动序列（恢复散热模式 / 键盘灯 / 亮度守护）")
     NativeAPI.startupSequence()
     hlog("启动序列完成，开启 EC 采样器")

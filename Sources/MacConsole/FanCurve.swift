@@ -1,5 +1,4 @@
 import Foundation
-import Combine
 
 // MARK: - 曲线数据模型
 
@@ -100,8 +99,23 @@ final class FanCurveController: ObservableObject {
     private var lastWrite = Date.distantPast
     private let minDwell: TimeInterval = 2.5
 
+    /// 2.7.6：控制环与「退出曲线模式」之间的竞态闸门。
+    ///
+    /// 以前 stop() 只是 cancel + 把 loop 置 nil，但 tick() 可能正跑到一半：
+    /// 它算完目标档位后调 fc.setLevel()，这一步会**重新打开 CTRL_1 手动门**并把
+    /// FAN_CTRL 写回 0x80|档位——如果它恰好落在 setMode("normal") 之后，
+    /// EC 的手动门就被重新打开了，界面表现为「从曲线切不回自动」。
+    /// 用户当时靠「先点手动再点自动」绕过去，正是因为第二次 stop() 之后没有
+    /// 在途 tick 了。
+    ///
+    /// 修法：所有 EC 写都放进这条串行队列，stop() 用 queue.sync 做一次栅栏，
+    /// 保证它返回之后不可能再有 tick 的写落地。
+    private let writeGate = DispatchQueue(label: "com.macconsole.fancurve.write")
+    private var running = false
+
     func start() {
         guard loop == nil else { return }
+        writeGate.sync { self.running = true }
         DispatchQueue.main.async { self.active = true }
         loop = Task { [weak self] in
             while !Task.isCancelled {
@@ -114,16 +128,31 @@ final class FanCurveController: ObservableObject {
     func stop() {
         loop?.cancel()
         loop = nil
+        // 栅栏：等在途 tick 的写事务收尾，之后 running=false 才生效
+        writeGate.sync { self.running = false }
+        // 曲线运行期间每一笔 setLevel() 都会打开 CTRL_1 手动门（0x741 bit0）。
+        // 2.8.14（用户要求）：**退出曲线必须把门关上**，否则 benchmarkMode() 恒为真，
+        // 控制页的散热档 / 功耗档会被全部挡掉（表现为「点了没反应」）。
+        // 关门走安全顺序（先放档位 0x751←0x00，再清门），不会触发 FAN_ABNORMAL。
+        let doorHeld = appliedLevel >= 0   // 99 = 高温兜底的 boost，同样算「我们开过门」
         appliedLevel = -1
         DispatchQueue.main.async { self.active = false }
+        if doorHeld {
+            let r = FanControl.shared.releaseManualDoor()
+            if r?.ok != true {
+                NSLog("[FanCurve] 退出手动门失败 status=%d（不影响曲线已停）", r?.status ?? -99)
+            }
+        }
     }
 
     /// 配置读取统一走主线程（UI 也在主线程写），避免结构体撕裂读。
     private func tick() {
         guard FanControl.kextLoaded() else { return }
-        let st = FanControl.shared.fanStatus()
+        // 2.8.15：温度走 SMC / NVAccel（NativeAPI.fanStatusCached），
+        // 曲线环**不再读 EC** —— 温度不来自 EC，转速只取缓存。
+        let st = NativeAPI.fanStatusCached()
         let cfg = DispatchQueue.main.sync { self.config }
-        // fanStatus() 返回的数值是 UInt8/Int 等具体类型，装箱进 Any 后不能用 as? Int
+        // 返回的数值是 UInt8/Int 等具体类型，装箱进 Any 后不能用 as? Int
         // 直接取（UInt8 不是 Int 的子类，会失败变成 0）；统一走 NSNumber 桥接最稳。
         let tc = (st["temp_cpu"] as? NSNumber)?.intValue ?? 0
         let tg = (st["temp_gpu"] as? NSNumber)?.intValue ?? 0
@@ -136,10 +165,12 @@ final class FanCurveController: ObservableObject {
 
         let fc = FanControl.shared
         if temp >= cfg.failsafeTemp {
-            if appliedLevel != 99 {
+            // 写事务必须过闸门：stop() 之后绝不能再碰 EC
+            writeGate.sync {
+                guard self.running, self.appliedLevel != 99 else { return }
                 _ = fc.setMode("boost")
-                appliedLevel = 99
-                lastWrite = Date()
+                self.appliedLevel = 99
+                self.lastWrite = Date()
             }
             DispatchQueue.main.async { [weak self] in
                 self?.currentTemp = temp
@@ -149,11 +180,14 @@ final class FanCurveController: ObservableObject {
         }
 
         let target = cfg.level(for: temp)
-        let now = Date()
-        if target != appliedLevel && now.timeIntervalSince(lastWrite) >= minDwell {
-            _ = fc.setLevel(target)
-            appliedLevel = target
-            lastWrite = now
+        writeGate.sync {
+            guard self.running else { return }
+            let now = Date()
+            if target != self.appliedLevel && now.timeIntervalSince(self.lastWrite) >= self.minDwell {
+                _ = fc.setLevel(target)
+                self.appliedLevel = target
+                self.lastWrite = now
+            }
         }
         DispatchQueue.main.async { [weak self] in
             self?.currentTemp = temp

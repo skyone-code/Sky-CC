@@ -3,8 +3,6 @@
 //  mcutil —— Mac控制台硬件命令行助手（原生，无 Python）
 //
 //  替代旧版 python后端/ 下 bright.py / rgbkb.py 的命令行用法：
-//     mcutil brightness get          读亮度（多显示器，与 bright.py get 同输出形状）
-//     mcutil brightness set 65       设亮度（0-100，内部确保面板 PWM 模式）
 //     mcutil rgb profile             打印保存的键盘灯效（无配置时打印 (无配置)）
 //     mcutil rgb apply               应用保存的键盘灯效（登录恢复用，带重试由调用方决定）
 //     mcutil rgb clear               清除保存的灯效
@@ -13,7 +11,7 @@
 //
 //  随 app 打包在 Contents/MacOS/mcutil（与主程序共用 Native/*.swift），
 //  因此在 app bundle 内运行时 Bundle.main 指向 app，可找到 native/bin/ 下的
-//  auxbright / pwmwake / nvmetemp。独立运行时回退 ~/bin 与 /usr/local/bin。
+//  nvmetemp。独立运行时回退 ~/bin 与 /usr/local/bin。
 //
 //  退出码：0 成功；1 用法错误；2 硬件操作失败（ok:false）。
 //
@@ -40,8 +38,6 @@ func usage() -> Never {
     let text = """
     用法: mcutil <命令> [参数]
 
-      brightness get              读取亮度
-      brightness set <0-100>      设置亮度
       rgb profile                 打印保存的键盘灯效（无配置输出 (无配置)）
       rgb apply                   应用保存的键盘灯效
       rgb clear                   清除保存的键盘灯效
@@ -76,7 +72,6 @@ func helperRunning() -> Bool {
 
 if cmd != "xpc", helperRunning(), !CommandLine.arguments.contains("--force") {
     let isWrite = (cmd == "fan" || cmd == "rgb")
-        || (cmd == "brightness" && rest.first == "set")
     if isWrite {
         fail("后台服务正在运行，它独占 EC/SMC 通道，直写会与其争用。\n"
              + "  建议改用 app 界面或 HTTP 接口；确需强来加 --force")
@@ -86,27 +81,6 @@ if cmd != "xpc", helperRunning(), !CommandLine.arguments.contains("--force") {
 }
 
 switch cmd {
-
-// MARK: - 亮度
-
-case "brightness":
-    guard let sub = rest.first else { usage() }
-    switch sub {
-    case "get":
-        printJSON(NativeBrightness.get())
-    case "set":
-        guard let v = Double(rest.dropFirst().first ?? "") else {
-            fail("用法: mcutil brightness set <0-100>")
-        }
-        // 与 Python 版一致：写亮度前确保面板在 PWM 模式，
-        // 否则唤醒后面板复位回 AUX，原生链路写的寄存器面板根本不听
-        _ = NativeBrightness.ensurePWMMode()
-        let r = NativeBrightness.set(v)
-        printJSON(r)
-        if r["ok"] as? Bool != true { exit(2) }
-    default:
-        usage()
-    }
 
 // MARK: - 键盘灯效
 
@@ -170,6 +144,13 @@ case "xpc":
     case "get":
         guard let path = rest.dropFirst().first else { usage() }
         printJSON(xpcCall(path, nil))
+    case "post":
+        // mcutil xpc post /api/fan '{"thermal":2}'
+        guard let path = rest.dropFirst().first,
+              let json = rest.dropFirst(2).first,
+              let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { usage() }
+        printJSON(xpcCall(path, obj))
     default:
         usage()
     }

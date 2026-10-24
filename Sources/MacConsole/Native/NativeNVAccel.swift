@@ -67,14 +67,17 @@ enum NVAccelUtil {
 
     /// 返回：
     ///   available  —— 驱动是否提供 NVAccel 服务
-    ///   reported   —— 驱动是否真的上报了利用率（本机该驱动为 false，见下）
+    ///   reported   —— 驱动是否真的上报了利用率（四个引擎全 0 时判为未上报）
     ///   gr/fb/enc/dec_pct —— 百分比（未上报时为 0）
     ///
-    /// 为什么要单列 `reported`：本机驱动（2.4.3 + NVK）会把整个样本结构写回来
+    /// 为什么要单列 `reported`：2.4.3 + NVK 时期的驱动会把整个样本结构写回来
     /// （时间戳递增、6 个引擎块结构完整、procId 恒为 0xFFFFFFFF），但 util 恒为 0，
-    /// 即便用 Metal 把独显压到满载（实测单次 dispatch 80ms）也是 0。
-    /// 也就是说这条 ctrl 在当前驱动上是「形状对、数值空」。
-    /// 界面据此显示「驱动未上报」而不是一个假的 0%，避免把不可用当空闲。
+    /// 即便用 Metal 把独显压到满载也是 0 —— 那条 ctrl 当时是「形状对、数值空」。
+    /// 现在（驱动已更新，含 PR #323 的温度上报）实测有真实数值：
+    ///   gr_pct 13.73 / fb_pct 1.20 / proc_id 159 / Temperature(C) 49℃
+    /// 所以判据保留但含义变了：全 0 只代表「这一拍四个引擎都没动」，
+    /// 界面据此显示「未上报」而不是一个假的 0%，避免把不可用当空闲。
+    /// 注意固件 14.4 秒才采一次样，数值是跳变的、不会平滑滑动。
     static func snapshot() -> [String: Any] {
         lock.lock()
         defer { lock.unlock() }
@@ -127,6 +130,38 @@ enum NVAccelUtil {
     static var connected: Bool {
         lock.lock(); defer { lock.unlock() }
         return hSubdev != 0
+    }
+
+    // MARK: GPU 核心温度（2.7.6 起，替代 EC 0x044F）
+
+    /// 读 NVAccel 自己上报的 GPU 核心温度（摄氏度）。
+    ///
+    /// 来源：nullmoth/nvidia-macos-driver PR #323（GeekAudio）——
+    /// 驱动侧用 250ms 定时器读 TSENS(0x20460)，把摄氏度写进 NVAccel 服务的
+    /// `PerformanceStatistics["Temperature(C)"]`（read-copy-modify-write，不动其他键）。
+    /// 这就是 iStat 读 GPU 面板走的那条路径。
+    ///
+    /// 为什么换掉 EC 0x044F：那个寄存器读的是「GPU 附近」的板级环境温度，
+    /// 满载时几乎不动（本机实测 CPU 64→89℃ 时它只有 60→62℃），拿它当独显温度
+    /// 会同时误导显示和风扇曲线。核心温度只有 TSENS 给得准。
+    ///
+    /// 两个细节按 PR 的说明处理：
+    ///   ① 驱动启动 5s 后才开始读 BAR0，此前的值不可用 → 读不到就返回 nil；
+    ///   ② GSP-RM 下 TSENS 的 valid 位恒为 0（这也是 gp100_therm_new() 在
+    ///      这些卡上放弃 attach 的原因），驱动改用「落在 1..125℃」做有效性判断，
+    ///      所以这里也只做范围校验，不看 valid 位。
+    ///
+    /// 注意：这是 IORegistry 属性读，不开 RM 通道、不需要 root、不碰 BAR0。
+    static func coreTemperatureC() -> Int? {
+        guard let svc = service() else { return nil }
+        defer { IOObjectRelease(svc) }
+        guard let unmanaged = IORegistryEntryCreateCFProperty(
+            svc, "PerformanceStatistics" as CFString, kCFAllocatorDefault, 0) else { return nil }
+        let v = unmanaged.takeRetainedValue()
+        guard let dict = v as? [String: Any],
+              let n = dict["Temperature(C)"] as? NSNumber else { return nil }
+        let c = n.intValue
+        return (c >= 1 && c <= 125) ? c : nil
     }
 
     // MARK: 底层

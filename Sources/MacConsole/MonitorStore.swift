@@ -42,6 +42,21 @@ final class MonitorStore: ObservableObject {
 
     var refreshInterval: TimeInterval = 1.0
 
+    /// 2.8.15「按需读 EC」的两个需求计数：
+    /// * liveFan   —— 有页面正在显示实时转速（性能页 / 风扇曲线页）
+    /// * lighting  —— 灯效页可见（海岸灯状态要从 EC 读）
+    /// 计数归零后 helper 侧的租约 10 秒内自然过期，EC 读取彻底停下。
+    private var liveFanDemand = 0
+    private var lightingDemand = 0
+
+    func demandLiveFan(_ on: Bool) {
+        liveFanDemand = max(0, liveFanDemand + (on ? 1 : -1))
+    }
+
+    func demandLighting(_ on: Bool) {
+        lightingDemand = max(0, lightingDemand + (on ? 1 : -1))
+    }
+
     func attach(_ backend: BackendService) {
         guard self.backend == nil else { return }
         self.backend = backend
@@ -74,6 +89,12 @@ final class MonitorStore: ObservableObject {
         if let d = BackendService.array(snap, "disks") as? [[String: Any]] { disks = d }
         if let p = BackendService.array(snap, "processes") as? [[String: Any]] { processes = p }
         if let f = BackendService.dict(snap, "fan"), !f.isEmpty { fan = f }
+        // 有页面在看实时转速：额外打一次 /api/fan/live —— 既是取值也是「续租」。
+        // 没有页面在看时这一整块不执行，helper 端也不会去读 EC。
+        if liveFanDemand > 0, let lf = try? await backend.getJSON("/api/fan/live") as? [String: Any],
+           !lf.isEmpty {
+            fan = lf
+        }
         if let v = BackendService.dict(snap, "volume"), !v.isEmpty { volume = v }
         snapshotMs = BackendService.int(snap, "elapsed_ms") ?? 0
         connected = true
@@ -111,6 +132,14 @@ final class MonitorStore: ObservableObject {
 
     func refreshSlow() async {
         guard let backend else { return }
+        // 2.8.15：灯效面（RGB 控制器 + 海岸灯）读的是 HID 与 EC，
+        // 只有「灯效」页可见时才轮询；其它页面一律不碰。
+        guard lightingDemand > 0 else { return }
+        await refreshLightingOnce(backend)
+    }
+
+    /// 灯效面单次刷新（RGB + 海岸灯）。供 onAppear 的「进页读一次」立即触发。
+    func refreshLightingOnce(_ backend: BackendService) async {
         async let rgbReq = backend.getJSON("/api/rgb")
         async let lbReq = backend.getJSON("/api/lightbar")
         if let r = try? await rgbReq as? [String: Any] { rgb = r }
@@ -134,7 +163,8 @@ final class MonitorStore: ObservableObject {
     var dgpuAvailable: Bool { BackendService.bool(dgpu, "available") ?? false }
     var dgpuUtil: Double { BackendService.double(dgpu, "gr_pct") ?? 0 }
 
-    /// 独显温度：EC 0x044F 读的是 PCIe 那张卡
+    /// 独显温度：2.7.6 起由 NVAccel 上报的 GPU 核心温度（PR #323），不再读 EC 0x044F。
+    /// 驱动未就绪/未上报时为 0，调用方按「不可用」处理。
     var gpuTemp: Double { Double(BackendService.int(live, "temp_gpu") ?? 0) }
     /// CPU 温度：优先 SMC 封装温度（TC0P，与 Stats 同源、读取更快），
     /// 拿不到再退 EC 的 temp_cpu（两路实测同值）。
@@ -146,7 +176,17 @@ final class MonitorStore: ObservableObject {
         return Double(BackendService.int(live, "temp_cpu") ?? 0)
     }
     /// 硬盘温度（NVMe SMART，15 秒缓存）
+    /// 2.7.6：概览页可以选看哪一块盘，选择存在 UserDefaults 里，
+    /// 这里跟着走 —— 这样 KPI 卡和 90 秒曲线用的是同一块盘，不会对不上。
     var diskTemp: Double? {
+        let target = UserDefaults.standard.string(forKey: "mc.overview.diskTarget") ?? ""
+        if !target.isEmpty {
+            for d in (BackendService.array(overview, "smart") as? [[String: Any]]) ?? [] {
+                guard (BackendService.string(d, "bsd") ?? "") == target,
+                      BackendService.bool(d, "ok") == true else { continue }
+                if let t = BackendService.double(d, "temperature_c") { return t }
+            }
+        }
         let d = BackendService.dict(overview, "disk_temp") ?? [:]
         guard (d["ok"] as? Bool) == true else { return nil }
         return BackendService.double(d, "temperature_c")
