@@ -520,6 +520,20 @@ enum NativeAPI {
                                              save: params["save"] as? Int ?? 1)
                 result = ["ok": kr == 0, "kr": kr, "mode": "keymap",
                           "keys": RGBProfile.keyRows * RGBProfile.keyCols]
+            case "matrix":
+                // 音乐律动每帧走这里（2026-10-25）：21 段频谱 → 6 行 × 21 列逐键上色。
+                // 与 keymap 的差别只有一点：**不每帧重进逐键模式** —— 每帧发一次 0x08
+                // 会打断正在刷的行数据，画面会闪；断流超过 1.5s 才补一次。
+                let rows = RGBProfile.normalizeKeymap(params["rows"])
+                let gap = Date().timeIntervalSince(RGBActivity.lastZones)
+                if gap > 1.5 {
+                    _ = kb.userMode(save: 0, brightness: RGBActivity.zoneBrightness)
+                    usleep(3_000)
+                }
+                let kr = try kb.setMatrixRows(rows)
+                RGBActivity.lastZones = Date()   // 告诉灯效保活：频谱在跑，别插手
+                result = ["ok": kr == 0, "kr": kr, "mode": "matrix", "entered": gap > 1.5]
+
             default:
                 break
             }

@@ -44,6 +44,11 @@ enum AppPolicy {
         if NSApp.activationPolicy() != .accessory { NSApp.setActivationPolicy(.accessory) }
         GestureHotkey.shared.reregister(reason: "toAccessory")
     }
+    /// 把 app 叫到前台。macOS 14 起 `activate(ignoringOtherApps:)` 已废弃且无效。
+    static func activateApp() {
+        NSApp.activate()
+    }
+
     /// 主窗口判定：可见、不是面板、宽度够大（菜单栏面板只有 300 左右）
     static var noMainWindow: Bool {
         !NSApp.windows.contains { w in
@@ -61,6 +66,14 @@ enum AppPolicy {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+
+    /// 单实例闸门。**必须在这里**（窗口还没建出来的时刻）：以前放在
+    /// `BackendService.start()` 里太晚，第二个进程的界面已经画到屏幕上了 ——
+    /// 用户实测「退出控制台再打开，出现两个控制台」。
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        // --ui-shots 时 InstanceLock 内部会自动跳过
+        InstanceLock.claimOrHandOff()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 卸载器用：一次清掉**全部** SMAppService 注册。
@@ -241,8 +254,7 @@ struct MacConsoleApp: App {
         // 2026-10-25：登录项启动不应该弹窗。SwiftUI 的 SceneBuilder 不支持 if，
         // 没法按系统版本套 defaultLaunchBehavior(.suppressed)，所以统一在
         // AppDelegate 里用「启动 0.2s 后收窗」兜底（窗口还没画出来就关掉了）。
-        windowGroup
-
+        mainWindow
         // 菜单栏常驻图标：窗口关掉后控制台仍在后台运行，硬件状态实时可见
         MenuBarExtra {
             MenuBarView()
@@ -260,8 +272,15 @@ struct MacConsoleApp: App {
     }
 
     // 主窗口场景。
-    private var windowGroup: some Scene {
-        WindowGroup(id: "main") {
+    //
+    // **2.8.15 之前这里是 `WindowGroup(id:)` —— 那是「万能开窗器」**：
+    // 每调一次 `openWindow(id: "main")` 就新建一个窗口，哪怕已经有一个在。
+    // 双击 app 启动时 SwiftUI 先建好一个窗口，接着
+    // `applicationDidFinishLaunching` 里那句 0.2s 后的 `.macConsoleShowMain`
+    // 又 openWindow 一次 —— 结果就是「退出控制台再打开，眼前两个控制台」。
+    // `Window`（macOS 13+）天生单例：已存在时 openWindow 只会把它叫到前面。
+    private var mainWindow: some Scene {
+        Window("Mac控制台", id: "main") {
             RootView()
                 .environmentObject(backend)
                 .environmentObject(store)
@@ -272,7 +291,7 @@ struct MacConsoleApp: App {
                     store.attach(backend)
                     // 主窗口可见 → 切回 regular，菜单栏出现程序名/关闭/退出
                     AppPolicy.toRegular()
-                    NSApp.activate(ignoringOtherApps: true)
+                    AppPolicy.activateApp()
                 }
         }
         .windowStyle(.titleBar)
@@ -293,17 +312,19 @@ struct MenuBarLabel: View {
             // 静默启动时主窗口没被创建，双击 app 图标要靠这里把窗口叫出来。
             // 放在菜单栏图标上是因为它常驻实例化，能拿到 openWindow 环境值。
             .onReceive(NotificationCenter.default.publisher(for: .macConsoleShowMain)) { _ in
-                openWindow(id: "main")
+                // 主窗口已经在（双击启动时 SwiftUI 自己建过一个）就只把它叫到前面，
+                // 不要再 openWindow —— 那是第二个窗口的老来源
+                if AppPolicy.noMainWindow { openWindow(id: "main") }
                 AppPolicy.toRegular()
-                NSApp.activate(ignoringOtherApps: true)
+                AppPolicy.activateApp()
             }
             // 2.8.4：第二个实例（比如两条登录项各拉起一个）抢锁失败时，
             // 会在这里发一条跨进程通知，把已有实例的窗口叫出来 ——
             // 用户看到的就是「点一下，窗口出来了」，而不是「双开」或「点了没反应」。
             .onReceive(DistributedNotificationCenter.default().publisher(for: .mcShowMainFromOther)) { _ in
-                openWindow(id: "main")
+                if AppPolicy.noMainWindow { openWindow(id: "main") }
                 AppPolicy.toRegular()
-                NSApp.activate(ignoringOtherApps: true)
+                AppPolicy.activateApp()
             }
     }
 }
@@ -329,9 +350,9 @@ struct MenuBarView: View {
                     .font(.system(size: 13, weight: .semibold))
                 Spacer()
                 Button("打开控制台") {
-                    openWindow(id: "main")
+                    if AppPolicy.noMainWindow { openWindow(id: "main") }
                     AppPolicy.toRegular()
-                    NSApplication.shared.activate(ignoringOtherApps: true)
+                    AppPolicy.activateApp()
                 }
                 .controlSize(.small)
             }
@@ -401,7 +422,7 @@ struct MenuBarView: View {
             syncFromBackend()
             // 2.7.1：MenuBarExtra 的 .window 面板同样依赖 app 处于 active 才会在
             // 点外部时收起；LSUIElement 常驻后台时不会自动激活，这里显式激活一次。
-            NSApplication.shared.activate(ignoringOtherApps: true)
+            NSApplication.shared.activate()
         }
         .onReceive(NotificationCenter.default.publisher(
             for: NSApplication.didBecomeActiveNotification)) { _ in

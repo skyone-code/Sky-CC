@@ -308,7 +308,7 @@ struct RGBView: View {
                                   : Theme.dim2)
                             .frame(width: 6, height: 6)
                         Text(music.running
-                             ? "运行中 · 跟随系统输出（12 Hz 六段频谱）"
+                             ? "运行中 · 跟随系统输出（21 段频谱条 · 左低右高）"
                              : (music.lastError.map { "未启动：\($0)" }
                                 ?? "点「确定应用」开始抓取系统输出"))
                             .font(.system(size: 10.5))
@@ -599,7 +599,7 @@ struct RGBView: View {
         effects.first { $0.0 == key }?.1 ?? key
     }
 
-    /// 音乐律动：先定亮度（helper 会记下来），再开始抓音频，之后每帧只发 6 行颜色
+    /// 音乐律动：先定亮度（helper 会记下来），再开始抓音频，之后每帧发 6×21 逐键颜色
     private func applyMusic() async {
         // 亮度必须先设：helper 进逐键模式时要用它，顺序反了首帧会按默认 75% 亮
         _ = await backend.post("/api/rgb",

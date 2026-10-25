@@ -42,82 +42,21 @@ final class BackendService: ObservableObject {
 
     // MARK: - 启动 / 停止
 
+    // MARK: - 启动
+
+    /// 2.8.4：单实例是内核 flock 原子锁（见 `InstanceLock`），先于一切动作执行。
+    /// 2026-10-25：闸门**提前**到 `applicationWillFinishLaunching`（那一处才是
+    /// 「窗口画出来之前」），这里保留一次是为了覆盖 `start()` 被多路调用的场景。
     func start() async {
         diag("start() 被调用（纯 XPC 客户端，无 HTTP）")
-        // 2.8.4：单实例改成内核 flock 原子锁（先于一切动作执行）。
-        // 「开机自启」只有 mainApp 一条登录项（静默启动 2.8.15 已删除），
-        // 但登录时仍可能与旧版本残留进程抢跑；flock 没有这个窗口期。
-        if !acquireInstanceLock() {
-            handOffToExistingInstance()
-            exit(0)
-        }
+        InstanceLock.claimOrHandOff()
         terminateIfDuplicateInstance()
         // UI 的全部数据都来自后台 helper，这一步失败界面才会真没得用
         await ensureHelper()
     }
 
-    // MARK: - 单实例锁
-
-    /// flock 的文件句柄。进程退出（含被杀）时内核自动释放，不会留下死锁。
-    private var instanceLockFD: Int32 = -1
-    /// 本进程是否已经持有锁（start() 会被调用多次，重复 flock 同一文件会自我冲突）
-    private var instanceLockAcquired = false
-
-    /// 抢全局单实例锁。true = 本进程是唯一实例。
-    private func acquireInstanceLock() -> Bool {
-        // 本进程已经拿到过锁：直接放行。
-        // flock 是按「打开文件描述」算的，同一进程再 open 一次同一个文件去加
-        // LOCK_EX|LOCK_NB 会失败 —— 不判这个标志，第二次 start() 会把
-        // 自己误判成「已有实例」然后 exit，表现就是 app 起来就没了。
-        if instanceLockAcquired { return true }
-
-        // 开发用 --ui-shots 时跳过：离屏截图要跟正在运行的实例并存。
-        if CommandLine.arguments.contains("--ui-shots") { return true }
-
-        let dir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/MacConsole", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let path = dir.appendingPathComponent("app.lock").path
-
-        let fd = open(path, O_CREAT | O_RDWR, 0o644)
-        guard fd >= 0 else {
-            // 拿不到锁文件（权限/磁盘异常）时不阻断启动，退回旧判断
-            diag("单实例锁文件打不开（errno \(errno)），退回 NSRunningApplication 判断")
-            return true
-        }
-        if flock(fd, LOCK_EX | LOCK_NB) != 0 {
-            close(fd)
-            return false
-        }
-        instanceLockFD = fd
-        instanceLockAcquired = true
-        let pidText = "\(getpid())\n"
-        ftruncate(fd, 0)
-        _ = pidText.withCString { write(fd, $0, strlen($0)) }
-        return true
-    }
-
-    /// 已有实例在跑：请它把主窗口叫出来，然后自己退场。
-    /// 跨进程用 DistributedNotificationCenter —— 本地 NotificationCenter 出不了进程。
-    private func handOffToExistingInstance() {
-        DistributedNotificationCenter.default().postNotificationName(
-            .mcShowMainFromOther, object: nil, userInfo: nil, deliverImmediately: true)
-        if let bid = Bundle.main.bundleIdentifier,
-           let other = NSRunningApplication.runningApplications(withBundleIdentifier: bid)
-            .first(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }) {
-            // macOS 14 起 activateIgnoringOtherApps 无效果（已被废弃）：
-            // 14+ 直接 activate()，老系统仍走旧参数。
-            if #available(macOS 14.0, *) {
-                other.activate()
-            } else {
-                other.activate(options: [.activateIgnoringOtherApps])
-            }
-        }
-        diag("已有实例在运行，本实例退出并把窗口交给它")
-    }
-
     /// 单实例：同一个 app 开两份会出现两个菜单栏图标、两条轮询。
-    /// 2.8.4 起主路径是 flock（见 acquireInstanceLock），这里只作为兜底：
+    /// 2.8.4 起主路径是 flock（见 InstanceLock），这里只作为兜底：
     /// 锁文件打不开时仍能靠它挡住明显重复的实例。
     private func terminateIfDuplicateInstance() {
         guard let bid = Bundle.main.bundleIdentifier else { return }
@@ -128,7 +67,7 @@ final class BackendService: ObservableObject {
             .filter { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
         if !others.isEmpty {
             diag("检测到另一个 Mac控制台 实例（pid \(others.map(\.processIdentifier))），本实例退场")
-            handOffToExistingInstance()
+            InstanceLock.handOff()
             exit(0)
         }
     }
@@ -392,5 +331,83 @@ final class BackendService: ObservableObject {
     }
     static func array(_ d: Any?, _ key: String) -> [Any]? {
         (d as? [String: Any])?[key] as? [Any]
+    }
+}
+
+// MARK: - 全局单实例闸门
+
+/// 同一个 app 被拉起两份会同时出现两个菜单栏图标、两条 EC 轮询、两个主窗口。
+/// 用内核 flock 抢一把原子锁：抢到的继续跑，抢不到的发一条「请把窗口叫出来」
+/// 跨进程通知然后自己 exit。
+///
+/// **2026-10-25 修「退出控制台再打开，冒出两个控制台」**：
+/// 以前这把锁是在 `BackendService.start()` 里抢的，而 start() 由
+/// `applicationDidFinishLaunching` 里的 Task 和主窗口 onAppear 各调一次 ——
+/// 那时窗口早就画完了，第二个进程的界面已经摆到用户脸上才被 exit 掉。
+/// 现在闸门提前到 `applicationWillFinishLaunching`：窗口还没建就先判。
+enum InstanceLock {
+    private static var fd: Int32 = -1
+    private static var held = false
+
+    /// 抢锁。true = 本进程是唯一实例。
+    static func acquire() -> Bool {
+        // 本进程已经拿到过锁：直接放行。flock 按「打开文件描述」算，同一进程
+        // 再 open 一次同一个文件去加 LOCK_EX|LOCK_NB 会失败。
+        if held { return true }
+        // 开发用 --ui-shots 时跳过：离屏截图要跟正在运行的实例并存
+        if CommandLine.arguments.contains("--ui-shots") { return true }
+
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/MacConsole", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let path = dir.appendingPathComponent("app.lock").path
+
+        let f = open(path, O_CREAT | O_RDWR, 0o644)
+        guard f >= 0 else {
+            // 拿不到锁文件（权限/磁盘异常）时不阻断启动，退回 NSRunningApplication 判断
+            log("锁文件打不开（errno \(errno)），退回 NSRunningApplication 判断")
+            return true
+        }
+        if flock(f, LOCK_EX | LOCK_NB) != 0 {
+            close(f)
+            return false
+        }
+        fd = f
+        held = true
+        ftruncate(f, 0)
+        let pidText = "\(getpid())\n"
+        _ = pidText.withCString { write(f, $0, strlen($0)) }
+        return true
+    }
+
+    /// 抢不到就交棒给已有实例并退场（不返回）。
+    static func claimOrHandOff() {
+        guard !acquire() else { return }
+        handOff()
+        exit(0)
+    }
+
+    /// 已有实例在跑：请它把主窗口叫出来。
+    /// 跨进程只能用 DistributedNotificationCenter —— 本地 NotificationCenter 出不了进程。
+    static func handOff() {
+        DistributedNotificationCenter.default().postNotificationName(
+            .mcShowMainFromOther, object: nil, userInfo: nil, deliverImmediately: true)
+        if let bid = Bundle.main.bundleIdentifier,
+           let other = NSRunningApplication.runningApplications(withBundleIdentifier: bid)
+            .first(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }) {
+            other.activate()
+        }
+        log("已有实例在运行，本实例退场并把窗口交给它")
+    }
+
+    private static func log(_ s: String) {
+        let line = "[\(Date())] lock: \(s)\n"
+        guard let data = line.data(using: .utf8) else { return }
+        let url = URL(fileURLWithPath: "/tmp/macconsole-swift.log")
+        if let h = try? FileHandle(forWritingTo: url) {
+            h.seekToEndOfFile(); h.write(data); try? h.close()
+        } else {
+            try? data.write(to: url)
+        }
     }
 }
