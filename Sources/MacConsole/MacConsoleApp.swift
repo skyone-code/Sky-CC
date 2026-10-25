@@ -71,6 +71,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// `BackendService.start()` 里太晚，第二个进程的界面已经画到屏幕上了 ——
     /// 用户实测「退出控制台再打开，出现两个控制台」。
     func applicationWillFinishLaunching(_ notification: Notification) {
+        // 卸载器的命令行模式要在「app 正开着」的时候也能跑，既不能抢锁退场，
+        // 更不能顺手把正在跑的实例窗口叫出来。
+        let args = CommandLine.arguments
+        if args.contains("--unregister-all") || args.contains("--unregister-helper") { return }
         // --ui-shots 时 InstanceLock 内部会自动跳过
         InstanceLock.claimOrHandOff()
     }
