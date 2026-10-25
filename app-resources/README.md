@@ -1,5 +1,20 @@
 # Mac 控制台 · LAPQC71D
 
+> **⚠️ 这是一份历史文档（2026-10-25 加注）**
+>
+> 本文描述的是 2.x 早期那套 **Python 后端 + 浏览器 UI**（`server.py` + `web/`）。
+> 那套实现已于 2.6.0 被原生 XPC 架构取代，其源码（`server.py` / `fanctl.py` /
+> `hid.py` / `rgbkb.py` / `smc.py` / `bright.py` / `auxsmooth.py`、静态页 `web/`、
+> `vendor/` 与配套 `.command` 脚本）已于 2026-10-25 从工作树删除，
+> **需要翻原件请查 git 历史**（`git log --all -- app-resources/`）。
+>
+> 保留本文的原因是它记录的**实测结论**仍然有效且未被别处完整覆盖 ——
+> 键盘灯协议与颜色分平面、`0x7AB` 档位魔数的推导过程、白色光谱校准、
+> 真满载下三档行为的差异、以及一批「为什么不可行」的死路证据。
+> 现行 Swift 实现在 `Sources/MacConsole/Native/`，硬件权威表在
+> `08-GamingCenter逆向资料/01-源码/GamingCenter.Replica/docs/EC-Map.md`。
+> **读本文时把「Python」理解成「当时的实现载体」，结论部分照旧可信。**
+
 在 macOS（黑苹果）上复刻 OEM Control Center 的硬件控制面板。  
 基于你提供的 Windows 版 Control Center 安装文件逆向实现，**纯 Python 标准库 + ctypes 直调 IOKit，零第三方依赖**。
 

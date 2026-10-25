@@ -37,8 +37,9 @@ STAGE="${MC_STAGE:-$BUILD/swift-stage}"
 # 后端资源（kext / 助手二进制 / 恢复脚本）住在 app-resources/。
 # 本轮清理之前这个目录叫 python后端/ —— 那是 2.0 时代内置 Python 后端的名字，
 # 2.6.0 去 Python 化之后名不副实，已随遗留清理改名。
-# 目录里仍留着当年的 .py 参考实现（server.py / fanctl.py …）与静态页 web/，
-# 构建**完全不使用**它们，只是移植时的对照原件。
+# 当年的 .py 实现、静态页 web/、vendor/ 与那批 .command 启动脚本已一并删除
+# （git 历史里还在）；目录里的 README.md 留作那份实现的逆向结论与实测记录。
+# 现在构建只吃这四样：TongfangFan.kext、bin/、restore_rgb.sh、scripts 来自 templates/。
 PROJ="$BUILD/app-resources"
 [ -d "$PROJ" ] || { echo "错误：找不到资源目录 $PROJ" >&2; exit 1; }
 
