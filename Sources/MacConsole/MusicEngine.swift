@@ -1,6 +1,8 @@
 import Foundation
 import CoreAudio
+import CoreGraphics
 import Accelerate
+import AppKit
 
 // ============================================================================
 // 音乐律动（2026-10-25）
@@ -31,6 +33,11 @@ final class MusicAnalyzer {
     private var acc: [Float] = []
     private var levels = [Float](repeating: 0, count: 6)
     private var peaks = [Float](repeating: 0.02, count: 6)
+
+    /// 曾经收到过非零采样吗。
+    /// **TCC 未授权时 tap 照常创建、回调照常触发、数据全是 0** —— 这是唯一能识别
+    /// 「被拒绝」还是「真的没在放音乐」的线索。音频线程写，主线程读。
+    var sawSignal = false
     /// 1024 点 @48kHz ≈ 21ms 一帧；每 4 帧出一次 ≈ 12Hz，够顺滑又不占 HID
     private var frames = 0
     private let every = 4
@@ -101,6 +108,7 @@ final class MusicAnalyzer {
             var sum: Float = 0
             for k in lo..<hi { sum += mags[k] * mags[k] }
             let rms = (sum / Float(hi - lo)).squareRoot()
+            if rms > 1e-6 { sawSignal = true }
             peaks[b] = max(rms, peaks[b] * 0.99, 0.02)
             let v = min(1, rms / peaks[b])
             levels[b] = max(v, levels[b] * 0.72)   // 起得快、落得慢，看起来更像律动
@@ -115,11 +123,14 @@ final class MusicEngine: ObservableObject {
 
     @Published private(set) var running = false
     @Published private(set) var lastError: String?
+    /// 起了但收不到声音时给出的解释（权限 / 没在放音乐），UI 直接显示
+    @Published private(set) var hint: String?
 
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggID = AudioObjectID(kAudioObjectUnknown)
     private var procID: AudioDeviceIOProcID?
     private let analyzer = MusicAnalyzer()
+    private var watchdog: DispatchSourceTimer?
 
     var available: Bool {
         if #available(macOS 14.2, *) { return true }
@@ -193,11 +204,49 @@ final class MusicEngine: ObservableObject {
             stop()
             return false
         }
+        analyzer.sawSignal = false
+        hint = nil
         running = true
+        startWatchdog()
         return true
     }
 
+    /// 起了却没声音时的自检。
+    ///
+    /// 为什么要这个：`kTCCServiceAudioCapture`（系统设置 →「屏幕与系统音频录制」→
+    /// 「仅系统音频录制」）没授权时，**MAC 不会报错** —— tap 创建成功、回调照常
+    /// 触发、每个采样都是 0.0，看上去和「刚好没放音乐」一模一样。不说清楚的话，
+    /// 用户只会觉得「音乐律动没用」。
+    private func startWatchdog() {
+        watchdog?.cancel()
+        let t = DispatchSource.makeTimerSource(queue: .main)
+        t.schedule(deadline: .now() + 2.5, repeating: 2.5)
+        t.setEventHandler { [weak self] in
+            guard let self, self.running else { return }
+            if self.analyzer.sawSignal {
+                self.hint = nil
+                self.watchdog?.cancel()
+                self.watchdog = nil
+            } else if self.hint == nil {
+                self.hint = "收不到声音：如果正在放音乐，多半是「仅系统音频录制」没授权"
+            }
+        }
+        t.resume()
+        watchdog = t
+    }
+
+    /// 直接跳到「屏幕与系统音频录制」这一页，省得用户自己找
+    static func openPrivacySettings() {
+        for s in ["x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+                  "x-apple.systempreferences:com.apple.preference.security?Privacy"] {
+            if let u = URL(string: s), NSWorkspace.shared.open(u) { return }
+        }
+    }
+
     func stop() {
+        watchdog?.cancel()
+        watchdog = nil
+        hint = nil
         if let proc = procID {
             AudioDeviceStop(aggID, proc)
             AudioDeviceDestroyIOProcID(aggID, proc)

@@ -442,7 +442,9 @@ enum NativeAPI {
                 let kr = kb.disable()
                 result = ["ok": kr == 0, "kr": kr, "mode": "off"]
             case "brightness":
-                let kr = try kb.setBrightness(params["level"] as? Int ?? 75)
+                let level = params["level"] as? Int ?? 75
+                let kr = try kb.setBrightness(level)
+                RGBActivity.zoneBrightness = level   // 音乐律动重进逐键模式时沿用它
                 result = ["ok": kr == 0, "kr": kr, "mode": "brightness"]
             case "effect":
                 // 自带 hex 就走「命名色 0x14 + 槽位」，让灯效跑在自定义颜色上；
@@ -492,15 +494,24 @@ enum NativeAPI {
                     [z[0] as? Int ?? 0, z[1] as? Int ?? 0, z[2] as? Int ?? 0]
                 }
                 guard !zones.isEmpty else { return ["ok": false, "error": "zones 为空"] }
-                // 音乐律动每秒要发十几帧：亮度由调用方一次性设好，这里只在显式给值时重设
-                // （0x09 + 50ms 等待会把帧率压到个位数）
+                // 亮度由调用方一次性设好（0x09 + 50ms 等待会把帧率压到个位数），
+                // 这里只在显式给值时重设，并记下来给「重进逐键模式」用。
                 if let b = params["brightness"] as? Int {
                     _ = try kb.setBrightness(b)
+                    RGBActivity.zoneBrightness = b
                     usleep(50_000)
                 }
-                let kr = try kb.setZoneColors(zones, repeat: 1, save: 1)
+                // 关键：芯片不在逐键模式时，行数据写进去等于白写（灯还停在原来的灯效上，
+                // 看上去就是「音乐律动无效」）。断流超过 1.5s 就补一次 0x08 进模式。
+                // 正常流帧间隔 ~83ms，只在首帧和断流恢复时才走这条路。
+                let gap = Date().timeIntervalSince(RGBActivity.lastZones)
+                if gap > 1.5 {
+                    _ = kb.userMode(save: 0, brightness: RGBActivity.zoneBrightness)
+                    usleep(3_000)
+                }
+                let kr = try kb.setZoneColors(zones, repeat: 1)
                 RGBActivity.lastZones = Date()   // 告诉灯效保活：这边在刷帧，别插手
-                result = ["ok": kr == 0, "kr": kr, "mode": "zones"]
+                result = ["ok": kr == 0, "kr": kr, "mode": "zones", "entered": gap > 1.5]
             case "keymap":
                 // 2.8.8 逐键投影：6 行 × 21 列，每格一个颜色（固件码 0x33 + 行数据）
                 let rows = RGBProfile.normalizeKeymap(params["rows"])

@@ -44,7 +44,7 @@ PROJ="$BUILD/app-resources"
 [ -d "$PROJ" ] || { echo "错误：找不到资源目录 $PROJ" >&2; exit 1; }
 
 # 版本号（唯一来源：脚本注入 Info.plist 与 helper 的 BuildVersion.swift）
-VERSION="3.0.1.1"
+VERSION="3.0.1.2"
 # 显示版本（侧边栏/设置页文案）：数字版本 + 专用版标识
 DISPLAY_VERSION="$VERSION LAPQC71专版"
 # nvmetemp（NVMe 硬盘温度，SMART）——有现成二进制就用，

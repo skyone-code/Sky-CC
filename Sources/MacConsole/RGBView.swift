@@ -298,19 +298,35 @@ struct RGBView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            // 音乐律动的状态（2.7.x 起这个灯效一直是「无效」的：见 MusicEngine.swift）
+            // 音乐律动的状态（固件 0x22 不会自己动，真正的分析在 MusicEngine）
             if currentEffect == .music {
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(music.running ? Theme.green : Theme.dim2)
-                        .frame(width: 6, height: 6)
-                    Text(music.running
-                         ? "运行中 · 跟随系统输出（12Hz 六段频谱）"
-                         : (music.lastError.map { "未启动：\($0)" }
-                            ?? "点「确定应用」开始抓取系统输出（Core Audio tap，无需屏幕录制权限）"))
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(music.running ? Theme.dim : Theme.amber)
-                    Spacer(minLength: 0)
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(music.running
+                                  ? (music.hint == nil ? Theme.green : Theme.amber)
+                                  : Theme.dim2)
+                            .frame(width: 6, height: 6)
+                        Text(music.running
+                             ? "运行中 · 跟随系统输出（12 Hz 六段频谱）"
+                             : (music.lastError.map { "未启动：\($0)" }
+                                ?? "点「确定应用」开始抓取系统输出"))
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(music.running ? Theme.dim : Theme.amber)
+                        Spacer(minLength: 0)
+                    }
+                    if let h = music.hint {
+                        HStack(alignment: .top, spacing: 8) {
+                            Text(h + "。授权后回来再点一次「确定应用」；仍无声就重启控制台。")
+                                .font(.system(size: 10))
+                                .foregroundStyle(Theme.amber)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Spacer(minLength: 0)
+                            SecondaryButton(title: "去授权", icon: "lock.open", tint: Theme.blue) {
+                                MusicEngine.openPrivacySettings()
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -583,15 +599,18 @@ struct RGBView: View {
         effects.first { $0.0 == key }?.1 ?? key
     }
 
-    /// 音乐律动：启动音频抓取，亮度先设一次，之后每帧只发 6 行颜色
+    /// 音乐律动：先定亮度（helper 会记下来），再开始抓音频，之后每帧只发 6 行颜色
     private func applyMusic() async {
+        // 亮度必须先设：helper 进逐键模式时要用它，顺序反了首帧会按默认 75% 亮
+        _ = await backend.post("/api/rgb",
+                               ["mode": "brightness", "level": Int(effectBright), "remember": false])
+        // 先停再起：start() 在运行中会直接返回 true，那样用户「授权后再点一次」等于没点，
+        // 旧的 tap 还挂着全零数据。
+        music.stop()
         guard music.start() else {
             showToast("音乐律动启动失败：\(music.lastError ?? "未知原因")")
             return
         }
-        // 亮度单独设一次；不带 remember，避免把「音乐律动」写进存档（存档里没有它的动画）
-        _ = await backend.post("/api/rgb",
-                               ["mode": "brightness", "level": Int(effectBright), "remember": false])
         effectDirty = false
         locks.lock("effect", 4.0)
         showToast("音乐律动已启动 · 跟随系统输出")

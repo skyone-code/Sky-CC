@@ -579,7 +579,10 @@ final class KeyboardRGB {
     }
 
     /// 按行下发颜色（键盘 6 行 × 21 列），颜色过原厂补偿。
-    func setZoneColors(_ zones: [[Int]], repeat count: Int = 1, save: Int = 1) throws -> Int {
+    ///
+    /// ⚠️ 只写行数据，**不会**切模式 —— 调用方必须保证芯片已经在逐键模式
+    /// （`userMode`）。每帧都调 `userMode` 会让 0x08 打断正在刷的行，画面会闪。
+    func setZoneColors(_ zones: [[Int]], repeat count: Int = 1) throws -> Int {
         guard !zones.isEmpty else {
             throw NSError(domain: "KeyboardRGB", code: -1,
                           userInfo: [NSLocalizedDescriptionKey: "zones 不能为空"])
@@ -769,13 +772,17 @@ enum RGBProfile {
                                      palette: palette,
                                      direction: prof["direction"] as? Int ?? 1)
             case "zones":
-                _ = try kb.setBrightness(normalizePct(prof["brightness"] as? Int ?? 75))
+                let zb = normalizePct(prof["brightness"] as? Int ?? 75)
+                _ = try kb.setBrightness(zb)
                 usleep(20_000)
                 let zones = (prof["zones"] as? [[Any]] ?? []).map { z in
                     [z[0] as? Int ?? 0, z[1] as? Int ?? 0, z[2] as? Int ?? 0]
                 }
                 guard !zones.isEmpty else { return ["ok": false, "error": "配置里的 zones 为空"] }
-                kr = try kb.setZoneColors(zones, repeat: 1, save: save)
+                // 行数据只有在逐键模式下才生效
+                _ = kb.userMode(save: save, brightness: zb)
+                usleep(3_000)
+                kr = try kb.setZoneColors(zones, repeat: 1)
             case "keymap":
                 kr = try kb.setKeyMatrix(normalizeKeymap(prof["rows"]),
                                          brightness: normalizePct(prof["brightness"] as? Int ?? 75),
@@ -815,10 +822,17 @@ enum RGBProfile {
 enum RGBActivity {
     private static let lock = NSLock()
     private static var zonesAt = Date.distantPast
+    private static var zoneBright = 75
 
     static var lastZones: Date {
         get { lock.lock(); defer { lock.unlock() }; return zonesAt }
         set { lock.lock(); zonesAt = newValue; lock.unlock() }
+    }
+
+    /// 逐行上色用的亮度（音乐律动每帧都不带亮度，进逐键模式时得有个值）
+    static var zoneBrightness: Int {
+        get { lock.lock(); defer { lock.unlock() }; return zoneBright }
+        set { lock.lock(); zoneBright = max(0, min(100, newValue)); lock.unlock() }
     }
 
     /// 15 秒内刷过逐行上色 = 音乐律动还活着

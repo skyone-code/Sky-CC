@@ -24,6 +24,8 @@
 	<string>2.3.1</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>音乐律动需要读取系统正在播放的声音，用来分析频谱并驱动键盘灯效。音频只在内存里做 FFT，不录制、不保存、不上传。</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 	<key>LSUIElement</key>
