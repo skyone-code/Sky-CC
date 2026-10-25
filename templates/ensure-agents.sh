@@ -10,7 +10,7 @@
 #   装过的 rgbrestore 停掉并删除 plist。
 #
 # 同时让位已废弃的守护：
-#   com.user.pwmwake   面板 PWM 模式保持器（现由 helper 子进程 PwmKeeper 托管）
+#   com.user.pwmwake   面板 PWM 模式保持器（3.0.1 起 app 已彻底移除，这里只清旧机器残留）
 #   com.user.auxbright 更早的亮度守护（v4 watch）
 #   com.user.auxsmooth 更早的亮度渐变守护（Python 时代）
 # 这三个 plist 只改名 .disabled 备份（用户想回退 mv 回来即可），不删。

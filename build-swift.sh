@@ -44,7 +44,7 @@ PROJ="$BUILD/app-resources"
 [ -d "$PROJ" ] || { echo "错误：找不到资源目录 $PROJ" >&2; exit 1; }
 
 # 版本号（唯一来源：脚本注入 Info.plist 与 helper 的 BuildVersion.swift）
-VERSION="3.0.1"
+VERSION="3.0.1.1"
 # 显示版本（侧边栏/设置页文案）：数字版本 + 专用版标识
 DISPLAY_VERSION="$VERSION LAPQC71专版"
 # nvmetemp（NVMe 硬盘温度，SMART）——有现成二进制就用，
@@ -183,24 +183,8 @@ swiftc -O -target x86_64-apple-macosx14.0 \
   "$SWIFT"/Sources/MacConsoleHelper/main.swift \
   "$SWIFT"/Sources/MacConsole/Native/*.swift "$SWIFT"/Sources/MacConsole/FanCurve.swift
 
-# pwmwake（面板 PWM 模式保持器）：2.8.11 起由 MacConsoleHelper 作为子进程托管，
-# 不再注册登录项 com.user.pwmwake。只保持 DPCD 0x721=0x08，不参与亮度调节。
-PWMWAKE_SRC=""
-for cand in "$PROJ/bin/pwmwake" "$HOME/bin/pwmwake" "/usr/local/bin/pwmwake"; do
-  [[ -x "$cand" ]] && PWMWAKE_SRC="$cand" && break
-done
-if [[ -n "$PWMWAKE_SRC" ]]; then
-  echo "==> pwmwake: $PWMWAKE_SRC"
-else
-  echo "警告：找不到 pwmwake，面板 PWM 模式保持会跳过（不影响风扇/灯效）" >&2
-fi
-
 echo "==> 4/8 组装 app bundle（原生资源，无 Python）"
 cp -R "$PROJ/TongfangFan.kext" "$NATIVE/"
-if [[ -n "$PWMWAKE_SRC" ]]; then
-  cp "$PWMWAKE_SRC" "$NATIVE/bin/pwmwake"
-  chmod 755 "$NATIVE/bin/pwmwake"
-fi
 if [[ -x "$PROJ/bin/nvmetemp" ]]; then
   cp "$PROJ/bin/nvmetemp" "$NATIVE/bin/nvmetemp"
   chmod 755 "$NATIVE/bin/nvmetemp"

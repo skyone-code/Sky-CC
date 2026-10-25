@@ -1341,7 +1341,7 @@ enum NativeAPI {
         // （/bin/bash 跑 restore_rgb.sh）在登录时再恢复一次 —— 同一件事做两遍，
         // 用户登录项列表里还多一个 bash。现在登录项已删除，恢复完全由 helper 负责；
         // 把「开机初期 USB 键盘还没枚举完」的重试也从脚本搬到这里（后台队列，
-        // 不拖住 PwmKeeper / 登录项清理这些后续动作）。
+        // 不拖住登录项清理这些后续动作）。
         DispatchQueue.global(qos: .utility).async {
             for attempt in 1...30 {
                 let rr = RGBProfile.apply()
@@ -1365,9 +1365,6 @@ enum NativeAPI {
                 Thread.sleep(forTimeInterval: 2)
             }
         }
-        // 面板 PWM 模式保持：pwmwake 作为 helper 的子进程活着，
-        // 不再单独注册登录项 com.user.pwmwake（2.8.11 用户要求）
-        if PwmKeeper.startIfNeeded() { PwmKeeper.ensureOnce() }
         // 登录项
         installLoginAgents()
     }

@@ -7,7 +7,7 @@
 #       launchd、内核扩展、偏好设置里都不再有它的痕迹。
 #
 # 具体清这些东西：
-#   ① 进程      主程序（含静默启动拉起的实例）、MacConsoleHelper、pwmwake 子进程
+#   ① 进程      主程序（含旧版拉起的实例）、MacConsoleHelper、历史 pwmwake 残留进程
 #   ② 系统注册  SMAppService 的注册（helper / mainApp 登录项；autostart 是 ≤2.8.15
 #               的历史遗留，打包时已移除那份 plist，这里只清旧机器残留）
 #               —— 这些记录在系统数据库里，删 plist 或 bootout 都清不掉，
@@ -50,7 +50,7 @@ echo "  Mac 控制台 · 彻底卸载"
 echo "=============================================="
 echo
 echo "将要清除："
-echo "  · 主程序 / 后台守护 / pwmwake 子进程"
+echo "  · 主程序 / 后台守护 / 历史 pwmwake 残留进程"
 echo "  · 登录项与后台任务注册（helper、静默启动、开机自启）"
 echo "  · TongfangFan.kext 与它的开机加载项"
 echo "  · $SUPPORT（灯效 / 风扇曲线 / 软件记忆）"

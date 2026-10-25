@@ -86,8 +86,6 @@ final class HelperService: NSObject, MCHelperProtocol {
             hlog("收到 shutdown 请求，退出以便 launchd 拉起新版本")
             reply(["ok": true])
             DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) {
-                // 顺手收掉 pwmwake 子进程，避免留孤儿抢着写 DPCD
-                PwmKeeper.stop()
                 hlog("exit(0)")
                 exit(0)
             }
