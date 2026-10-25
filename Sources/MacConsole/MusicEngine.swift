@@ -54,13 +54,12 @@ final class MusicAnalyzer {
 
     /// 每段包络（快起慢落）
     private var env = [Float](repeating: 0, count: MusicAnalyzer.cols)
-    /// 每段自适应峰值（dB），AGC 用
-    private var peakDB = [Float](repeating: -70, count: MusicAnalyzer.cols)
-
-    /// 鼓点：全带能量与滑动均值的比值
-    private var beatAvg: Float = 0
-    private var pulse: Float = 0
-    private var lastBeat = Date.distantPast
+    /// **全局**自适应峰值（dB）。一条，不是每段各一条 ——
+    /// 每段各归一（3.0.1.3 那版）的结果是「安静的高频段也被拉到满格」，
+    /// 21 根柱子永远一样高，看着就不像跟着音乐走。
+    private var peakDB: Float = -90
+    /// 噪声底（dB）：缓慢上爬、立即下探。用来判「到底有没有在放声音」。
+    private var noiseFloor: Float = 0
 
     /// 下发节流：~16fps。再快也只是让 XPC 排队（每帧 = 6 行 × 2 笔 HID）
     private let emitInterval: TimeInterval = 0.06
@@ -146,36 +145,41 @@ final class MusicAnalyzer {
             }
         }
 
-        // ---- 鼓点：全带能量 vs 滑动均值（业界通行的能量法，简单且够用）
-        var total: Float = 0
-        for k in 3..<min(400, n / 2) { total += mags[k] * mags[k] }
-        let energy = total.squareRoot()
-        if energy > 0.01 { sawSignal = true }
-        beatAvg = beatAvg == 0 ? energy : beatAvg * 0.90 + energy * 0.10
-        if energy > 0.02, energy > beatAvg * 1.45,
-           Date().timeIntervalSince(lastBeat) > 0.16 {
-            lastBeat = Date()
-            pulse = 1
-        } else {
-            pulse *= 0.80
-        }
-
-        // ---- 21 段电平
+        // ---- 21 段 dB（只算一遍，后面三个判断都吃这一份结果）
+        var dbArr = [Float](repeating: -90, count: Self.cols)
+        var program: Float = -90          // 节目电平 = 这一帧最响的那一段
         for b in 0..<Self.cols {
             let lo = bandLo[b], hi = bandHi[b]
             var power: Float = 0
             for k in lo..<hi { power += mags[k] * mags[k] }
             power /= Float(hi - lo)
-            let db = 10 * log10f(power + 1e-10)
+            let db = 10 * log10f(power + 1e-12)
+            dbArr[b] = db
+            if db > program { program = db }
+        }
+        if program > -78 { sawSignal = true }
 
-            // AGC：以「最近见过的最响」为 100%，往下 26dB 归 0。
-            // 峰值每帧最多回落 0.44dB（≈9dB/s），所以安静段落不会瞬间变满格。
-            peakDB[b] = max(db, peakDB[b] - 0.44)
-            let span: Float = 26
-            var v = (db - (peakDB[b] - span)) / span
-            v = min(1, max(0, v))
-            // 快起慢落：起音立即跟上（打击乐有冲击力），回落 ~200ms（不闪）
-            env[b] = v > env[b] ? v : env[b] * 0.70 + v * 0.30
+        // ---- 噪声底：立即下探、缓慢上爬（0.2dB/帧 ≈ 12dB/s）
+        noiseFloor = noiseFloor == 0 ? program : min(program, noiseFloor + 0.2)
+
+        // ---- 静音判定：电平趴在噪声底上 → 没在放声音，整块黑。
+        // 这是「一开始都是黑的」那条要求的落点：不是靠 env 慢慢衰减到很小，
+        // 而是只要没超过底噪 6dB，就直接归零。
+        let active = program > noiseFloor + 6
+
+        // ---- 全局峰值（AGC）：回落 0.45dB/帧 ≈ 27dB/s
+        peakDB = max(program, peakDB - 0.45)
+        let span: Float = 30              // 峰值往下 30dB 归 0
+
+        for b in 0..<Self.cols {
+            var v: Float = 0
+            if active {
+                v = (dbArr[b] - (peakDB - span)) / span
+                v = min(1, max(0, v))
+                if v < 0.08 { v = 0 }     // 门槛：宁可黑，也不挂一格毛刺
+            }
+            // 快起慢落：起音立刻跟上（打击乐有冲击力），回落约 200ms（不闪）
+            env[b] = v > env[b] ? v : env[b] * 0.62 + v * 0.38
         }
     }
 
@@ -183,21 +187,23 @@ final class MusicAnalyzer {
     private func render() -> [[[Int]]] {
         var out = [[[Int]]](repeating: [[Int]](repeating: [0, 0, 0], count: Self.cols),
                             count: Self.rows)
-        let boost = 0.82 + 0.34 * pulse
         for c in 0..<Self.cols {
             let v = env[c]
+            if v <= 0.06 { continue }          // 静音 → 整列纯黑（不给底色）
             let h = v * Float(Self.rows)
             let full = min(Self.rows, Int(h))
             let frac = h - Float(full)
             let (r, g, b) = Self.bandColor(c)
             for row in 0..<Self.rows {
-                // 行 0 = 最上面一排（F 排），行 5 = 空格那排 —— 所以从 5 往上数
+                // 数组是**屏幕顺序**（行 0 = 最上面的 F 排），所以最底行是 rows-1；
+                // 芯片侧的物理行是反的（0 = 最下面），那个反转在
+                // KeyboardRGB.setMatrixRows 里统一做，这里只管屏幕顺序。
                 let level = Self.rows - 1 - row
                 var k: Float = 0
                 if level < full { k = 1 }
                 else if level == full { k = frac }
-                if k <= 0.03 { continue }
-                let s = min(1, powf(k, 0.85) * boost)
+                if k <= 0.05 { continue }
+                let s = min(1, powf(k, 0.85))
                 out[row][c] = [Int(Float(r) * s), Int(Float(g) * s), Int(Float(b) * s)]
             }
         }

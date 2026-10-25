@@ -547,6 +547,12 @@ enum NativeAPI {
             result["remembered"] = RGBProfile.save(prof)
             result["profile"] = prof
         }
+        // 记账：写进 rgb_keepalive.log，和 0x88 的状态流水共用一条时间线。
+        // 「灯自己灭了」这类问题就靠它分清是谁写的、写成了什么。
+        if params["remember"] as? Bool ?? true {
+            let bri = params["brightness"] as? Int ?? params["level"] as? Int
+            RGBKeepAlive.note("write mode=\(mode) bri=\(bri.map(String.init) ?? "-") ok=\(result["ok"] as? Bool ?? false)")
+        }
         return result
     }
 

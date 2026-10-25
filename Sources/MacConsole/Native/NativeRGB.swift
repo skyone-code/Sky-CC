@@ -595,10 +595,16 @@ final class KeyboardRGB {
                           userInfo: [NSLocalizedDescriptionKey: "逐键矩阵需要 \(numRows) 行，收到 \(rows.count)"])
         }
         var last = -1
-        for row in 0..<numRows {
-            let arr = KeyboardRGB.buildRowBuffer(colors: rows[row])
+        for chipRow in 0..<numRows {
+            // ⚠ 行序必须倒过来灌。原厂 `LM_ITE_RGB::Set_ITE_Effect_Type_UserMode`
+            // （Keyboard-HID.md §行序）是 `src = col + (5 - 物理行) * 21`，
+            // 而**芯片的物理行 0 = 键盘最下面一排**，我们传进来的数组是屏幕顺序
+            // （0 = 最上面的 F 排）。以前直接对上号发，结果是整块画面**上下镜像** ——
+            // 逐键投影和音乐律动柱状条都会「从顶部往下垂」。
+            let srcRow = numRows - 1 - chipRow
+            let arr = KeyboardRGB.buildRowBuffer(colors: rows[srcRow])
             // 原厂顺序：先选行、再写行数据；中间不能插回读
-            _ = setRowIndex(row)
+            _ = setRowIndex(chipRow)
             usleep(1_000)
             last = output(arr, rowLen)
         }
@@ -617,11 +623,13 @@ final class KeyboardRGB {
         let cols = zones.map { WkdColor.convert($0[0], $0[1], $0[2]) }
         var last = -1
         for _ in 0..<max(1, count) {
-            for row in 0..<numRows {
-                let c = cols[row % cols.count]
+            for chipRow in 0..<numRows {
+                // 与 setMatrixRows 同一个道理：数组是屏幕顺序（0 = 最上面），
+                // 芯片物理行是反的（0 = 最下面），所以倒过来取色。
+                let c = cols[(numRows - 1 - chipRow) % cols.count]
                 let arr = KeyboardRGB.buildRowBuffer(r: c.0, g: c.1, b: c.2)
                 // 原厂 IL：选行后跟 WriteFeature + Sleep(1)，绝不能回读（回读会清行锁存）
-                _ = setRowIndex(row)
+                _ = setRowIndex(chipRow)
                 usleep(1_000)
                 last = output(arr, rowLen)
             }
@@ -866,35 +874,35 @@ enum RGBActivity {
     static var musicActive: Bool { Date().timeIntervalSince(lastZones) < 15 }
 }
 
-/// 键盘背光「过一段时间自己熄灭」的修补（2026-10-25 第二版）。
+/// 键盘背光「约 11 分钟自己熄灭」的处理（2026-10-26 三组实测后的定案）。
 ///
-/// **第一版为什么失败（用户实测）**：每 10 秒补一笔 `0x09` 亮度 —— 结果变成
-/// 「每 10 秒亮一下又灭」的死循环。两个原因：
-///   ① 原厂复刻版 `Ite8291.ReEnable` 的实测结论：`TurnOff` 发的是 `0x08 ctrl=0x01`，
-///      之后**单发 `0x09` 亮度是点不亮的** —— 那笔报文从来没能把灯救回来，
-///      它只是让 LED 驱动闪一下，属于「看着有动作、其实没修好」。
-///   ② 灭灯不是芯片的主动行为（原厂 idle-off 是 Windows 服务端的 RawInput 计时器，
-///      见 `IdleTimerSwitchKeyboardLed`）。能真的把灯掐掉的只剩两种可能：
-///      USB 侧空闲（设备/主控进入低功耗）或 EC 断 LED 供电 —— 两者都靠
-///      **持续有报文往来**才不会发生，而 10 秒一次的间隔已经太稀。
+/// 【实测结论，别再猜了】断开一切干扰，只留一条 HID 通道：
+///   · 写 `0x08`（steady、亮度 `0x30`）后**完全不碰键盘**，亮度字节在 **11 分钟**整被清零
+///     （`88 02 01 0A 00 01 00 00`），`ctrl/effect/speed` 一个没变；
+///   · 同一时间段 EC `0x7C4` bit6 始终 = 1（`0x40`）→ **不是 EC 断 LED 供电**；
+///   · 每 60 秒发 `0x88` 查询 → 照样灭（**查询不重置计时**）；
+///   · 每 60 秒重下发整条 `0x08` → 照样灭，且**救不回来**（用户实测「黑了而且没救活」）；
+///   · 按一下键 → 灯立刻回来，亮度是芯片 NVM 里存的 36。
+/// 即：**计时器在 ITE 8291 固件里，认的是「有没有按键」；被它熄掉之后，任何 HID 报文
+/// 都点不亮，只有物理按键能唤醒。** 所以「保活」在 HID 侧做不到，硬写只会变成闪一下。
 ///
-/// **第二版做法**：
-///   ① 每 2.5 秒发一条 `0x88` GET_EFFECT 心跳 —— 纯查询，不改灯效、不会闪，
-///      但足以把任何「空闲计时器」打回零；
-///   ② 只有查询结果确实是「`ctrl=0x01` 关灯」或「亮度=0」时，才按存档完整
-///      重下发一次（`0x08 ctrl=0x02`），并带 30 秒退避，避免连环闪。
-/// 全程 HID，不碰 EC；音乐律动在跑的时候一次都不插手。
+/// 【现在做的两件事】
+///   ① 纯观察：每 5 秒 `0x88` 读一次真状态，流水写进 `rgb_keepalive.log`。
+///      一次都不写 —— 不闪、不掩盖真实状态，出问题时时间线可信。
+///   ② 按键即时回贴：熄灯后用户一按键，芯片只会还他一个 NVM 里的白（36），
+///      原来调好的灯效/逐键图案就丢了。所以检测到「刚按下键」且「近期确实熄过灯」时，
+///      立刻把存档灯效重下发一次 —— 用户感觉就是「一碰键盘，我的灯效回来了」。
+///      只在这一种情况下写，平时不打扰（动画不会被打断）。
 enum RGBKeepAlive {
     private static var started = false
     private static let queue = DispatchQueue(label: "com.macconsole.rgbkeepalive", qos: .utility)
-    /// 心跳间隔。旧版 10 秒已经被证明压不住，这里取 2.5 秒（对 HID 来说微不足道）。
-    private static let probeInterval: TimeInterval = 2.5
-    /// 完整重下发的退避时间：灯灭了只救一次，30 秒内不再动手
-    private static let restoreCooldown: TimeInterval = 30
+    /// 观察间隔。也是「按键后多久把灯效贴回」的上限。
+    private static let tickInterval: TimeInterval = 5
 
-    private static var lastRestore = Date.distantPast
     private static var lastState = ""
     private static var tick = 0
+    /// 读到过「灯被固件熄了」，但还没把灯效贴回去
+    private static var needReapply = false
 
     private static let logURL: URL = {
         let dir = FileManager.default.homeDirectoryForCurrentUser
@@ -908,47 +916,58 @@ enum RGBKeepAlive {
         started = true
         queue.async {
             while true {
-                Thread.sleep(forTimeInterval: probeInterval)
+                Thread.sleep(forTimeInterval: tickInterval)
                 autoreleasepool { step() }
             }
         }
     }
 
+    /// 记一笔「谁在什么时候写了灯效」，和状态流水共用一条时间线。
+    static func note(_ s: String) {
+        queue.async {
+            needReapply = false        // app 自己写了灯效：不用再贴
+            log(s, force: true)
+        }
+    }
+
     private static func step() {
         tick &+= 1
-        // 音乐律动在跑：它自己每 83ms 刷一帧，既不缺报文也不该被打断
+        // 音乐律动在跑：它每 83ms 写一帧，既不缺活动信号也不该被打断
         guard !RGBActivity.musicActive else { return }
         guard let prof = RGBProfile.load(),
               (prof["mode"] as? String ?? "color") != "off" else { return }
-
-        var probe: (control: UInt8, effect: UInt8, speed: UInt8, brightness: UInt8, color: UInt8)?
-        do {
-            let kb = try KeyboardRGB().open()
-            defer { kb.close() }
-            probe = kb.queryState()
-        } catch {
+        guard KeyboardRGB.available(), let kb = try? KeyboardRGB().open() else {
             log("device=gone", force: true)
             return
         }
-        guard let st = probe else {
-            // 固件没回 0x88：心跳本身已经发出去了，别为了「保险」再补写 —— 补写就是闪
+        defer { kb.close() }
+
+        // ① 纯查询，判断固件有没有把灯熄了
+        guard let st = kb.queryState() else {
             log("query=nil")
             return
         }
-
         let off = st.control == 0x01 || st.brightness == 0
         log("ctrl=\(st.control) eff=\(st.effect) bri=\(st.brightness)\(off ? "  → 灭了" : "" )")
-        guard off else { return }
-        guard Date().timeIntervalSince(lastRestore) > restoreCooldown else { return }
-        lastRestore = Date()
-        let r = RGBProfile.apply(prof, save: 0)   // save:0 —— 保活不能反复擦芯片 NVM
-        log("restore ok=\(r["ok"] as? Bool ?? false) mode=\(r["mode"] as? String ?? "?")", force: true)
+
+        // ② 熄过灯、后来又被唤醒（用户按键，芯片把 NVM 亮度还回来）→ 把存档灯效贴回去。
+        //    不贴的话用户看到的就是「一个忽明忽暗的灰白」，亮度 36、图案全丢。
+        //    用「亮度重新 > 0」当唤醒信号，不依赖按键事件（更可靠，也不用辅助功能权限）。
+        if off {
+            needReapply = true
+            return
+        }
+        guard needReapply else { return }
+        needReapply = false
+        let r = RGBProfile.apply(prof, save: 0)
+        log("唤醒回贴 ok=\(r["ok"] as? Bool ?? false) mode=\(r["mode"] as? String ?? "?")",
+            force: true)
     }
 
-    /// 落盘一份状态流水（状态变化 / 每 24 拍≈1 分钟 / 强制）。排查「到底是被关了
-    /// 还是只是暗」全靠这个文件：`ctrl=2 bri=38` 却黑着 = 芯片说亮、电源被掐了。
+    /// 落盘一份状态流水（状态变化 / 每 60 拍≈5 分钟 / 强制）。排查靠它看时间线：
+    /// `write …` 是 app 写的，`ctrl=… bri=…` 是这里读的，`按键回贴 …` 是这里补的。
     private static func log(_ s: String, force: Bool = false) {
-        guard force || s != lastState || tick % 24 == 0 else { return }
+        guard force || s != lastState || tick % 60 == 0 else { return }
         lastState = s
         let line = "\(timeFormatter.string(from: Date())) \(s)\n"
         guard let data = line.data(using: .utf8) else { return }

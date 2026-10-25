@@ -611,6 +611,12 @@ struct RGBView: View {
             showToast("音乐律动启动失败：\(music.lastError ?? "未知原因")")
             return
         }
+        // 进来先铺一帧纯黑。进逐键模式那一刻芯片还挂着上一帧（或存档灯效），
+        // 用户要的是「一开始全黑，只有跟上音乐才从下往上亮柱子」—— 不铺这一帧，
+        // 前 40ms 会看到旧画面。
+        let blank = [[[Int]]](repeating: [[Int]](repeating: [0, 0, 0], count: RGBProfile.keyCols),
+                              count: RGBProfile.keyRows)
+        _ = await backend.post("/api/rgb", ["mode": "matrix", "rows": blank, "remember": false])
         effectDirty = false
         locks.lock("effect", 4.0)
         showToast("音乐律动已启动 · 跟随系统输出")
