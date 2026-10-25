@@ -50,6 +50,14 @@ enum AppPolicy {
             w.isVisible && !(w is NSPanel) && w.frame.width > 400
         }
     }
+
+    /// 关掉启动时 SwiftUI 自动建出来的主窗口（macOS 14 兜底，见 AppDelegate）
+    static func closeMainWindows() {
+        for w in NSApp.windows where !(w is NSPanel) && w.frame.width > 400 {
+            w.orderOut(nil)
+            w.close()
+        }
+    }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -99,7 +107,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // v2.4.3：恢复用户选的外观（浅色/深色/随系统，默认随系统）
         AppAppearance.current.apply()
         // 2.8.15：静默启动已删除，常规进入 regular 策略
-        DispatchQueue.main.async { AppPolicy.toRegular() }
+        // 2026-10-25：改为「登录项启动 = 纯后台」。之前这里无条件 toRegular()，
+        // 开机时会在 Dock 里挂一个图标、还把主窗口顶到前面 —— 用户要的是无感后台。
+        // 现在启动一律 .accessory（无 Dock、无应用菜单），主窗口只在被显式打开时出现。
+        DispatchQueue.main.async { AppPolicy.toAccessory() }
+        // 用户自己双击 app 拉起时（进程启动即被激活）仍要看到界面；
+        // 登录项启动时进程不是前台应用，就把 SwiftUI 自动建出来的主窗口收掉。
+        // 0.2s 足够区分这两种情况，而且窗口通常还没画到屏幕上。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            if NSApp.isActive {
+                NotificationCenter.default.post(name: .macConsoleShowMain, object: nil)
+            } else {
+                AppPolicy.closeMainWindows()
+            }
+        }
         // 菜单栏监控图标（AppKit 状态项，Stats 同款）：开关在「系统」页
         MenuBarMonitors.shared.start()
         // 2.7.8：接管触控板左上角双击手势（固件合成 Ctrl+Cmd+F13，见 GestureHotkey.swift）
@@ -216,6 +237,10 @@ struct MacConsoleApp: App {
     var body: some Scene {
         // 主窗口：关闭后 app 不退出，继续在菜单栏后台运行；
         // 重新打开走菜单栏图标的「打开控制台」（openWindow id: main）
+        //
+        // 2026-10-25：登录项启动不应该弹窗。SwiftUI 的 SceneBuilder 不支持 if，
+        // 没法按系统版本套 defaultLaunchBehavior(.suppressed)，所以统一在
+        // AppDelegate 里用「启动 0.2s 后收窗」兜底（窗口还没画出来就关掉了）。
         windowGroup
 
         // 菜单栏常驻图标：窗口关掉后控制台仍在后台运行，硬件状态实时可见
@@ -342,21 +367,19 @@ struct MenuBarView: View {
             }
 
             // 系统功耗设置（= 原厂同名卡片：0x7AB 高半字节 0x11/0x22/0x33）
+            // 2026-10-25 用户要求：与「散热模式」用同一种控件（分段选择器），
+            // 去掉每档上方的小图标；两段样式因此完全一致。
             VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Text("系统功耗设置")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Text("当前：\(perfName)")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.secondary)
+                Text("系统功耗设置")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                Picker("系统功耗设置", selection: perfBinding) {
+                    Text("高性能").tag(0x11)
+                    Text("平衡").tag(0x22)
+                    Text("节能").tag(0x33)
                 }
-                HStack(spacing: 8) {
-                    perfButton("高性能", 0x11, Theme.red)
-                    perfButton("平衡", 0x22, Theme.blue)
-                    perfButton("节能", 0x33, Theme.green)
-                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
                 .disabled(benchmark)
                 .opacity(benchmark ? 0.5 : 1)
             }
@@ -390,29 +413,17 @@ struct MenuBarView: View {
         }
     }
 
-    /// 性能模式三档按钮（紧凑版：图标 + 名称，选中即生效）
-    private func perfButton(_ title: String, _ code: Int, _ tint: Color) -> some View {
-        let active = perfIndex == code
-        return Button {
-            perfIndex = code
-            UIControlPrefs.set(UIControlPrefs.K.perfIndex, code)
-            Task { await applyPerf(code) }
-        } label: {
-            VStack(spacing: 3) {
-                Image(systemName: code == 0x11 ? "cpu" : (code == 0x22 ? "scale.3d" : "leaf"))
-                    .font(.system(size: 14))
-                Text(title)
-                    .font(.system(size: 12, weight: .semibold))
+    /// 系统功耗档（0x7AB 高半字节）。与散热模式同一套「软件记忆优先」逻辑：
+    /// 只有用户点选才写记忆 + 下发，程序回读直接赋 @State 不经过 setter。
+    private var perfBinding: Binding<Int> {
+        Binding(
+            get: { UIControlPrefs.int(UIControlPrefs.K.perfIndex) ?? perfIndex },
+            set: { code in
+                perfIndex = code
+                UIControlPrefs.set(UIControlPrefs.K.perfIndex, code)
+                Task { await applyPerf(code) }
             }
-            .foregroundStyle(active ? Color.white : Theme.dim)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 8)
-            .background(RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .fill(active ? tint : Theme.panel2))
-            .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .strokeBorder(active ? tint : Theme.line, lineWidth: 1))
-        }
-        .buttonStyle(.plain)
+        )
     }
 
     /// 当前散热档（0x7AB 低半字节）。乐观更新窗口内以本地选择为准。
@@ -445,21 +456,6 @@ struct MenuBarView: View {
                 Task { await applyBenchmark(v) }
             }
         )
-    }
-
-    /// 当前性能模式名（软件记忆优先，绝不反映"上次点了什么"以外的猜测）
-    private var perfName: String {
-        if let mi = UIControlPrefs.int(UIControlPrefs.K.perfIndex) { return perfLabel(mi) }
-        return perfLabel(perfIndex)
-    }
-
-    private func perfLabel(_ code: Int) -> String {
-        switch code {
-        case 0x11: return "高性能"
-        case 0x22: return "平衡"
-        case 0x33: return "节能"
-        default: return "—"
-        }
     }
 
     private func syncFromBackend() {

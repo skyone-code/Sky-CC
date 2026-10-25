@@ -492,9 +492,14 @@ enum NativeAPI {
                     [z[0] as? Int ?? 0, z[1] as? Int ?? 0, z[2] as? Int ?? 0]
                 }
                 guard !zones.isEmpty else { return ["ok": false, "error": "zones 为空"] }
-                _ = try kb.setBrightness(params["brightness"] as? Int ?? 75)
-                usleep(50_000)
+                // 音乐律动每秒要发十几帧：亮度由调用方一次性设好，这里只在显式给值时重设
+                // （0x09 + 50ms 等待会把帧率压到个位数）
+                if let b = params["brightness"] as? Int {
+                    _ = try kb.setBrightness(b)
+                    usleep(50_000)
+                }
                 let kr = try kb.setZoneColors(zones, repeat: 1, save: 1)
+                RGBActivity.lastZones = Date()   // 告诉灯效保活：这边在刷帧，别插手
                 result = ["ok": kr == 0, "kr": kr, "mode": "zones"]
             case "keymap":
                 // 2.8.8 逐键投影：6 行 × 21 列，每格一个颜色（固件码 0x33 + 行数据）

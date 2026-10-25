@@ -21,11 +21,50 @@ struct RGBView: View {
     private static let keyRows = 6
     private static let keyCols = 21
 
-    /// 键盘上一个位置
-    private struct KeyPos: Hashable {
-        var row: Int
-        var col: Int
+    /// 键盘上的一个键（2026-10-25 按原厂键位表重建）
+    ///
+    /// 来源：Intel NUC Software Studio 的 `KeyMapUS`（`MobileKeyboardLedMgr.dll`，
+    /// 即原厂自己用的表）。一行固定 16 个网格位，`leds` 是该键实际点亮的 LED 索引
+    /// （绝对索引 = 行×21 + 列）。大键占多位：左 Shift 3 位 3 颗灯，Enter / Tab /
+    /// Caps / 空格等占多位但只有 1…2 颗灯，与真机一致。
+    private struct KeyDef {
+        var label: String
+        var span: Int
+        var leds: [Int]
     }
+
+    /// 选中的键（键位下标，非 LED 下标）
+    private struct KeyPick: Equatable { var row: Int; var idx: Int }
+
+    private static func k(_ label: String, _ led: Int, _ span: Int = 1) -> KeyDef {
+        KeyDef(label: label, span: span, leds: [led])
+    }
+
+    /// US 布局，6 行各 16 个网格位（ESC 行在最上 = LED 第 1 行）
+    private static let layout: [[KeyDef]] = [
+        [k("esc", 0), k("F1", 1), k("F2", 2), k("F3", 3), k("F4", 4), k("F5", 5),
+         k("F6", 6), k("F7", 7), k("F8", 8), k("F9", 9), k("F10", 10), k("F11", 11),
+         k("F12", 12), k("ins", 13), k("srlk", 14), k("del", 15)],
+        [k("`", 21), k("1", 22), k("2", 23), k("3", 24), k("4", 25), k("5", 26),
+         k("6", 27), k("7", 28), k("8", 29), k("9", 30), k("0", 31), k("-", 32),
+         k("=", 33), KeyDef(label: "⌫", span: 2, leds: [35]), k("home", 36)],
+        [KeyDef(label: "tab", span: 2, leds: [42]),
+         k("Q", 44), k("W", 45), k("E", 46), k("R", 47), k("T", 48), k("Y", 49),
+         k("U", 50), k("I", 51), k("O", 52), k("P", 53), k("[", 54), k("]", 55),
+         k("\\", 56), k("pgup", 57)],
+        [KeyDef(label: "caps", span: 2, leds: [63]),
+         k("A", 65), k("S", 66), k("D", 67), k("F", 68), k("G", 69), k("H", 70),
+         k("J", 71), k("K", 72), k("L", 73), k(";", 74), k("'", 75),
+         KeyDef(label: "⏎", span: 2, leds: [76, 77]), k("pgdn", 78)],
+        [KeyDef(label: "shift", span: 3, leds: [84, 85, 86]),
+         k("Z", 87), k("X", 88), k("C", 89), k("V", 90), k("B", 91), k("N", 92),
+         k("M", 93), k(",", 94), k(".", 95), k("/", 96),
+         k("shift", 97), k("↑", 98), k("end", 99)],
+        [KeyDef(label: "ctrl", span: 2, leds: [105]), k("fn", 107), k("⌘", 108),
+         k("alt", 109), KeyDef(label: "space", span: 5, leds: [112]),
+         k("alt", 115), k("menu", 116), k("ctrl", 117),
+         k("←", 118), k("↓", 119), k("→", 120)],
+    ]
 
     // MARK: - 灯效草稿
     @State private var effect: String = "rainbow"
@@ -56,12 +95,12 @@ struct RGBView: View {
         Color(hex: UInt32(($0.0 << 16) | ($0.1 << 8) | $0.2))
     }
 
-    // MARK: - 逐键投影（2.8.8 新增）
-    /// 6 行 × 21 列的逐键颜色草稿
+    // MARK: - 逐键投影（2.8.8 新增，2026-10-25 换成真实键盘布局）
+    /// 6 行 × 21 列的逐键颜色草稿（LED 级，下标 = 行×21 + 列）
     @State private var keymap: [[Color]] = Array(
         repeating: Array(repeating: Color(hex: 0x000000), count: 21), count: 6)
-    /// 当前选中的键（点一下即用笔刷色涂上）
-    @State private var selectedKey: KeyPos?
+    /// 当前选中的键（键位下标，非 LED 下标）
+    @State private var picked: KeyPick?
     /// 笔刷色：点投影里的键就用这个颜色
     @State private var brush: Color = Color(hex: 0x00A0FF)
 
@@ -77,6 +116,8 @@ struct RGBView: View {
     @Environment(\.hideCardSubs) private var hideCardSubs
 
     @StateObject private var locks = EditLocks()
+    /// 音乐律动引擎（2026-10-25：固件 0x22 不自带动画，靠它抓系统音频实时上色）
+    @ObservedObject private var music = MusicEngine.shared
 
     private var rgbAvailable: Bool { store.rgb["available"] as? Bool ?? false }
     private var lightbarAvailable: Bool { store.lightbar["available"] as? Bool ?? false }
@@ -256,6 +297,22 @@ struct RGBView: View {
                     .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
                     .fixedSize(horizontal: false, vertical: true)
             }
+
+            // 音乐律动的状态（2.7.x 起这个灯效一直是「无效」的：见 MusicEngine.swift）
+            if currentEffect == .music {
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(music.running ? Theme.green : Theme.dim2)
+                        .frame(width: 6, height: 6)
+                    Text(music.running
+                         ? "运行中 · 跟随系统输出（12Hz 六段频谱）"
+                         : (music.lastError.map { "未启动：\($0)" }
+                            ?? "点「确定应用」开始抓取系统输出（Core Audio tap，无需屏幕录制权限）"))
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(music.running ? Theme.dim : Theme.amber)
+                    Spacer(minLength: 0)
+                }
+            }
         }
     }
 
@@ -319,19 +376,19 @@ struct RGBView: View {
         }
     }
 
-    // MARK: - 逐键投影（2.8.8）
+    // MARK: - 逐键投影
     //
-    // 用户原话：「逐键自定义没有键盘投影，他在原厂是可以让用户选择哪个键点亮
-    // 哪个颜色的模式」。芯片的真实能力就是 6 行 × 21 列共 126 个可独立配色的
-    // 位置（每行一条 64 字节行数据，21 个位置各 3 通道），所以这里直接把这个
-    // 矩阵画出来当投影：点一下某个位置 = 用笔刷色把它点亮。
+    // 2026-10-25：用户拿原厂截图对比后要求「每个键跟我的键盘一模一样」。
+    // 原来的 6×21 方格是芯片的灯位矩阵（21 列里只有前 16 列有灯），画出来右边
+    // 一大片空的、也看不出哪个格是哪颗键。现在按原厂 KeyMapUS 画真实布局：
+    // 每行 16 个网格位，大键按原厂宽度占位，标签就是键帽上的字。
     private var keymapSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline) {
-                GroupTitle(text: "键盘投影", sub: "6 行 × 21 列 · 126 键位")
+                GroupTitle(text: "键盘投影", sub: "US 布局 · 85 键 · 每键对应真实灯位")
                 Spacer(minLength: 8)
-                if let k = selectedKey {
-                    Text("选中 R\(k.row + 1)-\(k.col + 1) · \(keymap[k.row][k.col].toHex().uppercased())")
+                if let p = picked {
+                    Text("\(Self.layout[p.row][p.idx].label) · " + pickedHex)
                         .font(.system(size: 10.5).monospacedDigit())
                         .foregroundStyle(Theme.dim2)
                 } else {
@@ -340,25 +397,22 @@ struct RGBView: View {
                 }
             }
 
-            // 键位矩阵
-            VStack(alignment: .leading, spacing: 4) {
-                ForEach(0..<Self.keyRows, id: \.self) { r in
-                    HStack(spacing: 4) {
-                        Text("R\(r + 1)")
-                            .font(.system(size: 8.5).monospacedDigit())
-                            .foregroundStyle(Theme.dim2)
-                            .frame(width: 16, alignment: .leading)
-                        ForEach(0..<Self.keyCols, id: \.self) { c in
-                            keyCell(row: r, col: c)
+            // 键盘本体：宽度自适应，键高固定，16 个网格位一行
+            GeometryReader { geo in
+                let gap: CGFloat = 3
+                let unit = max(10, min(34, (geo.size.width - gap * 15) / 16))
+                VStack(spacing: gap) {
+                    ForEach(0..<Self.layout.count, id: \.self) { r in
+                        HStack(spacing: gap) {
+                            ForEach(0..<Self.layout[r].count, id: \.self) { i in
+                                keyCap(row: r, idx: i, unit: unit)
+                            }
+                            Spacer(minLength: 0)
                         }
-                        Spacer(minLength: 0)
                     }
                 }
             }
-            .padding(8)
-            .background(Theme.panel2, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(Theme.line, lineWidth: 1))
+            .frame(height: 6 * 22 + 5 * 3)
 
             // 笔刷色 + 快捷填充
             HStack(spacing: 8) {
@@ -373,7 +427,7 @@ struct RGBView: View {
                     let c = KeyboardCatalog.defaultPalette[i]
                     Button {
                         brush = Color(hex: UInt32((c.0 << 16) | (c.1 << 8) | c.2))
-                        paintSelected()
+                        if let p = picked { paint(row: p.row, idx: p.idx) }
                     } label: {
                         RoundedRectangle(cornerRadius: 4, style: .continuous)
                             .fill(Color(hex: UInt32((c.0 << 16) | (c.1 << 8) | c.2)))
@@ -388,12 +442,12 @@ struct RGBView: View {
 
             HStack(spacing: 8) {
                 SecondaryButton(title: "整行填充", icon: "arrow.right.to.line", tint: Theme.blue) {
-                    guard let k = selectedKey else { return }
-                    for c in 0..<Self.keyCols { keymap[k.row][c] = brush }
+                    guard let p = picked else { return }
+                    for c in 0..<Self.keyCols { keymap[p.row][c] = brush }
                     effectDirty = true
                 }
-                .disabled(selectedKey == nil)
-                .opacity(selectedKey == nil ? 0.5 : 1)
+                .disabled(picked == nil)
+                .opacity(picked == nil ? 0.5 : 1)
                 SecondaryButton(title: "全部填充", icon: "square.fill", tint: Theme.cyan) {
                     keymap = Array(repeating: Array(repeating: brush, count: Self.keyCols),
                                    count: Self.keyRows)
@@ -405,45 +459,62 @@ struct RGBView: View {
                     effectDirty = true
                 }
                 Spacer(minLength: 0)
-                SecondaryButton(title: "选中键", icon: "cursorarrow.click", tint: Theme.purple) {
-                    paintSelected()
-                }
-                .disabled(selectedKey == nil)
-                .opacity(selectedKey == nil ? 0.5 : 1)
             }
 
             if !hideCardSubs {
-                Text("点键位 → 立刻用当前颜色点亮该键；想批量改就选中一个键再点「整行填充」。"
-                     + "矩阵按芯片行/列顺序排列，R1 是靠近功能键那一排。")
+                Text("点键位 → 立刻用当前颜色点亮该键；大键（Shift / Enter / 空格）会一次点亮它全部的灯。"
+                     + "布局与原厂键位表一致，空格键两侧的灯位也可以单独上色。")
                     .font(.system(size: 10)).foregroundStyle(Theme.dim2)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
 
-    private func keyCell(row: Int, col: Int) -> some View {
-        let c = keymap[row][col]
-        let isSel = selectedKey == KeyPos(row: row, col: col)
+    /// 一个键帽：宽度 = 占位数 × 单元宽，颜色 = 该键第一颗灯的颜色
+    private func keyCap(row: Int, idx: Int, unit: CGFloat) -> some View {
+        let def = Self.layout[row][idx]
+        let color = keymap[def.leds[0] / Self.keyCols][def.leds[0] % Self.keyCols]
+        let isSel = picked == KeyPick(row: row, idx: idx)
+        let w = unit * CGFloat(def.span) + 3 * CGFloat(def.span - 1)
         return Button {
-            selectedKey = KeyPos(row: row, col: col)
-            keymap[row][col] = brush
-            effectDirty = true
+            paint(row: row, idx: idx)
         } label: {
-            RoundedRectangle(cornerRadius: 2.5, style: .continuous)
-                .fill(c)
-                .frame(width: 13, height: 13)
-                .overlay(RoundedRectangle(cornerRadius: 2.5, style: .continuous)
-                    .strokeBorder(isSel ? Color.white : Theme.line.opacity(0.7),
-                                  lineWidth: isSel ? 1.6 : 0.6))
+            Text(def.label)
+                .font(.system(size: def.span > 1 ? 8.5 : 9.5, weight: .medium))
+                .foregroundStyle(capTextColor(color))
+                .lineLimit(1).minimumScaleFactor(0.55)
+                .frame(width: w, height: 22)
+                .background(RoundedRectangle(cornerRadius: 3, style: .continuous).fill(color))
+                .overlay(RoundedRectangle(cornerRadius: 3, style: .continuous)
+                    .strokeBorder(isSel ? Color.white : Theme.line, lineWidth: isSel ? 1.6 : 0.6))
         }
         .buttonStyle(.plain)
-        .help("R\(row + 1)-\(col + 1)")
+        .help("\(def.label) · LED \(def.leds.map(String.init).joined(separator: ","))")
     }
 
-    private func paintSelected() {
-        guard let k = selectedKey else { return }
-        keymap[k.row][k.col] = brush
+    /// 键帽文字颜色：亮底用黑字、暗底用白字（键没点亮时是纯黑，标签要看得见）
+    private func capTextColor(_ c: Color) -> Color {
+        let hex = c.toHex()
+        guard hex.count == 6, let v = UInt32(hex, radix: 16) else { return .white.opacity(0.8) }
+        let l = (0.299 * Double((v >> 16) & 0xFF) + 0.587 * Double((v >> 8) & 0xFF)
+                 + 0.114 * Double(v & 0xFF)) / 255
+        return l > 0.55 ? .black.opacity(0.75) : .white.opacity(0.8)
+    }
+
+    /// 用笔刷色涂满一个键（大键 = 涂满它的所有灯位）
+    private func paint(row: Int, idx: Int) {
+        for led in Self.layout[row][idx].leds where led / Self.keyCols < Self.keyRows {
+            keymap[led / Self.keyCols][led % Self.keyCols] = brush
+        }
+        picked = KeyPick(row: row, idx: idx)
         effectDirty = true
+    }
+
+    /// 选中键当前的颜色（没有选中就是笔刷色）
+    private var pickedHex: String {
+        guard let p = picked else { return brush.toHex().uppercased() }
+        let led = Self.layout[p.row][p.idx].leds[0]
+        return keymap[led / Self.keyCols][led % Self.keyCols].toHex().uppercased()
     }
 
     /// 速度 / 亮度：只有用户拖动才置脏（程序回读直接赋 @State，不经过 setter）
@@ -462,6 +533,13 @@ struct RGBView: View {
 
     /// 点「确定应用」才真正下发
     private func applyEffectConfirmed() async {
+        // 音乐律动走另一条路：固件码 0x22 只是编号，芯片不会分析音频，
+        // 原厂也是上位机抓音频自己做 FFT（见 MusicEngine.swift 顶部的说明）。
+        if currentEffect == .music {
+            await applyMusic()
+            return
+        }
+        music.stop()
         var body: [String: Any] = ["save": 1, "brightness": Int(effectBright)]
         var summary: String
         if isKeymap {
@@ -503,6 +581,20 @@ struct RGBView: View {
 
     private func effectName(_ key: String) -> String {
         effects.first { $0.0 == key }?.1 ?? key
+    }
+
+    /// 音乐律动：启动音频抓取，亮度先设一次，之后每帧只发 6 行颜色
+    private func applyMusic() async {
+        guard music.start() else {
+            showToast("音乐律动启动失败：\(music.lastError ?? "未知原因")")
+            return
+        }
+        // 亮度单独设一次；不带 remember，避免把「音乐律动」写进存档（存档里没有它的动画）
+        _ = await backend.post("/api/rgb",
+                               ["mode": "brightness", "level": Int(effectBright), "remember": false])
+        effectDirty = false
+        locks.lock("effect", 4.0)
+        showToast("音乐律动已启动 · 跟随系统输出")
     }
 
     // MARK: - 海岸灯（先调、再点确定生效）
@@ -644,6 +736,7 @@ struct RGBView: View {
                 }
                 compactButton("关闭键盘灯", "power", Theme.red) {
                     Task {
+                        music.stop()
                         let r = await backend.post("/api/rgb", ["mode": "off"])
                         showToast(r["ok"] as? Bool == true ? "键盘灯已关闭" : "失败")
                     }
@@ -741,7 +834,8 @@ struct RGBView: View {
         // 刚写完的 4 秒内一律不回读灯效（芯片 feature 缓冲刷新有延迟，
         // 这时候读到的还是上一笔的调色板报文，会把滑条刷成 0%）。
         // 只跳过「灯效草稿」这一段，海岸灯照常回读。
-        if !effectDirty, !locks.locked("effect") {
+        // 音乐律动运行中也不回读：它不下发灯效、只刷行数据，回读会把选择刷回去。
+        if !effectDirty, !locks.locked("effect"), !music.running {
             if profMode == "keymap" {
                 effect = KeyboardCatalog.key(for: .userMode)
                 if let rows = profile?["rows"] {

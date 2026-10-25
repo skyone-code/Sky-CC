@@ -152,6 +152,8 @@ DispatchQueue.global(qos: .userInitiated).async {
     TrackpadLock.releaseAll()
     hlog("开始启动序列（恢复散热模式 / 键盘灯 / 亮度守护）")
     NativeAPI.startupSequence()
+    // 灯效保活（闲置熄灯修补，见 NativeRGB.swift 的 RGBKeepAlive）
+    RGBKeepAlive.start()
     hlog("启动序列完成，开启 EC 采样器")
     NativeAPI.startSampler()
 }

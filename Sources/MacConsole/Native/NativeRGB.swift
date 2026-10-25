@@ -31,6 +31,7 @@
 import Foundation
 import IOKit
 import IOKit.hid
+import CoreGraphics
 
 // MARK: - 协议常量
 
@@ -726,7 +727,10 @@ enum RGBProfile {
     }
 
     /// 按配置恢复灯效。返回 {'ok','kr','mode','profile','gains','applied_rgb'}
-    static func apply(_ profile: [String: Any]? = nil) -> [String: Any] {
+    ///
+    /// - Parameter save: 1 = 写进芯片 NVM（正常应用）；0 = 只作用于当前会话。
+    ///   灯效保活每分钟会重放一次存档，必须用 0，否则等于每分钟擦写一次 NVM。
+    static func apply(_ profile: [String: Any]? = nil, save: Int = 1) -> [String: Any] {
         guard let prof = profile ?? load() else {
             return ["ok": false, "error": "没有已保存的灯效配置"]
         }
@@ -759,7 +763,7 @@ enum RGBProfile {
                 kr = try kb.setStyle(name: prof["style"] as? String ?? "rainbow",
                                      brightness: normalizePct(prof["brightness"] as? Int ?? 75),
                                      speed: prof["speed"] as? Int ?? 5,
-                                     save: 1,
+                                     save: save,
                                      rgb: effRGB,
                                      slot: prof["slot"] as? Int ?? 1,
                                      palette: palette,
@@ -771,11 +775,11 @@ enum RGBProfile {
                     [z[0] as? Int ?? 0, z[1] as? Int ?? 0, z[2] as? Int ?? 0]
                 }
                 guard !zones.isEmpty else { return ["ok": false, "error": "配置里的 zones 为空"] }
-                kr = try kb.setZoneColors(zones, repeat: 1, save: 1)
+                kr = try kb.setZoneColors(zones, repeat: 1, save: save)
             case "keymap":
                 kr = try kb.setKeyMatrix(normalizeKeymap(prof["rows"]),
                                          brightness: normalizePct(prof["brightness"] as? Int ?? 75),
-                                         save: 1)
+                                         save: save)
             default:  // color
                 let rgb: [Int]
                 if let r = prof["rgb"] as? [Int], r.count == 3 {
@@ -786,7 +790,7 @@ enum RGBProfile {
                 _ = try kb.setBrightness(normalizePct(prof["brightness"] as? Int ?? 75))
                 usleep(20_000)
                 kr = try kb.setColor(r: rgb[0], g: rgb[1], b: rgb[2],
-                                     brightness: normalizePct(prof["brightness"] as? Int ?? 75), save: 1)
+                                     brightness: normalizePct(prof["brightness"] as? Int ?? 75), save: save)
                 let conv = WkdColor.convert(rgb[0], rgb[1], rgb[2])
                 appliedRGB = [conv.0, conv.1, conv.2]
             }
@@ -801,6 +805,70 @@ enum RGBProfile {
         ]
         if let appliedRGB = appliedRGB { out["applied_rgb"] = appliedRGB }
         return out
+    }
+}
+
+// MARK: - 灯效保活（2026-10-25）
+
+/// 灯效活动标记：音乐律动每帧都会刷一次「逐行上色」，保活循环据此避让，
+/// 免得不打字时把正在跑的频谱画面覆盖回旧灯效。
+enum RGBActivity {
+    private static let lock = NSLock()
+    private static var zonesAt = Date.distantPast
+
+    static var lastZones: Date {
+        get { lock.lock(); defer { lock.unlock() }; return zonesAt }
+        set { lock.lock(); zonesAt = newValue; lock.unlock() }
+    }
+
+    /// 15 秒内刷过逐行上色 = 音乐律动还活着
+    static var musicActive: Bool { Date().timeIntervalSince(lastZones) < 15 }
+}
+
+/// 键盘背光「过一段时间自己熄灭，按一下键才回来」的修补。
+///
+/// 原厂的闲置熄灯是**软件**行为：Windows 服务里有 `IdleTimerSwitchKeyboardLed` /
+/// `KeyboLedIdleTimerNotification`，用 RawInput 数键击、到点发 0x08 ctrl=0x01 熄灯、
+/// 有键击再点亮（`KeyboardIdleTimer` 的 13 档 5s…3h 就是这个计时器）。
+/// 固件 0x08/0x09/0x12/0x14/0x16 里没有任何「闲置」命令，所以 macOS 这边没人做，
+/// 固件仍会在一段时间没有报文后自己熄掉 —— 这就是用户看到的现象。
+///
+/// 修补：每 10 秒看一眼「键盘闲置了多久」，闲置超过 10 秒就补一笔：
+///   · 平时 只补亮度（0x09）—— 一笔 Feature 报文，动画相位不受影响
+///   · 每 60 秒 完整重发一次存档灯效（含逐键行数据），确保彻底熄掉也能回来
+/// 用户正在打字时一次都不写。全程走 HID，不碰 EC，没有频率风险。
+enum RGBKeepAlive {
+    private static var started = false
+    private static var tick = 0
+    private static let queue = DispatchQueue(label: "com.macconsole.rgbkeepalive", qos: .utility)
+
+    static func start() {
+        guard !started else { return }
+        started = true
+        queue.async {
+            while true {
+                Thread.sleep(forTimeInterval: 10)
+                step()
+            }
+        }
+    }
+
+    private static func step() {
+        tick &+= 1
+        // 音乐律动在跑的时候别插手（它每 1/12 秒就重画一次，而且没有「存档灯效」可恢复）
+        guard !RGBActivity.musicActive else { return }
+        guard let prof = RGBProfile.load(),
+              (prof["mode"] as? String ?? "color") != "off" else { return }
+        // 最近 10 秒敲过键 → 灯本来就是亮的，不打扰
+        let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .keyDown)
+        guard idle >= 10 else { return }
+        if tick % 6 == 0 {
+            _ = RGBProfile.apply(prof, save: 0)   // save:0 —— 保活不能每分钟擦一次芯片 NVM
+            return
+        }
+        guard KeyboardRGB.available(), let kb = try? KeyboardRGB().open() else { return }
+        defer { kb.close() }
+        _ = try? kb.setBrightness(normalizePct(prof["brightness"] as? Int ?? 75))
     }
 }
 

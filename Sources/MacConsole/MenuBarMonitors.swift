@@ -357,9 +357,9 @@ final class MenuBarMonitors: NSObject {
 
     private func panelWidth(_ kind: MenuBarIconKind) -> CGFloat {
         switch kind {
-        case .cpu, .net: return 268   // 三格
-        case .mem: return 268
-        case .gpu, .disk: return 196  // 两格
+        case .mem, .net: return 268   // 三格
+        // 2026-10-25：CPU 面板去掉风扇转速，只剩温度 + 占用两格
+        case .cpu, .gpu, .disk: return 196
         }
     }
 
@@ -488,12 +488,11 @@ struct SensorPanelView: View {
     private var tiles: [(String, String, String)] {
         switch kind {
         case .cpu:
+            // 2026-10-25 用户要求：只留温度 + 占用，风扇转速从这一格里删掉
             let temp = BackendService.double(hub.live, "temp_cpu")
             let usage = BackendService.double(hub.overview, "cpu_usage")
-            let rpm = BackendService.int(hub.live, "rpm_cpu")
             return [("CPU 温度", temp.map { String(format: "%.0f", $0) } ?? "—", "℃"),
-                    ("CPU 占用", usage.map { String(format: "%.0f", $0) } ?? "—", "%"),
-                    ("风扇", rpm.map { "\($0)" } ?? "—", "RPM")]
+                    ("CPU 占用", usage.map { String(format: "%.0f", $0) } ?? "—", "%")]
         case .mem:
             let m = BackendService.dict(hub.overview, "memory")
             let pct = BackendService.double(m, "percent")
