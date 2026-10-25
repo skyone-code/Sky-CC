@@ -2,7 +2,7 @@
 //  main.swift
 //  mcutil —— Mac控制台硬件命令行助手（原生，无 Python）
 //
-//  替代旧版 python后端/ 下 bright.py / rgbkb.py 的命令行用法：
+//  替代旧版 app-resources/ 下 bright.py / rgbkb.py 的命令行用法：
 //     mcutil rgb profile             打印保存的键盘灯效（无配置时打印 (无配置)）
 //     mcutil rgb apply               应用保存的键盘灯效（登录恢复用，带重试由调用方决定）
 //     mcutil rgb clear               清除保存的灯效

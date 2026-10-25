@@ -54,7 +54,7 @@ enum PwmKeeper {
         let p = Process()
         p.executableURL = bin
         if let h = FileHandle(forWritingAtPath: logPath) {
-            try? h.seekToEnd()
+            _ = try? h.seekToEnd()
             p.standardOutput = h
             p.standardError = h
         }

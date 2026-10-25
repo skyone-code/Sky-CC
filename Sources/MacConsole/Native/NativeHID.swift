@@ -2,7 +2,7 @@
 //  NativeHID.swift
 //  Mac控制台 —— IOKit HID 用户态封装（原生移植）
 //
-//  对应 Python 版 python后端/hid.py。
+//  对应 Python 版 app-resources/hid.py。
 //
 //  用途：打开 ITE 8291 (048d:6004/6006/600B/CE00) 键盘灯控制器，收发 HID Feature /
 //  Output 报告。该设备挂的是通用 AppleUserHIDDevice，没有被系统事件驱动

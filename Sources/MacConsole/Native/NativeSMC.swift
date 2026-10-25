@@ -2,7 +2,7 @@
 //  NativeSMC.swift
 //  Mac控制台 —— macOS SMC (System Management Controller) 读取（原生移植）
 //
-//  对应 Python 版 python后端/smc.py：纯 IOKit AppleSMC 用户客户端，无第三方依赖。
+//  对应 Python 版 app-resources/smc.py：纯 IOKit AppleSMC 用户客户端，无第三方依赖。
 //  本机（OpenCore + VirtualSMC）实测可用。提供 CPU 各核心温度、封装温度、
 //  电流、功耗、电压。
 //

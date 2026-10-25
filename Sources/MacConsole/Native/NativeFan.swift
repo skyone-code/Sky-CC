@@ -2,7 +2,7 @@
 //  NativeFan.swift
 //  Mac控制台 —— TongfangFan.kext 用户态客户端（原生移植）
 //
-//  对应 Python 版 python后端/fanctl.py。
+//  对应 Python 版 app-resources/fanctl.py。
 //
 //  原理：
 //    TongfangFan.kext 挂在 ACPI PNP0C14（WMI）设备上，暴露 TongfangFanDriver
@@ -772,17 +772,20 @@ final class FanControl {
     }
 
     /// CPU 性能档 0-3（CTRL_2 bit2-3）。实测本机写得进但无可观测效果，保留备用。
+    ///
+    /// ⚠️ 这是**唯一**故意用裸 `ecWrite` 的路径：没有调用方，纯排障备用。
+    /// 走 `ecWriteVerified` 会在无用的开关门上多打 4 轮 EC 流量，不划算。
     func setTurbo(_ level: Int) -> FanReply? {
         guard (0...3).contains(level) else { return nil }
         bizLock.lock()
         defer { bizLock.unlock() }
         let prev = UInt8((ecRead(EC.ctrl1)?.result ?? 0) & 0xFF)
-        ecWrite(EC.ctrl1, EC.ctrl1ManualMode)
+        _ = ecWrite(EC.ctrl1, EC.ctrl1ManualMode)
         let cur = UInt8((ecRead(EC.ctrl2)?.result ?? 0) & 0xFF)
         let v = (cur & ~EC.ctrl2TurboLevelMask) | UInt8(level << 2)
         let r = ecWrite(EC.ctrl2, v)
         if prev & EC.ctrl1ManualMode == 0 {
-            ecWrite(EC.ctrl1, prev)
+            _ = ecWrite(EC.ctrl1, prev)
         }
         return r
     }
@@ -1091,9 +1094,8 @@ final class FanControl {
     func ecWriteVerified(_ addr: UInt32, _ value: UInt8, attempts: Int = 4) -> FanReply? {
         bizLock.lock()
         defer { bizLock.unlock() }
-        var last: FanReply?
         for _ in 0..<max(1, attempts) {
-            last = ecWrite(addr, value)
+            _ = ecWrite(addr, value)
             usleep(20_000)
             let back = UInt8((ecRead(addr)?.result ?? 0) & 0xFF)
             if back == value {

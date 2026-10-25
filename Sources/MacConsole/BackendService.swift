@@ -105,7 +105,13 @@ final class BackendService: ObservableObject {
         if let bid = Bundle.main.bundleIdentifier,
            let other = NSRunningApplication.runningApplications(withBundleIdentifier: bid)
             .first(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }) {
-            other.activate(options: [.activateIgnoringOtherApps])
+            // macOS 14 起 activateIgnoringOtherApps 无效果（已被废弃）：
+            // 14+ 直接 activate()，老系统仍走旧参数。
+            if #available(macOS 14.0, *) {
+                other.activate()
+            } else {
+                other.activate(options: [.activateIgnoringOtherApps])
+            }
         }
         diag("已有实例在运行，本实例退出并把窗口交给它")
     }

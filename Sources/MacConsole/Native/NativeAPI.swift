@@ -2,7 +2,7 @@
 //  NativeAPI.swift
 //  Mac控制台 —— 本地后端 API 层（原生移植）
 //
-//  对应 Python 版 python后端/server.py 的全部接口逻辑。JSON 输出形状与
+//  对应 Python 版 app-resources/server.py 的全部接口逻辑。JSON 输出形状与
 //  Python 版逐字段一致（前端 web UI 与 SwiftUI 都按原形状解析）。
 //
 //  覆盖：
@@ -472,11 +472,14 @@ enum NativeAPI {
                                          // 2.7.10：方向字节只对波浪/跑马灯/极光有意义，
                                          // setStyle 内部会按 supportsDirection 过滤；缺省取原厂「右」
                                          direction: params["direction"] as? Int ?? 1)
+                // hex 回显：只在真的下发了 RGB 时才有意义。显式给 Any ——
+                // 三元里混 String / NSNull 会被隐式提升成 Any? 再塞进字典（编译警告）。
+                let hexOut: Any = (effRGB != nil ? (params["hex"] as? String) : nil) ?? NSNull()
                 result = ["ok": kr == 0, "kr": kr, "mode": "effect",
                           "style": params["style"] as? String ?? "rainbow",
                           "slots": palette?.count ?? 0,
                           "effect_code": KeyboardCatalog.effect(forName: params["style"] as? String ?? "")?.rawValue ?? 0,
-                          "hex": effRGB != nil ? (params["hex"] as? String ?? NSNull()) : NSNull()]
+                          "hex": hexOut]
             case "color":
                 let hx = (params["hex"] as? String ?? "#00a0ff").replacingOccurrences(of: "#", with: "")
                 let rgb = hx.count == 6 ? RGBUtil.hexToRgb(hx) : [0, 160, 255]

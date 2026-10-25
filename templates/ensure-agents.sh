@@ -52,9 +52,25 @@ for LABEL in com.user.pwmwake com.user.auxbright com.user.auxsmooth; do
     echo "[agents] 已停用亮度守护: $LABEL（plist 备份为 $LABEL.plist.disabled）"
   fi
 done
+# ---------- 3. 清掉已废弃的「静默启动」登录项（com.macconsole.autostart）----------
+#
+# 2.8.15 删掉静默启动功能，本轮 P2 清理起 app bundle 里也不再生成这份 plist。
+# 老机器（≤2.8.15）可能在 ~/Library/LaunchAgents 留着一份（autostart.sh 写的）
+# 或者在 SMAppService 注册库里有记录 —— 后者 app 侧 AutostartHeal 负责（需要
+# bundle 里还有 plist 才能注销），这里负责磁盘与 launchd 运行态。
+LABEL_AUTO="com.macconsole.autostart"
+bootout_if_running "$LABEL_AUTO"
+launchctl disable "gui/$UID_NUM/$LABEL_AUTO" >/dev/null 2>&1 || true
+for f in "$LA_DIR/$LABEL_AUTO.plist" \
+         "$LA_DIR/$LABEL_AUTO.plist.disabled" \
+         "$LA_DIR/.$LABEL_AUTO.plist.tmp"; do
+  [[ -e "$f" ]] && rm -f "$f" && echo "[agents] 已删除废弃登录项 ${f:t}"
+done
+
+# ---------- 4. 兜底：kill 残留进程 ----------
 # 兜底：plist 已经不在了但进程还活着（旧版本 app 直接拉起的）
 pkill -f "/pwmwake$" 2>/dev/null && echo "[agents] 已结束残留 pwmwake 进程"
 pkill -f "auxbright watch" 2>/dev/null && echo "[agents] 已结束残留 auxbright watch 进程"
 pkill -f "auxsmooth" 2>/dev/null && echo "[agents] 已结束残留 auxsmooth 进程"
 
-echo "[agents] done（当前只应有 com.macconsole.helper / com.macconsole.autostart 两条）"
+echo "[agents] done（当前只应有 com.macconsole.helper 一条）"

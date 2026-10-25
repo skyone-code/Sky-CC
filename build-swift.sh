@@ -34,9 +34,12 @@ SWIFT="$BUILD"   # Swift 源码在 $BUILD/Sources/MacConsole/（接手包布局�
 # staging 目录可用环境变量改到 /tmp：本机文件策略会拦截「删除/重命名」已存在的
 # app bundle（file-delete / rename source refused），原地重建会一直失败。
 STAGE="${MC_STAGE:-$BUILD/swift-stage}"
-# 后端资源（web UI / 助手二进制 / kext）仍住在 python后端/：它是历史目录名，
-# 内容已与 Python 无关（web 是纯静态前端，bin/ 三个是编译型 C 二进制）。
-PROJ="$BUILD/python后端"
+# 后端资源（kext / 助手二进制 / 恢复脚本）住在 app-resources/。
+# 本轮清理之前这个目录叫 python后端/ —— 那是 2.0 时代内置 Python 后端的名字，
+# 2.6.0 去 Python 化之后名不副实，已随遗留清理改名。
+# 目录里仍留着当年的 .py 参考实现（server.py / fanctl.py …）与静态页 web/，
+# 构建**完全不使用**它们，只是移植时的对照原件。
+PROJ="$BUILD/app-resources"
 [ -d "$PROJ" ] || { echo "错误：找不到资源目录 $PROJ" >&2; exit 1; }
 
 # 版本号（唯一来源：脚本注入 Info.plist 与 helper 的 BuildVersion.swift）
@@ -46,7 +49,7 @@ DISPLAY_VERSION="$VERSION LAPQC71专版"
 # nvmetemp（NVMe 硬盘温度，SMART）——有现成二进制就用，
 # 源码更新则现场重编。
 # ⚠️ 2026-10-22：该工具的 C 源码全盘已找不到（原先两个外部路径都已失效），
-# 现在 python后端/bin/nvmetemp 这份二进制就是唯一来源，已纳入 git。
+# 现在 app-resources/bin/nvmetemp 这份二进制就是唯一来源，已纳入 git。
 # 所以源码缺失不再静默降级——二进制也没了就直接报错，避免打出缺硬盘温度的包。
 NVME_C=""
 if [[ -f "$BUILD/Tools/nvmetemp.c" ]]; then NVME_C="$BUILD/Tools/nvmetemp.c"; fi
@@ -244,27 +247,16 @@ cat > "$APP/Contents/Library/LaunchAgents/com.macconsole.helper.plist" <<'PLIST'
 </plist>
 PLIST
 
-# 静默启动用的 LaunchAgent（2.7.6）：系统页「静默启动」打开时，
-# SMAppService.agent(plistName: "com.macconsole.autostart.plist") 注册的就是它，
-# 由它拉起 app 本身并带上 MCCONSOLE_BACKGROUND=1，主窗口就不会出现。
+# 【P2 遗留清理起不再生成 com.macconsole.autostart.plist】
+# 静默启动功能 2.8.15 就从代码里删掉了，这份 LaunchAgent 一直跟着 bundle 走，
+# 只为让老机器升级时还能靠 SMAppService.agent(plistName:) 注销掉残留注册
+# （而 SMAppService 只能注销**本 bundle 里真实存在**的 plist）。
 #
-# 为什么用 EnvironmentVariables 而不是 ProgramArguments 传参：
-# agent plist 里 BundleProgram 已经指定了程序，再给 ProgramArguments 会和它的
-# argv[0] 语义打架；EnvironmentVariables 是独立键，两者可以共存。
-cat > "$APP/Contents/Library/LaunchAgents/com.macconsole.autostart.plist" <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.macconsole.autostart</string>
-  <key>BundleProgram</key><string>Contents/MacOS/Mac控制台</string>
-  <key>EnvironmentVariables</key>
-  <dict><key>MCCONSOLE_BACKGROUND</key><string>1</string></dict>
-  <key>RunAtLoad</key><true/>
-  <key>ProcessType</key><string>Interactive</string>
-</dict>
-</plist>
-PLIST
+# 现在改成两条互不依赖的清理，plist 不进包：
+#   ① 老 bundle 里还有 plist 的（≤2.8.15），app 启动时 AutostartHeal 仍能正常注销；
+#   ② 新 bundle 没有 plist 的，由 ensure-agents.sh（helper 启动序列）清掉
+#      ~/Library/LaunchAgents 下的旧 plist 与 launchd 残留，卸载器再兜一层。
+# 详情见 Sources/MacConsole/MacConsoleApp.swift 的 LegacyAutostart。
 
 echo "==> 5/8 自检（语法 + 助手二进制冒烟）"
 zsh -n "$NATIVE/scripts/ensure-agents.sh"

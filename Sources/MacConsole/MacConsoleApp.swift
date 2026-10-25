@@ -59,8 +59,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 这些记录在系统的后台任务数据库里，光 bootout 进程、删 LaunchAgents 里的
         // plist 都清不掉；不注销的话「系统设置 → 通用 → 登录项」会留下幽灵条目。
         //   ① com.macconsole.helper     后台硬件守护（LaunchAgent）
-        //   ② com.macconsole.autostart  静默启动（LaunchAgent）
+        //   ② com.macconsole.autostart  静默启动（2.8.15 已废，打包时已移除该 plist）
         //   ③ mainApp                   旧「开机自启动」登录项（macOS 13+）
+        // ② 只能在本 bundle 还带着那份 plist 时走 SMAppService 注销（老版本升级场景），
+        // 见 LegacyAutostart 的注释。
         if CommandLine.arguments.contains("--unregister-all") {
             var out: [String] = []
             if #available(macOS 13.0, *) {
@@ -68,15 +70,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 do { try helper.unregister(); out.append("helper=已注销") }
                 catch { out.append("helper=\(error.localizedDescription)") }
 
-                let auto = SMAppService.agent(plistName: "com.macconsole.autostart.plist")
-                do { try auto.unregister(); out.append("autostart=已注销") }
-                catch { out.append("autostart=\(error.localizedDescription)") }
+                out.append(LegacyAutostart.unregisterRegistration())
 
                 do { try SMAppService.mainApp.unregister(); out.append("mainApp=已注销") }
                 catch { out.append("mainApp=\(error.localizedDescription)") }
             } else {
                 out.append("macOS < 13，无 SMAppService 注册")
             }
+            out.append("autostart-残留: " + LegacyAutostart.cleanLeftovers())
             print("unregister-all: " + out.joined(separator: " | "))
             exit(0)
         }
@@ -139,17 +140,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 /// 登录项自愈（2.8.11）
 ///
-/// 2.8.15：静默启动已删除，autostart agent 不再使用。
-/// 保留这段清理：老版本升级上来的机器可能还残留着 com.macconsole.autostart
-/// 这条登录项，一旦它 enabled 就注销，避免它按老逻辑拉起进程。
+/// 2.8.15：静默启动功能删除，`com.macconsole.autostart` 这条 agent 不再使用。
+/// P2 清理：bundle 里也不再生成那份 plist（见 build-swift.sh）。
+///
+/// 清理因此分成两条腿：
+///   · **SMAppService 注册** —— 只能寻址本 bundle `Contents/Library/LaunchAgents/`
+///     里真实存在的 plist。所以老包（≤2.8.15）升级上来时还能正常注销；新包没有
+///     这份文件，注册库里若还留着幽灵条目只能由用户在「登录项」里手删。
+///   · **磁盘 / launchd 残留** —— 不依赖 plist 是否存在，随时可清。
 enum AutostartHeal {
     @available(macOS 13.0, *)
     static func run() {
-        let agent = SMAppService.agent(plistName: "com.macconsole.autostart.plist")
-        if agent.status == .enabled {
-            try? agent.unregister()
-            print("[autostart] 已注销残留的静默启动登录项（2.8.15 起废弃）")
+        let reg = LegacyAutostart.unregisterRegistration()
+        let left = LegacyAutostart.cleanLeftovers()
+        if reg != "autostart=未注册" || left != "无残留" {
+            print("[autostart] \(reg)｜残留清理：\(left)")
         }
+    }
+}
+
+/// 已废弃的「静默启动」LaunchAgent（`com.macconsole.autostart`）清理
+enum LegacyAutostart {
+    static let label = "com.macconsole.autostart"
+    static let plistName = "com.macconsole.autostart.plist"
+
+    /// 本 bundle 里是否还带着那份 plist（P2 清理后恒为 false）
+    static var bundled: Bool {
+        FileManager.default.fileExists(atPath: Bundle.main.bundleURL
+            .appendingPathComponent("Contents/Library/LaunchAgents/\(plistName)").path)
+    }
+
+    /// 注销系统注册。plist 不在包里时**不能**调这个 API —— 返回说明字符串代替。
+    @available(macOS 13.0, *)
+    static func unregisterRegistration() -> String {
+        guard bundled else { return "autostart=无（打包时已移除该 plist）" }
+        let agent = SMAppService.agent(plistName: plistName)
+        guard agent.status != .notRegistered else { return "autostart=未注册" }
+        do {
+            try agent.unregister()
+            return "autostart=已注销"
+        } catch {
+            return "autostart=\(error.localizedDescription)"
+        }
+    }
+
+    /// 清 launchd 运行态与磁盘上的旧 plist（旧 autostart.sh 写过三个名字）。
+    /// 走 NativeProc：launchctl 卡住不能让进程无界等待。
+    @discardableResult
+    static func cleanLeftovers() -> String {
+        let uid = getuid()
+        _ = NativeProc.runCapture("/bin/launchctl", ["bootout", "gui/\(uid)/\(label)"])
+        _ = NativeProc.runCapture("/bin/launchctl", ["disable", "gui/\(uid)/\(label)"])
+
+        let dir = ("~/Library/LaunchAgents" as NSString).expandingTildeInPath
+        var removed: [String] = []
+        for name in ["\(label).plist", "\(label).plist.disabled", ".\(label).plist.tmp"] {
+            let p = "\(dir)/\(name)"
+            if FileManager.default.fileExists(atPath: p),
+               (try? FileManager.default.removeItem(atPath: p)) != nil {
+                removed.append(name)
+            }
+        }
+        return removed.isEmpty ? "无残留" : "已删 " + removed.joined(separator: "、")
     }
 }
 

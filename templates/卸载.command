@@ -8,7 +8,8 @@
 #
 # 具体清这些东西：
 #   ① 进程      主程序（含静默启动拉起的实例）、MacConsoleHelper、pwmwake 子进程
-#   ② 系统注册  SMAppService 的三条注册（helper / autostart / mainApp 登录项）
+#   ② 系统注册  SMAppService 的注册（helper / mainApp 登录项；autostart 是 ≤2.8.15
+#               的历史遗留，打包时已移除那份 plist，这里只清旧机器残留）
 #               —— 这些记录在系统数据库里，删 plist 或 bootout 都清不掉，
 #               必须让 app 自己调 --unregister-all 注销
 #   ③ 内核扩展  /Library/Extensions/TongfangFan.kext
@@ -66,7 +67,8 @@ echo "→ 1/9 停止正在运行的进程"
 for D in "${APP_DIRS[@]}"; do
   BIN="$D/Contents/MacOS/Mac控制台"
   [[ -x "$BIN" ]] || continue
-  # --unregister-all 一次性注销 helper / autostart / mainApp 三条后台注册。
+  # --unregister-all 注销 helper / mainApp 两条现役注册，外加 autostart 历史残留
+  # （3.0.1 起 bundle 不含 autostart plist，SMAppService 那条只能清旧机器）。
   # 必须在删 app 之前跑：注册记录在系统数据库里，只删文件清不掉。
   "$BIN" --unregister-all 2>/dev/null && echo "    已注销后台注册（$D）"
 done
