@@ -47,20 +47,49 @@ private let rgbPIDs: [Int] = [0x6004, 0x6006, 0x600B, 0xCE00]
 ///   · X15 键盘      固件 22.x → 0…100（发 101+ 会被固件钳到 0x64）
 /// 写死 50 的后果：X15 上拖到最亮也只有一半。固件读不到时保守取 50。
 /// 版本响应 `[0x80, major, minor, buildHi, buildLo, …]`，major ≥ 20 判 X15。
+///
+/// 2026-10-26：加了「重试 + 落盘」。之前只要 `getFirmware()` 失败一次，整个进程
+/// 就按 0…50 处理到退出 —— 而 0x12 提交 NVM 之后，这个错误量程会被**写进芯片 NVM**，
+/// 之后每次按键唤醒都只有半亮。实测 mcutil 那条路就踩过：`rgb apply --force`
+/// 把 100% 写成了原始值 50。现在读不到先重试 3 次，还不行就沿用上次成功记下的值。
 private var brightnessMaxCache: UInt8?
+
+private var brightnessMaxFile: URL {
+    let dir = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/MacConsole", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir.appendingPathComponent("rgb_brightmax.txt")
+}
+
+private func persistBrightnessMax(_ v: UInt8) {
+    try? "\(v)".data(using: .utf8)?.write(to: brightnessMaxFile)
+}
+
+private func loadPersistedBrightnessMax() -> UInt8? {
+    guard let s = try? String(contentsOf: brightnessMaxFile, encoding: .utf8),
+          let v = UInt8(s.trimmingCharacters(in: .whitespacesAndNewlines)),
+          v == 50 || v == 100 else { return nil }
+    return v
+}
 
 private func brightnessMax() -> UInt8 {
     if let v = brightnessMaxCache { return v }
-    var maxV: UInt8 = 50
-    if let kb = try? KeyboardRGB().open() {
-        let fw = kb.getFirmware()
-        kb.close()
-        if let bytes = fw["version_bytes"] as? [UInt8], let major = bytes.first {
-            maxV = major >= 20 ? 100 : 50
+    for _ in 0..<3 {
+        if let kb = try? KeyboardRGB().open() {
+            let fw = kb.getFirmware()
+            kb.close()
+            if let bytes = fw["version_bytes"] as? [UInt8], let major = bytes.first {
+                let v: UInt8 = major >= 20 ? 100 : 50
+                brightnessMaxCache = v
+                persistBrightnessMax(v)
+                return v
+            }
         }
+        usleep(120_000)
     }
-    brightnessMaxCache = maxV
-    return maxV
+    let v = loadPersistedBrightnessMax() ?? 50
+    brightnessMaxCache = v
+    return v
 }
 
 /// 亮度百分比 0…100 → 0x08 / 0x09 报文的 light 字节（按固件量程等比换算）。
@@ -436,6 +465,22 @@ final class KeyboardRGB {
     func setBrightness(_ pct: Int) throws -> Int {
         let raw = rawFromPct(pct)
         return feature([0x09, 0x02, raw, 0x00, 0x00, 0x00, 0x00, 0x00])
+    }
+
+    /// `0x12` SET_PICTURE —— **把当前画面（调色板 + 亮度）提交进芯片 NVM**。
+    ///
+    /// 2026-10-26 补：原厂 `HID_Set_Picture_12H(Saved)`，报文
+    /// `{0, 0x12, 0, 0, 8, Saved, 0, 0, 0}`（首字节是 ReportID，所以这里 8 字节从 0x12 起）。
+    /// 原厂静态模式（`Set_ITE_Effect_Type_StaticMode`）的顺序是：
+    ///   `0x08`(ctrl=2, effect=51, light, save) → 64 字节行数据 → **`0x12`(Saved)**
+    ///
+    /// 之前我们只发前两步，`0x08` 的 save 字节只标记灯效，**NVM 里那一份画面从来没被提交**，
+    /// 所以芯片一直用出厂默认亮度 36 —— 灯被固件闲置熄掉后按一下键，回来的就是 36 而不是
+    /// 用户设的 100。补上这一条之后 NVM 才会真正记住亮度。
+    ///
+    /// 只在「用户手动应用」（save=1）时发，保活重放（save=0）绝不能发 —— 那是 NVM 擦写。
+    func setPicture(saved: Int) -> Int {
+        feature([0x12, 0x00, 0x00, 0x08, UInt8(clamping: saved) & 0xFF, 0x00, 0x00, 0x00])
     }
 
     /// 原始 0x08 下发（内部用；effect 为固件码，brightness 是百分比）
@@ -835,6 +880,13 @@ enum RGBProfile {
                                      brightness: normalizePct(prof["brightness"] as? Int ?? 75), save: save)
                 let conv = WkdColor.convert(rgb[0], rgb[1], rgb[2])
                 appliedRGB = [conv.0, conv.1, conv.2]
+            }
+
+            // 2026-10-26：手动应用（save=1）时把画面提交进 NVM，芯片才会记住亮度。
+            // 详见 `KeyboardRGB.setPicture` 的注释；save=0 的保活重放一律跳过。
+            if save == 1, mode != "off" {
+                usleep(20_000)
+                _ = kb.setPicture(saved: 1)
             }
         } catch {
             return ["ok": false, "error": "\(error)", "mode": mode, "profile": prof]

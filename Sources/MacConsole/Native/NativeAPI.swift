@@ -553,8 +553,48 @@ enum NativeAPI {
             default:
                 break
             }
+
+            // 2026-10-26（用户要求）：把「当前画面」提交进芯片 NVM。
+            //
+            // 原厂 `Set_ITE_Effect_Type_StaticMode` 的最后一步是 `HID_Set_Picture_12H(Save)`，
+            // 我们一直缺这一步 —— 结果就是 NVM 里留的还是出厂亮度 36：灯被固件闲置熄掉后
+            // 按一下键，芯片只会还你一个 36 的暗白。补上之后 NVM 才记住用户设的亮度。
+            //
+            // 排除项：
+            //   · `off`  —— 提交进去会让键盘冷启动就是黑的；
+            //   · `zones` / `matrix` —— 音乐律动每 83ms 一帧，每帧写 NVM 等于毁 flash；
+            //   · save=0 —— 保活重放、频谱帧都走这个，绝不能碰 NVM。
+            let wantSave = params["save"] as? Int ?? 1
+            if wantSave == 1, result["ok"] as? Bool == true,
+               ["effect", "color", "brightness", "keymap"].contains(mode) {
+                usleep(20_000)
+                _ = kb.setPicture(saved: 1)
+            }
         } catch {
             return ["ok": false, "error": "\(error)"]
+        }
+
+        // 2026-10-26（用户要求）：跟原厂对齐 —— 应用灯效时把 EC 状态位 0x07C4 bit6 一并置上，
+        // 关灯时一并清掉。
+        //
+        // 原厂是「ControlCenter.exe 写注册表 → LaunchServGM 服务写 EC」的两段式，
+        // macOS 没有那个常驻服务，所以在这里补写（读-改-写单 bit，不碰同字节的其它位）。
+        //
+        // zones / matrix 是流式刷帧（音乐律动每帧都走这里），**绝不能每帧写 EC** ——
+        // 单次 EC 操作约 65ms，写进去帧率会掉到个位数；而这两种模式本来也只在灯亮着时才跑。
+        if result["ok"] as? Bool == true, FanControl.kextLoaded() {
+            let ecOn: Bool?
+            switch mode {
+            case "off":
+                ecOn = false
+            case "effect", "color", "keymap", "brightness":
+                ecOn = true
+            default:
+                ecOn = nil
+            }
+            if let on = ecOn {
+                result["ec_bit6"] = FanControl.shared.setKeyboardBacklightState(on)?.ok ?? false
+            }
         }
 
         // 成功后自动记住，供开机恢复

@@ -829,7 +829,13 @@ final class FanControl {
     private func modifyBit(_ addr: UInt32, _ mask: UInt8, _ on: Bool) -> FanReply? {
         bizLock.lock()
         defer { bizLock.unlock() }
-        let cur = UInt8((ecRead(addr)?.result ?? 0) & 0xFF)
+        // 2026-10-26：读失败就绝不写。
+        // 原来写的是 `ecRead(addr)?.result ?? 0`，读不到时 cur 会退化成 0，
+        // 接着按整字节写下去 —— 同字节里别的位会被一起清掉。
+        // 0x07C4 就是典型：bit7/bit3/bit1/bit0 归别的功能（0x8B = bit7|bit3|bit1|bit0），
+        // 一旦在 kext 未连接时写进去，键盘背光那一位虽然对了，别的状态全被抹平。
+        guard let r = ecRead(addr), r.ok else { return nil }
+        let cur = UInt8(r.result & 0xFF)
         var v = cur
         if on { v |= mask } else { v &= ~mask }
         if v == cur {
