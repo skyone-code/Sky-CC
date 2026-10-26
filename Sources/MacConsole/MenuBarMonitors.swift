@@ -83,9 +83,13 @@ enum MenuBarIconKind: String, CaseIterable, Identifiable {
     }
 
     /// 状态项宽度：与 Stats 逐一致——Mini 固定 31pt、Speed 两行 55pt
+    /// GPU 例外：指标为「占用率」时并排显示核显/独显两列，Mini 的 31pt 装不下，走双列视图
     var itemWidth: CGFloat {
         switch self {
         case .net: return NetStatusItemView.width
+        case .gpu: return MenuBarMetric.current(for: .gpu) == .usage
+                        ? GpuStatusItemView.width
+                        : MiniStatusItemView.width
         default: return MiniStatusItemView.width
         }
     }
@@ -211,9 +215,11 @@ final class MenuBarMonitors: NSObject {
             MenuBarIconKind.gpu.defaultsKey: false,
             MenuBarIconKind.disk.defaultsKey: false,
             MenuBarIconKind.net.defaultsKey: true,
-            // v2.4.5：菜单栏 CPU/GPU 默认显示温度（占用率可在「系统」页切回）
+            // v2.4.5：菜单栏 CPU 默认显示温度（占用率可在「系统」页切回）
             MenuBarIconKind.cpu.metricKey: MenuBarMetric.temp.rawValue,
-            MenuBarIconKind.gpu.metricKey: MenuBarMetric.temp.rawValue,
+            // GPU 例外：2026-10-26 用户要求 GPU 图标并排显示核显与独显两项，默认给占用率。
+            // 想看温度在「系统」页切回「温度」即可，切回去就是原来的单列 31pt 图标。
+            MenuBarIconKind.gpu.metricKey: MenuBarMetric.usage.rawValue,
         ])
         rebuild()
         NotificationCenter.default.addObserver(
@@ -237,6 +243,8 @@ final class MenuBarMonitors: NSObject {
             if want && !has { createItem(kind) }
             if !want && has { removeItem(kind) }
         }
+        // 指标可能也一起变了（GPU 温度↔占用率是两种视图、两种宽度），交给它按需重建
+        refreshTitles()
     }
 
     private func createItem(_ kind: MenuBarIconKind) {
@@ -271,6 +279,9 @@ final class MenuBarMonitors: NSObject {
         buttonKinds[ObjectIdentifier(button)] = kind
         items[kind] = item
         itemViews[kind] = view
+        // 菜单栏本身就是「有人在看」——不加这一句，用户切到别的页面看菜单栏时
+        // 独显那一格会 10 秒才动一次（NVAccelUtil 的按需节流），看着像卡住了。
+        if kind == .gpu { MonitorStore.shared.demandDgpu(true) }
         updateView(kind)   // 立即填一次值，避免首帧空白
     }
 
@@ -294,6 +305,7 @@ final class MenuBarMonitors: NSObject {
     private func makeView(_ kind: MenuBarIconKind) -> NSView & StatusItemClickableView {
         switch kind {
         case .net: return NetStatusItemView()
+        case .gpu where MenuBarMetric.current(for: .gpu) == .usage: return GpuStatusItemView()
         default: return MiniStatusItemView(label: kind.menuLabel)
         }
     }
@@ -303,6 +315,8 @@ final class MenuBarMonitors: NSObject {
             if let b = it.button { buttonKinds.removeValue(forKey: ObjectIdentifier(b)) }
             NSStatusBar.system.removeStatusItem(it)
         }
+        // 与 createItem 里的登记配对，别漏 —— 漏了会让 MonitorStore 的需求计数只增不减
+        if kind == .gpu, items[kind] != nil { MonitorStore.shared.demandDgpu(false) }
         items[kind] = nil
         itemViews[kind] = nil
     }
@@ -358,16 +372,25 @@ final class MenuBarMonitors: NSObject {
     private func panelWidth(_ kind: MenuBarIconKind) -> CGFloat {
         switch kind {
         case .mem, .net: return 268   // 三格
+        // 2026-10-26：GPU 面板拆成 核显占用 / 独显占用 / 独显温度 三格，跟内存一样宽
+        case .gpu: return 268
         // 2026-10-25：CPU 面板去掉风扇转速，只剩温度 + 占用两格
-        case .cpu, .gpu, .disk: return 196
+        case .cpu, .disk: return 196
         }
     }
 
     /// 由 hub 数据刷新图标。视图是 AppKit 自绘，这里只推数值 + needsDisplay；
     /// 顺手做存在性校验（视图被系统异常摘掉时重建）。
+    ///
+    /// 2026-10-26：还要校验**宽度**。GPU 的「占用率」是双列 64pt、「温度」是单列 31pt，
+    /// 设置页切指标只调到这里（不重建状态项），宽度对不上就会沿用旧值 ——
+    /// 64pt 的视图塞进 31pt 的项、或者 31pt 的视图占着 64pt 的位置，两种都难看。
     func refreshTitles() {
         let broken = items.filter { ($0.value.button?.subviews.isEmpty ?? true) }.map { $0.key }
-        for kind in broken {
+        // 重建后 createItem 会把 length 设成 kind.itemWidth，所以这一条会自愈、不会每秒重来。
+        // 留 0.5pt 容差：万一系统对 length 做了取整，也不至于每帧都判成「变了」而反复重建（会闪）。
+        let resized = items.filter { abs($0.value.length - $0.key.itemWidth) > 0.5 }.map { $0.key }
+        for kind in Set(broken + resized) {
             removeItem(kind)
             createItem(kind)
         }
@@ -377,11 +400,22 @@ final class MenuBarMonitors: NSObject {
     private func updateView(_ kind: MenuBarIconKind) {
         let overview = MetricsHub.shared.overview
         switch kind {
-        case .cpu, .gpu:
-            // v2.4.5：CPU/GPU 按「系统」页设置的指标显示（默认温度）
+        case .cpu:
+            // v2.4.5：CPU 按「系统」页设置的指标显示（默认温度）
             (itemViews[kind] as? MiniStatusItemView)?.value =
                 Self.metricText(for: kind, overview: overview,
                                 live: MetricsHub.shared.live)
+        case .gpu:
+            // 双列视图（占用率模式）：核显 / 独显并排，各带标签
+            if let v = itemViews[kind] as? GpuStatusItemView {
+                v.igpu = Self.pctText(Self.igpuUsage(overview))
+                v.dgpu = Self.pctText(Self.dgpuUsage(overview))
+            } else {
+                // 温度模式：还是原来的单列 Mini 图标
+                (itemViews[kind] as? MiniStatusItemView)?.value =
+                    Self.metricText(for: kind, overview: overview,
+                                    live: MetricsHub.shared.live)
+            }
         case .mem:
             let m = BackendService.dict(overview, "memory")
             (itemViews[kind] as? MiniStatusItemView)?.value =
@@ -438,6 +472,32 @@ final class MenuBarMonitors: NSObject {
         case .life:
             return "—"
         }
+    }
+
+    /// 核显占用率：IOAccelerator 的 "Device Utilization %"（overview.gpu_usage）
+    static func igpuUsage(_ overview: [String: Any]) -> Double? {
+        BackendService.double(overview, "gpu_usage")
+    }
+
+    /// 独显占用率：NVAccel RM 的 GPUMON perfmon（issue #324），取 GR 引擎 **5 秒均值**。
+    ///
+    /// 为什么用均值：固件按整秒统计，瞬时值是一秒一跳的台阶（实测 0% → 99% 一步到位），
+    /// 菜单栏只有一行字，跳起来比进度条更刺眼。均值在同一次查询里就算好了，零额外开销。
+    ///
+    /// 驱动没上报时返回 nil → 界面显示「—」而不是 0%。这条很重要：
+    /// 2.4.3 + NVK 时期的驱动会把样本结构完整写回但 util 恒为 0，
+    /// 显示成 0% 会让人以为「独显真的闲着」。
+    static func dgpuUsage(_ overview: [String: Any]) -> Double? {
+        let d = BackendService.dict(overview, "dgpu") ?? [:]
+        guard (BackendService.bool(d, "reported") ?? false) else { return nil }
+        // 回退到瞬时值：装的是新 app、helper 还没重启时 payload 里没有均值字段，
+        // 这时宁可显示会跳台阶的瞬时值，也不要显示「—」让人以为功能坏了。
+        return BackendService.double(d, "gr_avg5_pct") ?? BackendService.double(d, "gr_pct")
+    }
+
+    /// 菜单栏用的百分比文本（无值时给「—」）
+    static func pctText(_ v: Double?) -> String {
+        v.map { String(format: "%.0f%%", $0) } ?? "—"
     }
 
     /// 2.7.5：硬盘图标选中的那块盘的 SMART 条目
@@ -502,10 +562,14 @@ struct SensorPanelView: View {
                     ("已用", used.map { String(format: "%.1f", $0 / 1e9) } ?? "—", "GB"),
                     ("总量", total.map { String(format: "%.0f", $0 / 1e9) } ?? "—", "GB")]
         case .gpu:
+            // 2026-10-26：核显与独显分开两格，标签写清楚是哪一颗。
+            // 温度那一格是 NVAccel 上报的 GPU 核心温度（TSENS，PR #323）—— 那是独显的，所以标「独显温度」。
             let temp = BackendService.double(hub.live, "temp_gpu")
-            let usage = BackendService.double(hub.overview, "gpu_usage")
-            return [("GPU 温度", temp.map { String(format: "%.0f", $0) } ?? "—", "℃"),
-                    ("GPU 占用", usage.map { String(format: "%.0f", $0) } ?? "—", "%")]
+            let igpu = MenuBarMonitors.igpuUsage(hub.overview)
+            let dgpu = MenuBarMonitors.dgpuUsage(hub.overview)
+            return [("iGPU 占用", igpu.map { String(format: "%.0f", $0) } ?? "—", "%"),
+                    ("dGPU 占用", dgpu.map { String(format: "%.0f", $0) } ?? "—", "%"),
+                    ("dGPU 温度", temp.map { String(format: "%.0f", $0) } ?? "—", "℃")]
         case .disk:
             // 2.7.5：面板跟着「选中的那块盘」走
             let e = MenuBarMonitors.diskEntry(hub.overview)
@@ -607,6 +671,74 @@ final class MiniStatusItemView: NSView, StatusItemClickableView {
         ]
         NSAttributedString(string: value, attributes: valueAttributes)
             .draw(in: NSRect(x: 0, y: 1, width: Self.width, height: 13))
+    }
+}
+
+/// GPU 双列图标：iGPU / dGPU 并排，各带一行标签。
+///
+/// 为什么要单独做一个视图：Mini 是 31pt 单列，塞不下两个「带标注」的百分比。
+///
+/// 宽度是按实测字宽定的，别随手改小：
+///   11pt regular 下 "100%" = 29.40pt、"99%" = 24.38pt、"12%" = 22.11pt、"—" = 9.68pt
+///   7pt  light   下 "iGPU" = 17.13pt、"dGPU" = 19.77pt
+/// 所以列宽必须 ≥ 30pt（由 "100%" 决定），取 31pt 留 1.6pt 余量
+/// （"100%" 是真会出现的：满载实测 99.01%）。标签比列宽窄，不会挤。
+/// 总宽 31 + 2 + 31 = 64pt，比 NET 的 55pt 略宽，是菜单栏里最宽的一项，但已经是
+/// 「两个带标签的百分比」的合理下限。
+///
+/// 行高与字号沿用 MiniStatusItemView 的硬编码几何（标签 y=12 h=7、数值 y=1 h=13），
+/// 理由见那边的注释：相对定位在 22pt 菜单栏（视图 18pt 高）下会把两行叠在一起。
+final class GpuStatusItemView: NSView, StatusItemClickableView {
+    static let width: CGFloat = 64
+    private static let colW: CGFloat = 31
+    private static let gap: CGFloat = 2
+
+    /// 左列 = iGPU，右列 = dGPU。无值时为「—」（驱动未上报 ≠ 0%）
+    var igpu: String = "—" {
+        didSet { if oldValue != igpu { needsDisplay = true } }
+    }
+    var dgpu: String = "—" {
+        didSet { if oldValue != dgpu { needsDisplay = true } }
+    }
+
+    /// 点击回调（双通道 + 去重，见 MiniStatusItemView.onClick 注释）
+    var onClick: (() -> Void)?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+    }
+
+    convenience init() {
+        self.init(frame: NSRect(x: 0, y: 2, width: Self.width,
+                                height: max(0, NSStatusBar.system.thickness - 4)))
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent?) { onClick?() }
+    override func rightMouseDown(with event: NSEvent?) { onClick?() }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let textColor = NSColor.labelColor
+        let labelAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 7, weight: .light),
+            .foregroundColor: textColor,
+        ]
+        let valueAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .regular),
+            .foregroundColor: textColor,
+        ]
+        for (i, pair) in [("iGPU", igpu), ("dGPU", dgpu)].enumerated() {
+            let x = CGFloat(i) * (Self.colW + Self.gap)
+            NSAttributedString(string: pair.0, attributes: labelAttributes)
+                .draw(in: NSRect(x: x, y: 12, width: Self.colW, height: 7))
+            NSAttributedString(string: pair.1, attributes: valueAttributes)
+                .draw(in: NSRect(x: x, y: 1, width: Self.colW, height: 13))
+        }
     }
 }
 

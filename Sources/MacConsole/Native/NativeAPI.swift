@@ -137,6 +137,22 @@ enum NativeAPI {
         case "/api/capability": return capability()
         case "/api/all":        return allPayload(slim: false)
         case "/api/snapshot":   return allPayload(slim: true)
+        // 独显利用率的「有没有人在看」信号（2026-10-26）。
+        //
+        // 为什么要有这两条：`NVAccelUtil` 的静态状态跟着进程走，而真正读 NVAccel 的是
+        // **helper 进程**（/api/snapshot 在这里组包）。app 侧的 NVAccelUtil 是另一份
+        // 没人用的副本，直接在 app 里调 setWanted() 对 helper 毫无影响 ——
+        // 所以这个信号必须经 XPC 送过来。
+        //
+        // 为什么用 GET 而不是 POST：handlePost 开头会 invalidateFanCache()，
+        // 一次多余的风扇冷扫描是 17 次 EC 读 ≈1.1 秒，纯属白花。
+        // 两条独立路径而不是带参数，是因为 GET 侧没有 params 通道。
+        case "/api/dgpu/want":
+            NVAccelUtil.setWanted(true)
+            return ["ok": true, "wanted": true]
+        case "/api/dgpu/idle":
+            NVAccelUtil.setWanted(false)
+            return ["ok": true, "wanted": false]
         default:
             return nil
         }
@@ -1177,7 +1193,7 @@ enum NativeAPI {
             ["name": "CPU 封装温度", "detail": "SMC TC0P / TC0D / TC0E / TC0F / TC0H"],
             ["name": "CPU 电流与功耗", "detail": "SMC PC0C / PCPC / PCPT / PCTR (sp96 定点)"],
             ["name": "内存 / 负载 / 运行时间", "detail": "sysctl + host_statistics64"],
-            ["name": "显卡信息", "detail": "system_profiler，核显 + RTX 2070S 均可见"],
+            ["name": "显卡信息", "detail": "system_profiler，iGPU + RTX 2070S 均可见"],
             ["name": "电池", "detail": "IORegistry AppleSmartBattery + pmset"],
             ["name": "磁盘占用", "detail": "df，含 Word / Windows 分区"],
             ["name": "键盘灯控制", "detail": "ITE 8291 (048d:6004/6006/600B/CE00，原厂 PID 白名单) HID Feature 报告，已实测可写"],
@@ -1202,7 +1218,7 @@ enum NativeAPI {
             usable.append(["name": "风扇转速与温度读数",
                            "detail": "绕开 SMC，直接读 EC 0x046C(CPU) / 0x0464(GPU)（大端，实测 "
                 + ecLiveRPMText() + "），CPU 温度读 0x043E。"
-                + "独显温度自 2.7.6 起改读 NVAccel 上报的核心温度"
+                + "dGPU 温度自 2.7.6 起改读 NVAccel 上报的核心温度"
                 + "（驱动侧 TSENS → PerformanceStatistics[\"Temperature(C)\"]，PR #323），"
                 + "不再轮询 EC 0x044F。"
                 + "实测两路 PWM 数值始终相同（12 进程满载全程 80→177 一致），"
@@ -1291,11 +1307,12 @@ enum NativeAPI {
                     + "常规做法要靠 smartctl（smartmontools），"
                     + "本机未安装且无 brew，且 macOS 读 NVMe SMART 需管理员权限"],
                 ["name": "GPU 占用率与功耗",
-                 "detail": "macOS 没有开放 GPU 利用率的用户态接口。"
-                    + "独显 RTX 2070S 在 macOS 下只有一个 PCIe 设备条目"
-                    + "（官方驱动早已停更、始终空载），核显 UHD 630 也不上报。"
-                    + "核显与 CPU 同封装、本机没有它的独立热敏"
-                    + "（SMC 无 TG* 键），界面上核显那一格是 CPU 封装温度的参考值"],
+                 "detail": "dGPU 占用率走 NVAccel 的 RM 控制接口"
+                    + "（issue #324 的 GPUMON perfmon），iGPU 走 IOAccelerator 的 Device Utilization %；"
+                    + "两者都是引擎忙碌时间占比，不是显存占用率。"
+                    + "GPU 功耗 macOS 下没有用户态接口，本机未接入。"
+                    + "iGPU 与 CPU 同封装、本机没有它的独立热敏"
+                    + "（SMC 无 TG* 键），界面上 iGPU 那一格温度是 CPU 封装温度的参考值"],
                 ["name": "自定义风扇曲线（BIOS Fan Control Mode）",
                  "detail": "BIOS 里「Fan Control Mode」"
                     + "（Fixed/Custom/Cool/Balanced/Quiet/Fanless，"

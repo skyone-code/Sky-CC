@@ -45,6 +45,20 @@ struct OverviewView: View {
         }
         .background(Theme.bg)
         .task { await probe() }
+        .onAppear {
+            // 概览页只有把 KPI 切到「独显」时才需要 1 秒一次查 NVAccel；
+            // 默认看核显，那一套走 IOAccelerator，不碰 RM 通道。
+            if gpuTarget == "dgpu" { store.demandDgpu(true) }
+        }
+        .onDisappear {
+            // 只释放自己真正持有过的那一份，否则会把性能页的登记一起减掉
+            if gpuTarget == "dgpu" { store.demandDgpu(false) }
+        }
+        .onChange(of: gpuTarget) { old, new in
+            // 页面还在、只是换了目标：按 old → new 精确增减，不能只加不减
+            if old == "dgpu" { store.demandDgpu(false) }
+            if new == "dgpu" { store.demandDgpu(true) }
+        }
     }
 
     // MARK: 头部
@@ -140,6 +154,7 @@ struct OverviewView: View {
                     icon: "cpu",
                     tint: Theme.blue,
                     series: store.history["cpu"] ?? [],
+                    seriesMax: 100, seriesMin: 0,
                     note: coreNote)
             KPICard(label: "CPU 温度",
                     value: Fmt.celsius(store.cpuTemp > 0 ? store.cpuTemp : nil),
@@ -161,6 +176,9 @@ struct OverviewView: View {
                     icon: "display",
                     tint: Theme.cyan,
                     series: gpuUsageSeries,
+                    // 必须固定 0~100：dGPU 空闲时 GR 只有 0.00~0.02（实测），
+                    // 自适应会把这点噪声画成满幅锯齿，跟旁边的「0%」自相矛盾。
+                    seriesMax: 100, seriesMin: 0,
                     note: gpuUsageNote,
                     accessory: AnyView(gpuPicker))
                 .help(gpuUsageHelp)
@@ -434,7 +452,8 @@ struct OverviewView: View {
     private var gpuUsageValue: Double? {
         if gpuTarget == "dgpu" {
             guard store.dgpuAvailable, store.dgpuReported else { return nil }
-            return store.dgpuUtil
+            // 与曲线同源：都取 5 秒均值，否则数字和折线会差一格台阶
+            return store.dgpuUtilAvg5
         }
         return BackendService.double(store.overview, "gpu_usage")
     }
@@ -446,11 +465,12 @@ struct OverviewView: View {
     /// 这个百分比是「引擎占用率」，不是显存占用 —— 用户专门问过，写进 tooltip 里说明清楚。
     private var gpuUsageHelp: String {
         if gpuTarget == "dgpu" {
-            return "独显：NVAccel RM 的 GPUMON perfmon（NV2080_CTRL_CMD_PERF_GET_GPUMON_PERFMON_UTIL_SAMPLES_V2），"
-                 + "取 GR（3D 图形引擎）最近一次采样的忙碌时间占比。\n"
-                 + "不是显存占用率。固件 14.4 秒才采一次样，所以数值是跳变的。"
+            return "dGPU：NVAccel RM 的 GPUMON perfmon（NV2080_CTRL_CMD_PERF_GET_GPUMON_PERFMON_UTIL_SAMPLES_V2），"
+                 + "取 GR（3D 图形引擎）的忙碌时间占比。\n"
+                 + "不是显存占用率。固件按整秒统计，这里显示的是最近 5 秒均值；"
+                 + "瞬时 \(Fmt.tridiagonal(store.dgpuUtil))%，15 秒均值 \(Fmt.tridiagonal(store.dgpuUtilAvg15))%。"
         }
-        return "核显：IOAccelerator 的 Device Utilization %，GPU 渲染引擎的忙碌时间占比。\n"
+        return "iGPU：IOAccelerator 的 Device Utilization %，GPU 渲染引擎的忙碌时间占比。\n"
              + "不是显存占用率。显存占用看「显卡」卡片里的 显存 已用 / 总量。"
     }
 
@@ -465,11 +485,11 @@ struct OverviewView: View {
 
     private var gpuPicker: some View {
         Menu {
-            Button("核显 · \(igpuName)") { gpuTarget = "igpu" }
-            Button("独显 · \(dgpuName)") { gpuTarget = "dgpu" }
+            Button("iGPU · \(igpuName)") { gpuTarget = "igpu" }
+            Button("dGPU · \(dgpuName)") { gpuTarget = "dgpu" }
         } label: {
             HStack(spacing: 2) {
-                Text(gpuTarget == "dgpu" ? "独显" : "核显")
+                Text(gpuTarget == "dgpu" ? "dGPU" : "iGPU")
                 Image(systemName: "chevron.down").font(.system(size: 6.5, weight: .semibold))
             }
             .font(.system(size: 9.5, weight: .medium))

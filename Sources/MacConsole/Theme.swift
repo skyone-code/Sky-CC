@@ -134,6 +134,16 @@ enum AppAppearance: String, CaseIterable, Identifiable {
     }
 }
 
+/// 卡片/分组标题的样式化。
+///
+/// 原本一律 `uppercased()`，但 dGPU / iGPU 这类标识符有语义大小写，
+/// 转成全大写就成了 DGPU，读起来像缩写而不是「d + GPU」。
+/// 规则：含小写字母的原样保留（中文没有大小写，不受影响），其余仍转大写 ——
+/// 所以 CPU / 内存 / 风扇这些老标题的显示效果一点没变。
+func styledLabel(_ t: String) -> String {
+    t.contains(where: { $0.isLowercase }) ? t : t.uppercased()
+}
+
 /// 圆角卡片容器
 struct Card<Content: View>: View {
     var title: String? = nil
@@ -152,11 +162,15 @@ struct Card<Content: View>: View {
         return head.trimmingCharacters(in: .whitespaces)
     }
 
+    /// 标题样式化。原本一律 `uppercased()`，但 dGPU / iGPU 这类标识符有语义大小写，
+    /// 转成全大写就成了 DGPU，读起来像缩写而不是「d + GPU」。
+    /// 规则见文件级 `styledLabel`。
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             if let t = displayTitle {
                 HStack {
-                    Text(t.uppercased())
+                    Text(styledLabel(t))
                         .font(.system(size: 10.5, weight: .semibold))
                         .foregroundStyle(Theme.dim2)
                         .tracking(1.1)

@@ -159,8 +159,9 @@ case "sensors":
     printJSON(SMCSnapshot.snapshot())
 
 case "dgpu":
-    // 独显利用率（NVAccel RM 通道，issue #324）：诊断驱动到底有没有上报
-    printJSON(NVAccelUtil.snapshot())
+    // 独显利用率（NVAccel RM 通道，issue #324）：诊断驱动到底有没有上报。
+    // 用 sampleOnce() 而不是 snapshot()：后者是非阻塞的，单次调用只能拿到空值。
+    printJSON(NVAccelUtil.sampleOnce())
 
 case "sys":
     // 系统信息全量导出（与 HTTP 接口同一套采集函数），排障/对账用

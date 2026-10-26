@@ -150,6 +150,10 @@ DispatchQueue.global(qos: .userInitiated).async {
     TrackpadLock.releaseAll()
     hlog("开始启动序列（恢复散热模式 / 键盘灯 / 亮度守护）")
     NativeAPI.startupSequence()
+    // 独显利用率预热：让第一份 /api/snapshot 就带上 dgpu 的真值。
+    // 不预热的话首秒 payload 里 available=false，界面会闪一下「未找到 NVAccel 服务」。
+    // 必须在 helper 进程里做 —— app 进程那份 NVAccelUtil 是没人用的副本。
+    NVAccelUtil.warmUp()
     // 灯效保活（闲置熄灯修补，见 NativeRGB.swift 的 RGBKeepAlive）
     RGBKeepAlive.start()
     hlog("启动序列完成，开启 EC 采样器")
