@@ -116,6 +116,13 @@ struct KPICard: View {
     var icon: String
     var tint: Color
     var series: [Double] = []
+    /// 曲线的 Y 轴上下限。**百分比类指标必须传 0 / 100**：
+    /// 不传时 Sparkline 走自适应（按 [最小值, 最大值] 拉满），对温度是对的
+    /// （60→65℃ 的波动应该看得见），对使用率是灾难 —— dGPU 空闲时 GR 的真实值
+    /// 是 0.00~0.02（实测），自适应会把这 0.02 的噪声画成满幅锯齿，
+    /// 而旁边的大数字取整后是「0%」，同一个卡片里数字和曲线自相矛盾。
+    var seriesMax: Double? = nil
+    var seriesMin: Double? = nil
     var note: String? = nil
     var percent: Double? = nil      // 0...1，给了就在底部画细条
     /// 标题行右侧的附加控件（2.7.6：硬盘温度卡用它在卡片里选看哪块盘）
@@ -148,7 +155,8 @@ struct KPICard: View {
             }
             Group {
                 if series.count > 1 {
-                    Sparkline(points: series, color: tint)
+                    Sparkline(points: series, color: tint,
+                              maxValue: seriesMax, minValue: seriesMin)
                 } else if let percent {
                     GeometryReader { geo in
                         ZStack(alignment: .leading) {
@@ -236,7 +244,7 @@ struct GroupTitle: View {
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(text.uppercased())
+            Text(styledLabel(text))
                 .font(.system(size: 10.5, weight: .semibold))
                 .foregroundStyle(Theme.dim2)
                 .tracking(1.2)

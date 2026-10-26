@@ -21,22 +21,33 @@ struct MonitorView: View {
             VStack(alignment: .leading, spacing: 16) {
                 if !backend.kextLoaded { KextBanner() }
                 header
+                // 2026-10-26（用户定的版式）：核心温度并进 CPU 卡后，那张卡删掉，
+                // 剩下 7 张按**实测高度**配对，让每一行的两张尽量一样高（空位最小）：
+                //
+                //   第 1 行  CPU 440      | GPU 425        → 差 15
+                //   第 2 行  内存 339      | 网络 297       → 差 42
+                //   第 3 行  存储 385      | 风扇 238 + 电池 236 = 488 → 差 103
+                //
+                // 这个配法是穷举出来的最优解（总空位 160pt）。其它配法都更差：
+                //   内存|存储 + 网络|风扇+电池 → 237
+                //   内存|风扇+电池 + 网络|存储 → 237
+                // 想再收紧只能改卡片内容本身（比如存储卡多塞两行），不是排布问题。
                 Grid(horizontalSpacing: 14, verticalSpacing: 14) {
                     GridRow {
                         cpuCard.gridEqual()
-                        memCard.gridEqual()
-                    }
-                    GridRow {
                         gpuCard.gridEqual()
-                        fanCard.gridEqual()
                     }
                     GridRow {
-                        diskCard.gridEqual()
+                        memCard.gridEqual()
                         netCard.gridEqual()
                     }
                     GridRow {
-                        batteryCard.gridEqual()
-                        sensorCard.gridEqual()
+                        diskCard.gridEqual()
+                        VStack(spacing: 14) {
+                            fanCard
+                            batteryCard
+                        }
+                        .gridEqual()
                     }
                 }
             }
@@ -47,9 +58,12 @@ struct MonitorView: View {
             // 2.8.15：本页显示实时转速 → 声明需求，helper 才按租约读 EC。
             // 切走即收回，10 秒后 EC 读取归零。
             store.demandLiveFan(true)
+            // 本页的「显卡」卡片常驻显示独显那一行 → 独显利用率按 1 秒查。
+            store.demandDgpu(true)
         }
         .onDisappear {
             store.demandLiveFan(false)
+            store.demandDgpu(false)
         }
     }
 
@@ -87,7 +101,10 @@ struct MonitorView: View {
                         .foregroundStyle(Theme.dim2)
                         .lineLimit(1)
                 }
-                Sparkline(points: store.history["cpu"] ?? [], color: Theme.blue)
+                // 固定 0~100：自适应在空闲时会把 1~2% 的抖动拉成满幅，看着像满载。
+                // 百分比指标本来就该有绝对刻度（内存那条曲线一直是这么画的）。
+                Sparkline(points: store.history["cpu"] ?? [], color: Theme.blue,
+                          maxValue: 100, minValue: 0)
                     .frame(height: 44)
 
                 if !cores.isEmpty {
@@ -101,15 +118,150 @@ struct MonitorView: View {
                     }
                 }
 
+                // 2026-10-26（用户要求）：原「CPU 核心温度」卡片整块并进来，那张卡删掉。
+                // 占用和温度本来就是同一个东西的两个面，分两张卡反而要来回看。
+                // 6 个物理核（SMC TC1C~TC6C）一排 6 格，跟上面 12 个逻辑核的 4 列错开，
+                // 一眼能看出「6 核 12 线程」这个事实。
+                if !coreTemps.isEmpty {
+                    GroupTitle(text: "核心温度", sub: "6 个物理核 · TC1C~TC6C")
+                        .help(packageTempsHelp)
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 6),
+                              spacing: 8) {
+                        ForEach(Array(coreTemps.enumerated()), id: \.offset) { _, c in
+                            let t = BackendService.double(c, "celsius") ?? 0
+                            VStack(spacing: 3) {
+                                Text(String(format: "%.0f°", t))
+                                    .font(.system(size: 15, weight: .semibold, design: .rounded))
+                                    .monospacedDigit()
+                                    .foregroundStyle(store.tempColor(t))
+                                Text(BackendService.string(c, "name") ?? "")
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(Theme.dim2)
+                                    .lineLimit(1)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 6)
+                            .background(Theme.panel2, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        }
+                    }
+                }
+
                 Divider().overlay(Theme.line)
-                // 2.7.2：1/5/15 分钟三条负载压成一个字段，值按「1m / 5m / 15m」顺序并列
-                FieldGrid(rows: [
-                    ("封装温度", "\(Fmt.celsius(store.cpuTemp > 0 ? store.cpuTemp : nil))℃"),
-                    ("封装功耗", Fmt.watts(store.cpuWatts)),
-                    ("负载 1m/5m/15m", loadText(load)),
-                    ("逻辑核数", "\(BackendService.int(store.cpu, "logical") ?? 0)"),
-                ], columns: 2)
+                // 2026-10-26（用户要求）：4 项从「2 列 2 行」改成一行，CPU 卡比 GPU 卡高的问题就没了。
+                // 没用 FieldGrid(columns: 4)：等分后每列只有约 90pt，
+                // 「5.80 / 5.56 / 5.71」在 12.5pt 等宽字下要 135pt，会被压成省略号。
+                // 这里用 HStack + Spacer 让每项按内容取宽，再均匀铺开，视觉上和 4 列网格一样。
+                HStack(alignment: .top, spacing: 0) {
+                    cpuField("封装温度", "\(Fmt.celsius(store.cpuTemp > 0 ? store.cpuTemp : nil))℃")
+                    Spacer(minLength: 10)
+                    cpuField("封装功耗", Fmt.watts(store.cpuWatts))
+                    Spacer(minLength: 10)
+                    cpuField("负载 1m/5m/15m", loadText(load))
+                    Spacer(minLength: 10)
+                    cpuField("逻辑核数", "\(BackendService.int(store.cpu, "logical") ?? 0)")
+                }
             }
+        }
+    }
+
+    /// GPU 卡片底部的核显摘要：占用率 + 当前显存占用。
+    /// 温度不在这里重复 —— CPU 卡里的「封装温度」就是它（同一颗 die），
+    /// 原来显卡卡片里那个「≈ 封装温度」的近似值就是在说这件事。
+    private var iGPUBlock: some View {
+        let g = igpuInfo
+        let detail = BackendService.dict(g, "detail")
+        let name = BackendService.string(g, "name") ?? "Intel GPU"
+        let util = BackendService.double(store.overview, "gpu_usage")
+        // iGPU 没有独立显存：总量是动态上限（VRAM (Dynamic, Max)），
+        // 当前占用来自 IOAccelerator 的 In use system memory。
+        let stats = igpuStatEntry
+        let used = BackendService.double(stats, "In use system memory")
+            ?? BackendService.double(stats, "vramUsedBytes")
+            ?? BackendService.double(stats, "gartUsedBytes")
+        let cap = BackendService.string(detail, "VRAM (Dynamic, Max)")
+            ?? BackendService.string(detail, "VRAM (Total)")
+        let vramText: String = {
+            guard let cap else { return "显存 —" }
+            return "显存 \(Fmt.bytes(used)) / \(cap)"
+        }()
+
+        // 2026-10-26（用户要求「把显存并进右边」）：压成一行。
+        // 原来是「占用条 + 显存」独占第二行，白吃 20pt 高，GPU 卡比 CPU 卡高出一截；
+        // 现在 名称在左、占用条和百分比居中偏右、显存贴最右，一行说完。
+        return HStack(spacing: 7) {
+            Text("iGPU")
+                .font(.system(size: 10.5, weight: .semibold))
+                .foregroundStyle(Theme.cyan)
+                .tracking(1.0)
+            Text(name)
+                .font(.system(size: 10.5))
+                .foregroundStyle(Theme.dim2)
+                .lineLimit(1)
+            Spacer(minLength: 6)
+            MiniBar(value: (util ?? 0) / 100, color: Theme.cyan, height: 6)
+                .frame(width: 64)
+            Text(util.map { "\(Fmt.tridiagonal($0))%" } ?? "—")
+                .font(.system(size: 11.5, weight: .medium).monospacedDigit())
+                .foregroundStyle(util == nil ? Theme.dim2 : Theme.txt)
+            // 显存贴最右且不允许被截断 —— 型号名可以缩，这个数字不能
+            Text(vramText)
+                .font(.system(size: 9.5).monospacedDigit())
+                .foregroundStyle(Theme.dim2)
+                .lineLimit(1)
+                .fixedSize()
+                .padding(.leading, 3)
+        }
+    }
+
+    /// system_profiler 里 bus 不是 PCIe 的那条就是核显（核显没有 Bus 字段，
+    /// 只有 Connection Type: Internal）
+    private var igpuInfo: [String: Any] {
+        store.gpus.first { (BackendService.string($0, "bus") ?? "") != "PCIe" } ?? [:]
+    }
+
+    /// 核显的 IOAccelerator 统计（IntelAccelerator）。nv_accel 那条没有
+    /// PerformanceStatistics，所以按 io_class 挑，别按顺序猜。
+    private var igpuStatEntry: [String: Any] {
+        let stats = (BackendService.array(store.overview, "gpu_stats") as? [[String: Any]]) ?? []
+        if let intel = stats.first(where: {
+            (BackendService.string($0, "io_class") ?? "").localizedCaseInsensitiveContains("Intel")
+        }) { return intel }
+        return stats.first ?? [:]
+    }
+
+    /// 6 个物理核的温度（SMC TC1C~TC6C，来自 /api/snapshot 的 sensors.cores）
+    private var coreTemps: [[String: Any]] {
+        (BackendService.array(store.sensors, "cores") as? [[String: Any]]) ?? []
+    }
+
+    /// 封装温度那 5 个传感器的 tooltip。
+    /// 卡片正文里只留一个 TC0P（就是「封装温度」那格），其余 TC0D/0E/0F/0H
+    /// 属于排障数据 —— 以前它们在「温度传感器」卡里各占一行，现在收进这里，
+    /// 数据没丢，只是不再占版面。
+    private var packageTempsHelp: String {
+        let pkg = (BackendService.array(store.sensors, "package") as? [[String: Any]]) ?? []
+        guard !pkg.isEmpty else { return "SMC 封装温度不可用" }
+        let parts = pkg.map { p in
+            "\(BackendService.string(p, "name") ?? "—") "
+                + String(format: "%.1f℃", BackendService.double(p, "celsius") ?? 0)
+        }
+        return "封装 / 接近温度（SMC）：\n" + parts.joined(separator: " · ")
+    }
+
+    /// 一行里的一个字段，样式与 FieldGrid 的单元格完全一致
+    /// （10.5 灰标签 + 12.5 等宽主文字），只是宽度跟着内容走、不被等分列挤压。
+    private func cpuField(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(label)
+                .font(.system(size: 10.5))
+                .foregroundStyle(Theme.dim2)
+                .lineLimit(1)
+            Text(value)
+                .font(.system(size: 12.5, weight: .medium))
+                .monospacedDigit()
+                .foregroundStyle(Theme.txt)
+                .lineLimit(1)
+                .fixedSize()
         }
     }
 
@@ -197,116 +349,161 @@ struct MonitorView: View {
         }
     }
 
-    // MARK: - GPU
+    // MARK: - GPU（独显为主 + 核显摘要）
 
+    /// 2026-10-26（用户定的版式）：卡片改回「GPU」，上半张是独显，下半张是核显。
+    ///
+    /// 上一版把 iGPU 挪进了 CPU 卡片（理由是「和 CPU 同 die、同温度传感器」），
+    /// 但那样 CPU 卡越堆越杂，而这张卡本来就叫「显卡」。现在独显信息铺满上半张
+    /// （GR 大数字 + 曲线 + 四引擎 + 字段网格），核显退回底部一小条摘要。
     private var gpuCard: some View {
-        Card(title: "显卡",
-             trailing: { AnyView(Chip(text: gpuChipText, color: Theme.cyan)) }) {
+        let g = dgpuInfo
+        let detail = BackendService.dict(g, "detail")
+        let reported = store.dgpuReported
+        let gr = store.dgpuUtilAvg5
+        let temp = store.gpuTemp
+        let rpm = BackendService.int(store.live, "rpm_gpu") ?? 0
+        let peak = (store.history["dgpu"] ?? []).max()
+
+        return Card(title: "GPU",
+                    trailing: { AnyView(Chip(text: dgpuShortName, color: Theme.amber)) }) {
             VStack(alignment: .leading, spacing: 12) {
-                if store.gpus.isEmpty {
-                    Text("读取中…").font(.system(size: 12.5)).foregroundStyle(Theme.dim)
-                } else {
-                    ForEach(Array(store.gpus.enumerated()), id: \.offset) { i, g in
-                        if i > 0 { Divider().overlay(Theme.line) }
-                        gpuRow(g, index: i)
+                // 主数字 + 温度（与 CPU 卡片同一套排版：34pt 圆角数字、右侧温度）
+                HStack(alignment: .firstTextBaseline, spacing: 4) {
+                    Text(reported ? Fmt.tridiagonal(gr) : "—")
+                        .font(.system(size: 34, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                        .foregroundStyle(reported ? Theme.txt : Theme.dim2)
+                    Text("%")
+                        .font(.system(size: 13))
+                        .foregroundStyle(Theme.dim2)
+                    Text("GR · 5 秒均值")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(Theme.dim2)
+                        .padding(.leading, 2)
+                    Spacer(minLength: 8)
+                    if temp > 0 {
+                        HStack(spacing: 4) {
+                            Image(systemName: "thermometer.medium")
+                                .font(.system(size: 10.5, weight: .semibold))
+                            Text("\(Fmt.celsius(temp))℃")
+                                .font(.system(size: 15, weight: .semibold).monospacedDigit())
+                        }
+                        .foregroundStyle(store.tempColor(temp))
+                        .help("NVAccel 上报的 GPU 核心温度（TSENS，PR #323）")
                     }
                 }
+                .help(dgpuDetailHelp)
+
+                // 曲线固定 0~100：dGPU 空闲时 GR 只有 0.00~0.02，
+                // 自适应 Y 轴会把这点噪声拉满整卡高度，跟旁边的「0%」自相矛盾。
+                Sparkline(points: store.history["dgpu"] ?? [], color: Theme.amber,
+                          maxValue: 100, minValue: 0)
+                    .frame(height: 34)
+
+                // 半列宽下四列排不开（每列只剩 100pt，"ENC 视频编码 0.0%" 会挤成两行），
+                // 改成 2×2，和「存储」卡片的 FieldGrid 节奏一致。
+                GroupTitle(text: "引擎占用", sub: "5 秒均值")
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 14), count: 2),
+                          spacing: 9) {
+                    engineCell("GR", "3D 图形", gr, Theme.amber)
+                    engineCell("FB", "显示合成", store.dgpuFbAvg5, Theme.cyan)
+                    engineCell("ENC", "视频编码", store.dgpuEncAvg5, Theme.purple)
+                    engineCell("DEC", "视频解码", store.dgpuDecAvg5, Theme.green)
+                }
+
                 Divider().overlay(Theme.line)
-                Text(gpuFootNote)
-                    .font(.system(size: 10))
-                    .foregroundStyle(Theme.dim2)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-    }
+                // 温度不在这里重复 —— 主数字右边已经有一个更醒目的。
+                // 3 列 8 项：半列宽下 4 列会把「90 秒峰值」压到换行。
+                FieldGrid(rows: [
+                    ("风扇", rpm > 0 ? "\(rpm) RPM" : "—"),
+                    ("显存", BackendService.string(detail, "VRAM (Total)") ?? "—"),
+                    ("链路", BackendService.string(detail, "PCIe Lane Width") ?? "—"),
+                    ("Metal", BackendService.string(detail, "Metal Support") ?? "—"),
+                    ("设备 ID", BackendService.string(detail, "Device ID") ?? "—"),
+                    ("90 秒峰值", peak.map { String(format: "%.0f%%", $0) } ?? "—"),
+                    ("采样窗口", "72 秒"),
+                    ("槽位", BackendService.string(detail, "Slot") ?? "—"),
+                ], columns: 3)
 
-    /// 卡片标题右侧的胶囊：核显一定有值，独显只有驱动上报时才带上
-    private var gpuChipText: String {
-        let igpu = Fmt.tridiagonal(BackendService.double(store.overview, "gpu_usage"))
-        if store.dgpuReported {
-            return "核显 \(igpu)% · 独显 \(Fmt.tridiagonal(store.dgpuUtil))%"
-        }
-        return "核显 \(igpu)%"
-    }
+                // 核显：和独显共用这张卡，但只占底部一小条（占用率 + 动态显存）。
+                // 它和 CPU 同 die，温度看 CPU 卡里的「封装温度」就行，这里不重复。
+                Divider().overlay(Theme.line)
+                iGPUBlock
 
-    private func gpuRow(_ g: [String: Any], index: Int) -> some View {
-        let name = BackendService.string(g, "name") ?? "GPU"
-        let bus = BackendService.string(g, "bus") ?? ""
-        let isDGPU = bus == "PCIe"
-        let stats = gpuStatEntry(index)
-        // 核显：IOAccelerator 的 Device Utilization %；独显：NVAccel RM 通道（issue #324）
-        let rmReported = isDGPU && store.dgpuReported
-        let util: Double? = isDGPU
-            ? (rmReported ? store.dgpuUtil : nil)
-            : (BackendService.double(stats, "utilization")
-               ?? BackendService.double(store.overview, "gpu_usage"))
-        let utilText: String = {
-            guard let u = util else { return isDGPU ? "未上报" : "—" }
-            return "\(Fmt.tridiagonal(u))%"
-        }()
-        let vramTotal = BackendService.string(BackendService.dict(g, "detail"), "VRAM (Total)")
-        let vramUsed = BackendService.double(stats, "vramUsedBytes")
-            ?? BackendService.double(stats, "In use system memory")
-            ?? BackendService.double(stats, "gartUsedBytes")
-        // 核显没有独立的 SMC 温度键（raw_temps 里只有 TC0P/TC1C…TC6C，intel GPU 与 CPU 同 die），
-        // 所以按用户要求用封装温度加「≈」标出近似，而不是留空。
-        let temp: Double? = isDGPU ? store.gpuTemp : (store.cpuTemp > 0 ? store.cpuTemp : nil)
-        let tempPrefix = isDGPU ? "" : "≈"
-        let vramText: String = {
-            guard let t = vramTotal else { return "—" }
-            return "显存 \(Fmt.bytes(vramUsed)) / \(t)"
-        }()
-
-        return VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 6) {
-                Text(name)
-                    .font(.system(size: 12.5, weight: .semibold))
-                    .foregroundStyle(Theme.txt)
-                    .lineLimit(1)
-                Chip(text: isDGPU ? "独显" : "核显", color: isDGPU ? Theme.amber : Theme.cyan)
-                Spacer(minLength: 6)
-                if let temp, temp > 0 {
-                    Text("\(tempPrefix)\(Fmt.celsius(temp))℃")
-                        .font(.system(size: 12, weight: .semibold).monospacedDigit())
-                        .foregroundStyle(store.tempColor(temp))
-                        .help(isDGPU ? "NVAccel 上报的 GPU 核心温度（TSENS，PR #323）" : "核显与 CPU 同一封装，取封装传感器近似值")
+                // 只在异常时出现：正常空闲（GR 0% / FB 0.27%）不该再解释一遍
+                if let hint = dgpuHint {
+                    Text(hint)
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.dim2)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            HStack(spacing: 8) {
-                MiniBar(value: (util ?? 0) / 100,
-                        color: (util ?? 0) > 80 ? Theme.red : Theme.cyan,
-                        height: 7)
-                    .frame(width: 120)
-                Text(utilText)
-                    .font(.system(size: 11, weight: .medium).monospacedDigit())
-                    .foregroundStyle(util == nil ? Theme.dim2 : Theme.txt)
-                Spacer(minLength: 0)
-                Text(vramText)
-                    .font(.system(size: 10.5).monospacedDigit())
+        }
+    }
+
+    /// 主数字的 tooltip：半列宽下卡片里放不下的排障信息都收在这里。
+    private var dgpuDetailHelp: String {
+        let detail = BackendService.dict(dgpuInfo, "detail")
+        let dev = BackendService.string(detail, "Device ID") ?? "—"
+        let slot = BackendService.string(detail, "Slot") ?? "—"
+        let proc = store.dgpuProcId
+        let procText = proc == 0xFFFF_FFFF ? "无" : "pid \(proc)"
+        return "GR（3D 引擎）最近 5 秒均值 \(Fmt.tridiagonal(store.dgpuUtilAvg5))%，"
+             + "15 秒均值 \(Fmt.tridiagonal(store.dgpuUtilAvg15))%，瞬时 \(Fmt.tridiagonal(store.dgpuUtil))%。\n"
+             + "数据来自 GPUMON perfmon：72 条 × 1 秒的环形缓冲，均值取时间戳最新的 5 / 15 条。\n"
+             + "设备 \(dev) · \(slot) · 在用进程 \(procText)"
+    }
+
+    /// 单个引擎格子：名称 + 中文说明 + 百分比 + 细条
+    private func engineCell(_ key: String, _ label: String,
+                            _ v: Double, _ color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 5) {
+                Text(key)
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(color)
+                    .tracking(0.4)
+                Text(label)
+                    .font(.system(size: 9))
                     .foregroundStyle(Theme.dim2)
                     .lineLimit(1)
+                Spacer(minLength: 2)
+                // 一位小数：FB 恒定 0.3%，取整会变成 0 就看不出这点固定开销了
+                Text(String(format: "%.1f%%", v))
+                    .font(.system(size: 11, weight: .medium).monospacedDigit())
+                    .foregroundStyle(Theme.txt)
             }
+            MiniBar(value: v / 100, color: color, height: 5)
         }
     }
 
-    /// 说明文案要跟着数据来源变：驱动上报了就说 RM 通道，没上报就直说不可用，
-    /// 免得用户以为 0% 是「真的空闲」。
-    private var gpuFootNote: String {
-        if store.dgpuReported {
-            return "核显：IOAccelerator 的 Device Utilization %；独显：NVAccel RM 的 GPUMON perfmon（issue #324）。"
+    /// 异常状态的说明。正常时返回 nil，卡片底部就不会多一行字。
+    private var dgpuHint: String? {
+        if !store.dgpuAvailable {
+            return "未找到 NVAccel 服务 —— 驱动未加载或版本不含 RM 通道，dGPU 利用率不可用。"
         }
-        if store.dgpuAvailable {
-            return "核显：IOAccelerator 的 Device Utilization %。独显的 RM 通道已连通，但这次采样四个引擎（GR/FB/NVENC/NVDEC）全为 0，无法区分「真的空闲」与「驱动未上报」。"
+        if !store.dgpuReported {
+            return "RM 通道已连通，但开机以来 72 秒窗口内四个引擎始终为 0，"
+                 + "无法区分「一直空闲」与「驱动未上报」。跑个 3D 程序就会转为正常显示。"
         }
-        return "核显：IOAccelerator 的 Device Utilization %。未找到 NVAccel 服务，独显利用率不可用。"
+        return nil
     }
 
-    /// 把 gpu_stats（IOAccelerator 列表）与 gpus（system_profiler 列表）对上：
-    /// 两张表顺序不保证一致，按 index 兜底即可——核显通常只有一条统计。
-    private func gpuStatEntry(_ index: Int) -> [String: Any] {
-        let stats = (BackendService.array(store.overview, "gpu_stats") as? [[String: Any]]) ?? []
-        if index < stats.count { return stats[index] }
-        return stats.first ?? [:]
+    /// system_profiler 里 bus 是 PCIe 的那条就是独显
+    private var dgpuInfo: [String: Any] {
+        store.gpus.first { (BackendService.string($0, "bus") ?? "") == "PCIe" } ?? [:]
+    }
+
+    /// 型号简称：`NVIDIA GeForce RTX 2070 Super with Max-Q Design` → `RTX 2070 Super`
+    private var dgpuShortName: String {
+        let raw = BackendService.string(dgpuInfo, "name") ?? ""
+        guard !raw.isEmpty else { return "未识别" }
+        return raw
+            .replacingOccurrences(of: "NVIDIA GeForce ", with: "")
+            .replacingOccurrences(of: "NVIDIA ", with: "")
+            .replacingOccurrences(of: " with Max-Q Design", with: "")
+            .trimmingCharacters(in: .whitespaces)
     }
 
     // MARK: - 风扇
@@ -327,7 +524,7 @@ struct MonitorView: View {
                 HStack(spacing: 34) {
                     fanBig("CPU", rpm: BackendService.int(store.live, "rpm_cpu") ?? 0,
                            temp: BackendService.int(store.live, "temp_cpu") ?? 0)
-                    fanBig("独显", rpm: BackendService.int(store.live, "rpm_gpu") ?? 0,
+                    fanBig("dGPU", rpm: BackendService.int(store.live, "rpm_gpu") ?? 0,
                            temp: BackendService.int(store.live, "temp_gpu") ?? 0)
                 }
                 .frame(maxWidth: .infinity)
@@ -711,50 +908,6 @@ struct MonitorView: View {
             }
             .frame(width: side, height: side)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
-    }
-
-    // MARK: - 传感器
-
-    private var sensorCard: some View {
-        let cores = (BackendService.array(store.sensors, "cores") as? [[String: Any]]) ?? []
-        let pkg = (BackendService.array(store.sensors, "package") as? [[String: Any]]) ?? []
-        return Card(title: "温度传感器 · SMC",
-                    trailing: { AnyView(Chip(text: "TC0P \(Fmt.celsius(store.cpuTemp > 0 ? store.cpuTemp : nil))℃",
-                                             color: store.tempColor(store.cpuTemp))) }) {
-            if cores.isEmpty {
-                Text((store.sensors["available"] as? Bool) == true ? "读取中…" : "SMC 不可用")
-                    .font(.system(size: 12.5)).foregroundStyle(Theme.dim)
-            } else {
-                VStack(alignment: .leading, spacing: 10) {
-                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 6),
-                              spacing: 8) {
-                        ForEach(Array(cores.enumerated()), id: \.offset) { _, c in
-                            let t = BackendService.double(c, "celsius") ?? 0
-                            VStack(spacing: 3) {
-                                Text(String(format: "%.0f°", t))
-                                    .font(.system(size: 15, weight: .semibold, design: .rounded))
-                                    .monospacedDigit()
-                                    .foregroundStyle(store.tempColor(t))
-                                Text(BackendService.string(c, "name") ?? "")
-                                    .font(.system(size: 9))
-                                    .foregroundStyle(Theme.dim2)
-                                    .lineLimit(1)
-                            }
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 6)
-                            .background(Theme.panel2, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                        }
-                    }
-                    if !pkg.isEmpty {
-                        Divider().overlay(Theme.line)
-                        FieldGrid(rows: pkg.map { p in
-                            (BackendService.string(p, "name") ?? "—",
-                             String(format: "%.1f ℃", BackendService.double(p, "celsius") ?? 0))
-                        }, columns: 2)
-                    }
-                }
-            }
         }
     }
 
