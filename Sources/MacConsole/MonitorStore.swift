@@ -49,6 +49,7 @@ final class MonitorStore: ObservableObject {
     /// 计数归零后 helper 侧的租约 10 秒内自然过期，EC 读取彻底停下。
     private var liveFanDemand = 0
     private var lightingDemand = 0
+
     func demandLiveFan(_ on: Bool) {
         liveFanDemand = max(0, liveFanDemand + (on ? 1 : -1))
     }
