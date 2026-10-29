@@ -137,6 +137,11 @@ struct ControlView: View {
         guard !store.fan.isEmpty else { return }
         // 本次启动的第一次有效快照：EC → 记忆（只此一次）
         UIControlPrefs.seedIfNeeded(store.fan)
+        // 3.0.2.1（用户要求）：启动时**只读不应用** —— 把 EC 真值抄进记忆，
+        // 一个字节都不往 EC 写。旧版这里拿记忆值去覆盖 EC，会把别处改过的设置
+        // 强行改回去，已废弃。只跑一次。
+        // 必须放在下面「从记忆渲染界面」之前，否则首帧显示的是旧记忆值。
+        UIControlPrefs.adoptHardwareIfNeeded(store.fan)
 
         // 2.8.11（用户要求）：**散热模式 / 系统功耗设置这两项不走记忆，直接读 EC**。
         //   原厂逻辑是「动功耗 → 散热档跟着走；只动散热 → 功耗档不动」，
@@ -156,12 +161,6 @@ struct ControlView: View {
         if let v = UIControlPrefs.bool(UIControlPrefs.K.silentMode) { silentMode = v }
         if let v = UIControlPrefs.bool(UIControlPrefs.K.passiveCooling) { passiveCoolingDisabled = v }
         if let v = UIControlPrefs.bool(UIControlPrefs.K.caffeinate) { caffeinateOn = v }
-
-        // 2.8.11：本次启动的第一次对账 —— 除散热/功耗外，如果 EC 与记忆不一致，
-        // 就把记忆值写回 EC（让硬件回到用户上次的设置）。只跑一次。
-        for (key, value) in UIControlPrefs.mismatches(store.fan) {
-            Task { _ = await backend.post("/api/fan", [key: value]) }
-        }
     }
 
     private func showToast(_ s: String) {

@@ -895,6 +895,15 @@ enum NativeAPI {
             }
             out["curve"] = FanCurveController.shared.snapshot()
         } else {
+            // kext 没加载也要给温度：温度一律来自 SMC / NVAccel，本来就不经过 EC，
+            // 没有理由跟着风扇驱动一起缺失。否则菜单栏 CPU 图标和「监测」页的
+            // 温度会退化成「—」，看起来像「读不到系统温度」。
+            out["live"] = [
+                "rpm_cpu": 0,
+                "rpm_gpu": 0,
+                "temp_cpu": TempSources.cpuCelsius(),
+                "temp_gpu": TempSources.gpuCelsius(),
+            ]
             out["hint"] = ("TongfangFan.kext 未加载 —— 到「控制」或「实验性」页点「立即安装」"
                 + "（kext 已内嵌在 app 里，只需输入一次管理员密码）")
         }
@@ -1256,8 +1265,10 @@ enum NativeAPI {
                 + "关闭必须反序：先 0x751←0x00 再清门，EC 随即把 0x751 自己改回 0xA0。"
                 + "顺序反了会触发 FAN_ABNORMAL（0x741 变 0xA3），整片风扇寄存器拒写，只能重启恢复"])
             usable.append(["name": "风扇转速与温度读数",
-                           "detail": "绕开 SMC，直接读 EC 0x046C(CPU) / 0x0464(GPU)（大端，实测 "
-                + ecLiveRPMText() + "），CPU 温度读 0x043E。"
+                           "detail": "转速绕开 SMC，直接读 EC 0x046C(CPU) / 0x0464(GPU)（大端，实测 "
+                + ecLiveRPMText() + "）。温度一律不走 EC（2.8.15 起）："
+                + "CPU 取 SMC 封装温度 TC0P/TC0D/TC0E/TC0F/TC0H，"
+                + "与「监测」页传感器表同源。"
                 + "dGPU 温度自 2.7.6 起改读 NVAccel 上报的核心温度"
                 + "（驱动侧 TSENS → PerformanceStatistics[\"Temperature(C)\"]，PR #323），"
                 + "不再轮询 EC 0x044F。"
@@ -1420,8 +1431,8 @@ enum NativeAPI {
             print("散热模式恢复失败: \(r)")
         }
         // 2.8.15：启动时**读一次** EC（模式组 + 系统开关组 + 充电阈值），填进缓存。
-        // 这一步是「app 记忆对账」的数据源 —— UIControlPrefs.mismatches 拿它跟
-        // 本地记忆比一次，不一致就把记忆值写回 EC。只读这一次，之后不再轮询。
+        // 3.0.2.1：这一步只供界面「读一眼」用 —— UIControlPrefs.adoptHardwareIfNeeded
+        // 拿它把 EC 真值抄进软件记忆，**不再往 EC 写任何东西**。只读这一次，之后不轮询。
         primeCache()
         // 启动时恢复上次保存的键盘灯效（含白平衡增益）。
         //

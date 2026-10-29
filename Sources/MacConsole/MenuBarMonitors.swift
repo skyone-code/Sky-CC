@@ -161,6 +161,8 @@ final class MetricsHub: ObservableObject {
     static let shared = MetricsHub()
     @Published var overview: [String: Any] = [:]
     @Published var live: [String: Any] = [:]
+    /// SMC 传感器表（系统温度来源，和风扇 / EC 无关）
+    @Published var sensors: [String: Any] = [:]
     private var started = false
 
     func start() {
@@ -170,14 +172,35 @@ final class MetricsHub: ObservableObject {
         if !MonitorStore.shared.overview.isEmpty {
             overview = MonitorStore.shared.overview
             live = MonitorStore.shared.live
+            sensors = MonitorStore.shared.sensors
         }
     }
 
     /// MonitorStore 每轮刷新后调用（同一主线程，不用再跨 actor）
-    func ingest(overview o: [String: Any], live l: [String: Any]) {
+    func ingest(overview o: [String: Any], live l: [String: Any], sensors s: [String: Any]) {
         overview = o
         live = l
+        sensors = s
         MenuBarMonitors.shared.refreshTitles()
+    }
+
+    /// 菜单栏 CPU 温度：**直接取 SMC 快照**（系统传感器表），不经过风扇 / EC 那条链。
+    ///
+    /// `live["temp_cpu"]` 在后端虽然也是 SMC 取的，但它挂在 fan payload 下面，
+    /// 读代码时很容易被当成「风扇 / EC 数据」。菜单栏只要一个温度数字，
+    /// 从 `sensors.raw_temps` 取最直接，也保证 kext 没加载时照样有值。
+    static func cpuTempC(_ sensors: [String: Any], _ live: [String: Any]) -> Double? {
+        if let raw = sensors["raw_temps"] as? [String: Any] {
+            for key in ["TC0P", "TC0D", "TC0E", "TC0F", "TC0H"] {
+                if let n = raw[key] as? NSNumber, n.doubleValue > 0 { return n.doubleValue }
+            }
+        }
+        return BackendService.double(live, "temp_cpu")
+    }
+
+    /// 菜单栏 GPU 温度：NVAccel 上报的核心温度（本来就不经过 EC）。
+    static func gpuTempC(_ sensors: [String: Any], _ live: [String: Any]) -> Double? {
+        BackendService.double(live, "temp_gpu")
     }
 }
 
@@ -404,7 +427,8 @@ final class MenuBarMonitors: NSObject {
             // v2.4.5：CPU 按「系统」页设置的指标显示（默认温度）
             (itemViews[kind] as? MiniStatusItemView)?.value =
                 Self.metricText(for: kind, overview: overview,
-                                live: MetricsHub.shared.live)
+                                live: MetricsHub.shared.live,
+                                sensors: MetricsHub.shared.sensors)
         case .gpu:
             // 双列视图（占用率模式）：核显 / 独显并排，各带标签
             if let v = itemViews[kind] as? GpuStatusItemView {
@@ -414,7 +438,8 @@ final class MenuBarMonitors: NSObject {
                 // 温度模式：还是原来的单列 Mini 图标
                 (itemViews[kind] as? MiniStatusItemView)?.value =
                     Self.metricText(for: kind, overview: overview,
-                                    live: MetricsHub.shared.live)
+                                    live: MetricsHub.shared.live,
+                                    sensors: MetricsHub.shared.sensors)
             }
         case .mem:
             let m = BackendService.dict(overview, "memory")
@@ -457,17 +482,21 @@ final class MenuBarMonitors: NSObject {
     }
 
     /// v2.4.5：CPU/GPU 菜单栏数值——按「系统」页设置的指标取温度或占用率。
-    /// 温度源是 MetricsHub.live（/api/fan，temp_cpu/temp_gpu），占用源是 overview。
+    /// 温度源是 MetricsHub.live 的 `temp_cpu`/`temp_gpu` —— 那是 SMC 封装温度
+    /// 与 NVAccel 核心温度，**两者都不经过 EC**；占用源是 overview。
     static func metricText(for kind: MenuBarIconKind,
                            overview: [String: Any],
-                           live: [String: Any]) -> String {
+                           live: [String: Any],
+                           sensors: [String: Any] = [:]) -> String {
         switch MenuBarMetric.current(for: kind) {
         case .usage:
             let key = kind == .cpu ? "cpu_usage" : "gpu_usage"
             return String(format: "%.0f%%", BackendService.double(overview, key) ?? 0)
         case .temp:
-            let key = kind == .cpu ? "temp_cpu" : "temp_gpu"
-            guard let t = BackendService.double(live, key) else { return "—" }
+            // 系统温度：CPU 直接读 SMC（TC0P 等），GPU 读 NVAccel。都不经过 EC。
+            let t = kind == .cpu ? MetricsHub.cpuTempC(sensors, live)
+                                 : MetricsHub.gpuTempC(sensors, live)
+            guard let t else { return "—" }
             return String(format: "%.0f°", t)
         case .life:
             return "—"
@@ -549,7 +578,7 @@ struct SensorPanelView: View {
         switch kind {
         case .cpu:
             // 2026-10-25 用户要求：只留温度 + 占用，风扇转速从这一格里删掉
-            let temp = BackendService.double(hub.live, "temp_cpu")
+            let temp = MetricsHub.cpuTempC(hub.sensors, hub.live)
             let usage = BackendService.double(hub.overview, "cpu_usage")
             return [("CPU 温度", temp.map { String(format: "%.0f", $0) } ?? "—", "℃"),
                     ("CPU 占用", usage.map { String(format: "%.0f", $0) } ?? "—", "%")]
@@ -564,7 +593,7 @@ struct SensorPanelView: View {
         case .gpu:
             // 2026-10-26：核显与独显分开两格，标签写清楚是哪一颗。
             // 温度那一格是 NVAccel 上报的 GPU 核心温度（TSENS，PR #323）—— 那是独显的，所以标「独显温度」。
-            let temp = BackendService.double(hub.live, "temp_gpu")
+            let temp = MetricsHub.gpuTempC(hub.sensors, hub.live)
             let igpu = MenuBarMonitors.igpuUsage(hub.overview)
             let dgpu = MenuBarMonitors.dgpuUsage(hub.overview)
             return [("iGPU 占用", igpu.map { String(format: "%.0f", $0) } ?? "—", "%"),

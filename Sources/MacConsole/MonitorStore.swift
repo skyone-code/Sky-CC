@@ -8,9 +8,10 @@ import SwiftUI
 /// 每个都是一次 XPC 往返 + JSON 解码；现在后端把风扇（走采样器热缓存）、
 /// 音量（CoreAudio）都并进同一个 payload，UI 侧只剩一次往返。
 ///
-/// EC 面（风扇/温度）仍由 helper 的后台采样器 2 秒采一次——EC 邮箱硬上限
+/// 温度面（CPU/GPU）不走 EC：CPU 取 SMC（TC0P 等封装键），GPU 取 NVAccel 上报。
+/// 转速面（EC 0x046C/0x0464）仍由 helper 的后台采样器 2 秒采一次——EC 邮箱硬上限
 /// ~15 次/秒，一次全扫 17 读就是 1.1 秒，1 秒轮询不可能直读（见坑 #55）。
-/// 所以「UI 1 秒刷新、风扇值 2 秒更新」，与 Stats 的 1 秒一致，快照本身 <50ms。
+/// 所以「UI 1 秒刷新、转速值 2 秒更新」，与 Stats 的 1 秒一致，快照本身 <50ms。
 @MainActor
 final class MonitorStore: ObservableObject {
 
@@ -132,7 +133,7 @@ final class MonitorStore: ObservableObject {
         tick &+= 1
         pushHistory()
         // 菜单栏图标与弹出面板共用这一份快照（不再自己轮询，见 MetricsHub 注释）
-        MetricsHub.shared.ingest(overview: overview, live: live)
+        MetricsHub.shared.ingest(overview: overview, live: live, sensors: sensors)
     }
 
     /// 把关心的几个指标压进环形缓冲（1 秒一个点，90 点 = 90 秒）
@@ -224,7 +225,7 @@ final class MonitorStore: ObservableObject {
     /// 驱动未就绪/未上报时为 0，调用方按「不可用」处理。
     var gpuTemp: Double { Double(BackendService.int(live, "temp_gpu") ?? 0) }
     /// CPU 温度：优先 SMC 封装温度（TC0P，与 Stats 同源、读取更快），
-    /// 拿不到再退 EC 的 temp_cpu（两路实测同值）。
+    /// 拿不到再退后端快照的 `temp_cpu`（同一份 SMC 数据的另一个入口，**不是 EC**）。
     var cpuTemp: Double {
         if let raw = sensors["raw_temps"] as? [String: Any],
            let n = raw["TC0P"] as? NSNumber, n.doubleValue > 0 {

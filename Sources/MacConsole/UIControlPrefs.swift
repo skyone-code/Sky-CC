@@ -10,6 +10,10 @@ import Foundation
 ///   · 之后界面所有开关 / 档位都从这里的记忆值渲染，不再每轮去读 EC
 ///   · 用户每改一项，先写记忆、再写 EC，界面立刻以记忆为准
 ///
+/// 【3.0.2.1 修正】启动时**只读不应用**（adoptHardwareIfNeeded）：
+/// 拿到 EC 真值就抄进记忆，绝不拿记忆值去覆盖硬件。旧版 2.8.11 是反过来的
+/// 「不一致就把记忆写回 EC」，会把别处改过的设置强行改回去 —— 已废弃。
+///
 /// 好处：界面不再「点完 1 秒后被回读刷回去」；EC 的字节本来就是持久项，
 /// 我们只是自己留一份权威副本，省掉每轮的读-改-写与竞态。
 /// 代价：在别的系统（Windows / mcutil / 命令行）里改了同一项，界面要重启才发现。
@@ -131,37 +135,51 @@ enum UIControlPrefs {
     }
 
 
-    /// 启动对账（2.8.11，用户要求）
+    /// 启动时**只读不写**：把 EC 真值抄进软件记忆（3.0.2.1，用户要求）
     ///
-    /// 规则：**除「散热模式 / 系统功耗设置」以外**的项 —— 初始化时比一次 EC 与记忆，
-    /// 不一致就以记忆为准，把记忆值写回 EC（让硬件回到用户上次的设置）。
-    /// 散热/功耗两项故意排除：它们是同一个字节 0x7AB 的高低半字节，原厂语义是
-    /// 「动功耗 → 散热跟随；只动散热 → 功耗不动」，必须始终显示 EC 真值。
+    /// 用户原话：「首次进入软件之后 读取 ec 值就可以了 不要应用 首次打开只读不应用，
+    /// 现在的版本应该是首次打开读值不一致就应用对吧，改成只读不应用」。
     ///
-    /// 返回需要下发到 `/api/fan` 的 (参数名, 值) 列表；每次启动只算一次。
+    /// 【2.8.11 的旧行为，已废弃】初始化时比一次 EC 与记忆，不一致就把**记忆值写回 EC**，
+    /// 让硬件回到上次的设置。问题：在别处（Fn 键、Windows、命令行）改过的项，
+    /// 一开 app 就被强行改回去 —— 用户要的是「读一眼，别动手」。
+    ///
+    /// 【现在的行为】方向反过来：**EC 是权威**，启动第一次拿到快照时把 EC 真值抄进记忆，
+    /// 一个字节都不往 EC 写。界面于是显示硬件真实状态；用户不动手，硬件就不变。
+    ///
+    /// 「散热模式 / 系统功耗设置」仍然不参与：它们共用 0x7AB 的高低半字节，
+    /// 原厂语义是「动功耗 → 散热跟随；只动散热 → 功耗不动」，本来就一直读 EC 真值。
+    ///
+    /// 每次启动只做一次。快照里没有 `misc`（EC 还没就绪）时**不置标志**，等下一轮再抄。
     @MainActor
-    static func mismatches(_ fan: [String: Any]) -> [(String, Any)] {
-        guard !reconciled, !fan.isEmpty else { return [] }
-        reconciled = true
+    static func adoptHardwareIfNeeded(_ fan: [String: Any]) {
+        guard !reconciled, !fan.isEmpty else { return }
+        guard let misc = fan["misc"] as? [String: Any] else { return }   // EC 未就绪，下轮再试
 
-        var out: [(String, Any)] = []
-        if let misc = fan["misc"] as? [String: Any] {
-            func cmp(_ prefKey: String, _ fanKey: String) {
-                guard let want = d.object(forKey: prefKey) as? Bool,
-                      let cur = BackendService.bool(misc, fanKey), want != cur else { return }
-                out.append((fanKey, want))
+        var changed: [String] = []
+        func adopt(_ prefKey: String, _ fanKey: String) {
+            guard let cur = BackendService.bool(misc, fanKey) else { return }
+            if (d.object(forKey: prefKey) as? Bool) != cur {
+                d.set(cur, forKey: prefKey)
+                changed.append("\(fanKey)=\(cur)")
             }
-            cmp(K.kbBacklight, "keyboard_backlight")
-            cmp(K.winLock, "win_lock")
-            cmp(K.osd, "osd")
-            cmp(K.silentMode, "silent_mode")
-            cmp(K.passiveCooling, "passive_cooling_disabled")
-            cmp(K.fnLock, "fn_lock")
         }
-        if let want = int(K.charge), let cur = BackendService.int(fan, "charge"), want != cur {
-            out.append(("charge", want))
+        adopt(K.kbBacklight, "keyboard_backlight")
+        adopt(K.winLock, "win_lock")
+        adopt(K.osd, "osd")
+        adopt(K.silentMode, "silent_mode")
+        adopt(K.passiveCooling, "passive_cooling_disabled")
+        adopt(K.fnLock, "fn_lock")
+        if let cur = BackendService.int(fan, "charge") {
+            if d.object(forKey: K.charge) == nil || d.integer(forKey: K.charge) != cur {
+                d.set(cur, forKey: K.charge)
+                changed.append("charge=\(cur)")
+            }
         }
-        return out
+        if !changed.isEmpty {
+            print("[prefs] 启动只读采纳 EC 真值（不写回硬件）：\(changed.joined(separator: ", "))")
+        }
+        reconciled = true
     }
 
     private static var reconciled = false

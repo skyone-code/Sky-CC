@@ -44,10 +44,10 @@ enum EC {
     static let fanCtrl: UInt32      = 0x0751   // bit4=TURBO bit5=AUTO bit6=BOOST, 0x80+n=级别
     static let fanRPM1: UInt32      = 0x046C   // CPU 风扇转速（16位，大端）
     static let fanRPM2: UInt32      = 0x0464   // GPU 风扇转速
-    static let fanTemp1: UInt32     = 0x043E   // CPU 附近温度（°C）
-    static let fanTemp2: UInt32     = 0x044F   // GPU 附近板级温度（°C）—— 2.7.6 起已不再轮询，GPU 温度改走 NVAccel
-    static let fanPWM1: UInt32      = 0x1809   // CPU 风扇占空比（量程 0-200）
-    static let fanPWM2: UInt32      = 0x1804   // GPU 风扇占空比
+    static let fanTemp1: UInt32     = 0x043E   // CPU 附近板级温度（°C）—— 仅登记地址，2.8.15 起无读取点
+    static let fanTemp2: UInt32     = 0x044F   // GPU 附近板级温度（°C）—— 仅登记地址，2.7.6 起无读取点
+    static let fanPWM1: UInt32      = 0x1809   // CPU 风扇占空比（量程 0-200）—— 仅登记地址，界面不显示
+    static let fanPWM2: UInt32      = 0x1804   // GPU 风扇占空比 —— 仅登记地址，界面不显示
     static let ctrl1: UInt32        = 0x0741   // bit0 = 手动风扇门（写事件，不是状态位）bit5 = 风扇异常
     static let ctrl2: UInt32        = 0x078C   // bit2-3 = TURBO_LEVEL(0-3)
     static let ctrl3: UInt32        = 0x07A5   // ApOem3：功耗档+散热档共同决定（0x88|…），基准期间 EC 自己维护
