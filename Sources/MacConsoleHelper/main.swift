@@ -152,7 +152,7 @@ DispatchQueue.global(qos: .userInitiated).async {
     NativeAPI.startupSequence()
     // 独显利用率预热：让第一份 /api/snapshot 就带上 dgpu 的真值。
     // 不预热的话首秒 payload 里 available=false，界面会闪一下「未找到 NVAccel 服务」。
-    // 必须在 helper 进程里做 —— app 进程那份 NVAccelUtil 是没人用的副本。
+    // 现在只是读一次 IORegistry 把本地滑动窗口填上第一拍（驱动 2.6.3 自己每秒采样）。
     NVAccelUtil.warmUp()
     // 灯效保活（闲置熄灯修补，见 NativeRGB.swift 的 RGBKeepAlive）
     RGBKeepAlive.start()

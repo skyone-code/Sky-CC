@@ -137,22 +137,15 @@ enum NativeAPI {
         case "/api/capability": return capability()
         case "/api/all":        return allPayload(slim: false)
         case "/api/snapshot":   return allPayload(slim: true)
-        // 独显利用率的「有没有人在看」信号（2026-10-26）。
+        // 独显利用率的「有没有人在看」信号 —— 2026-10-28 起**已废弃**，保留空壳。
         //
-        // 为什么要有这两条：`NVAccelUtil` 的静态状态跟着进程走，而真正读 NVAccel 的是
-        // **helper 进程**（/api/snapshot 在这里组包）。app 侧的 NVAccelUtil 是另一份
-        // 没人用的副本，直接在 app 里调 setWanted() 对 helper 毫无影响 ——
-        // 所以这个信号必须经 XPC 送过来。
-        //
-        // 为什么用 GET 而不是 POST：handlePost 开头会 invalidateFanCache()，
-        // 一次多余的风扇冷扫描是 17 次 EC 读 ≈1.1 秒，纯属白花。
-        // 两条独立路径而不是带参数，是因为 GET 侧没有 params 通道。
-        case "/api/dgpu/want":
-            NVAccelUtil.setWanted(true)
-            return ["ok": true, "wanted": true]
-        case "/api/dgpu/idle":
-            NVAccelUtil.setWanted(false)
-            return ["ok": true, "wanted": false]
+        // 旧实现在这里开 RM 通道、一次拷 55,888 字节回来，所以必须有「有人看才 1 秒一次、
+        // 没人看降到 10 秒」的节流，app 侧还得经 XPC 把信号送进 helper。
+        // 驱动 2.6.3 自己每秒采样并发布到 PerformanceStatistics，我们只读 IORegistry，
+        // 一次微秒级、无内核锁，节流完全没必要了。
+        // 两条路由留着只为「老 app + 新 helper」升级过渡期不报 404。
+        case "/api/dgpu/want", "/api/dgpu/idle":
+            return ["ok": true, "deprecated": true]
         default:
             return nil
         }
@@ -1358,8 +1351,9 @@ enum NativeAPI {
                     + "常规做法要靠 smartctl（smartmontools），"
                     + "本机未安装且无 brew，且 macOS 读 NVMe SMART 需管理员权限"],
                 ["name": "GPU 占用率与功耗",
-                 "detail": "dGPU 占用率走 NVAccel 的 RM 控制接口"
-                    + "（issue #324 的 GPUMON perfmon），iGPU 走 IOAccelerator 的 Device Utilization %；"
+                 "detail": "dGPU 占用率读 NVAccel 发布的 PerformanceStatistics"
+                    + "（驱动 2.6.3 起由内核每秒采样并写入 GPU Core / Memory / Video 三个引擎的利用率），"
+                    + "iGPU 走 IOAccelerator 的 Device Utilization %；"
                     + "两者都是引擎忙碌时间占比，不是显存占用率。"
                     + "GPU 功耗 macOS 下没有用户态接口，本机未接入。"
                     + "iGPU 与 CPU 同封装、本机没有它的独立热敏"

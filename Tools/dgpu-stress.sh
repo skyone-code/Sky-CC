@@ -1,5 +1,5 @@
 #!/bin/zsh
-# dgpu-stress.sh —— 给 dGPU 加压，同时用 GPUMON 采样，验证利用率读数是否真的跟随负载
+# dgpu-stress.sh —— 给 dGPU 加压，同时采样利用率，验证读数是否真的跟随负载
 #
 # 用法：
 #   ./Tools/dgpu-stress.sh                 # 满载 20 秒 + 3 秒基线 + 5 秒回落
@@ -7,12 +7,16 @@
 #   ./Tools/dgpu-stress.sh 20 50           # 20 秒、占空比 50%（跑一半歇一半）
 #   ./Tools/dgpu-stress.sh 15 100 2        # 每 2 秒采一次（默认 1 秒）
 #
-# 为什么要占空比：GPUMON 的 GR 利用率是「引擎忙碌时间占比」。满载只能验证
+# 为什么要占空比：驱动报的 GR 利用率是「引擎忙碌时间占比」。满载只能验证
 # 「能不能打满」，占空比 50% 才能验证「读数是否与真实负载成正比」—— 后者
 # 才能排除「驱动写了个固定值」这种假上报。
 #
-# 依赖：Xcode 命令行工具（swiftc）、Metal。不需要 root，不需要 app 在跑，
-#       也不需要装任何 kext —— 走的是已装 NVAccel 的 RM escape 通道。
+# 采样方式：直接读 NVAccel 的 PerformanceStatistics（驱动 2.6.3 起由内核每秒采样，
+# 见 Sources/MacConsole/Native/NativeNVAccel.swift）。不需要 root、不需要 app 在跑、
+# 也不需要自己开 RM 通道。两个要记住的语义：驱动**每秒**才更新一次，采样间隔低于
+# 1 秒只会看到重复值；查询失败或样本超 5 秒没更新时驱动是**删键**而不是写 0。
+#
+# 依赖：Xcode 命令行工具（swiftc）、Metal。
 #
 # 退出码：0 正常；1 找不到 dGPU；2 编译失败；3 Metal 管线构建失败。
 
@@ -128,8 +132,9 @@ func dispatchOnce() -> Double {
 
 // MARK: - 采样线程
 //
-// 和加压并行跑：主线程在 dispatch，采样线程每秒打一次 GPUMON。
-// sampleOnce() 是阻塞的（一次 RM 往返 ≈4ms），放在独立线程不影响加压节奏。
+// 和加压并行跑：主线程在 dispatch，采样线程每秒打一次 IORegistry。
+// sampleOnce() 只是一次属性读（微秒级），放独立线程纯粹是为了不打乱加压节奏；
+// 驱动的采样周期是 1 秒，所以这里取到的值和上一拍重复是正常的。
 
 final class Recorder {
     struct Row { let t: Double; let phase: String; let gr: Double; let a5: Double; let a15: Double }

@@ -44,7 +44,7 @@ PROJ="$BUILD/app-resources"
 [ -d "$PROJ" ] || { echo "错误：找不到资源目录 $PROJ" >&2; exit 1; }
 
 # 版本号（唯一来源：脚本注入 Info.plist 与 helper 的 BuildVersion.swift）
-VERSION="3.0.2.0"
+VERSION="3.0.3.0"
 # 显示版本（侧边栏/设置页文案）：数字版本 + 专用版标识
 DISPLAY_VERSION="$VERSION LAPQC71专版"
 # nvmetemp（NVMe 硬盘温度，SMART）——有现成二进制就用，
@@ -145,7 +145,17 @@ cat > "$SWIFT/Sources/Shared/BuildVersion.swift" <<EOF
 // 由 build-swift.sh 自动生成，请勿手改
 let mcHelperBuildVersion = "$VERSION"
 EOF
+# module cache 位置：默认用系统那份；在受限环境（agent 沙盒 / 只读 HOME）里
+# swiftc 会报 "error opening '.../ModuleCache/Swift-XXXX.swiftmodule' for output:
+# Operation not permitted" —— 那不是代码问题，是默认缓存在 /var/folders 下不可写。
+# 这种情况给 MC_MODCACHE=/tmp/mcmodcache 即可，三个 target 都吃这个变量。
+MODCACHE_ARGS=()
+if [[ -n "${MC_MODCACHE:-}" ]]; then
+  mkdir -p "$MC_MODCACHE"
+  MODCACHE_ARGS=(-module-cache-path "$MC_MODCACHE")
+fi
 SWIFTC_MAIN=(swiftc -O -parse-as-library -target x86_64-apple-macosx14.0 \
+  "${MODCACHE_ARGS[@]}" \
   -o "$APP/Contents/MacOS/Mac控制台" \
   "$SWIFT"/Sources/Shared/*.swift \
   "$SWIFT"/Sources/MacConsole/*.swift "$SWIFT"/Sources/MacConsole/Native/*.swift)
@@ -169,7 +179,7 @@ done
 echo "==> 3/8 编译 mcutil（硬件命令行助手，复用 Native 层）"
 # 不加 -parse-as-library：main.swift 需要顶层代码（否则
 # "expressions are not allowed at the top level"）。
-swiftc -O -target x86_64-apple-macosx14.0 \
+swiftc -O -target x86_64-apple-macosx14.0 "${MODCACHE_ARGS[@]}" \
   -o "$APP/Contents/MacOS/mcutil" \
   "$SWIFT"/Sources/Shared/*.swift \
   "$SWIFT"/Sources/mcutil/main.swift "$SWIFT"/Sources/MacConsole/Native/*.swift "$SWIFT"/Sources/MacConsole/FanCurve.swift
@@ -177,7 +187,7 @@ swiftc -O -target x86_64-apple-macosx14.0 \
 echo "==> 3.5/8 编译 MacConsoleHelper（唯一持有 EC/SMC/HID 的后台进程）"
 # 与主程序同一套 Native 层源码，但自己带 main.swift：它是 launchd 拉起的
 # LaunchAgent，不是 app 的子进程，所以不能依赖 NSApplication。
-swiftc -O -target x86_64-apple-macosx14.0 \
+swiftc -O -target x86_64-apple-macosx14.0 "${MODCACHE_ARGS[@]}" \
   -o "$APP/Contents/MacOS/MacConsoleHelper" \
   "$SWIFT"/Sources/Shared/*.swift \
   "$SWIFT"/Sources/MacConsoleHelper/main.swift \

@@ -408,8 +408,9 @@ enum NativeSystem {
             "cpu_usage": usage,
             "gpu_usage": gpuUsage() as Any,
             "gpu_stats": slim ? gpuDetailSlim() : gpuDetail(),
-            // 独显（NVIDIA）利用率：走 NVAccel 的 RM 控制接口（issue #324），
-            // 核显那套 IOAccelerator 对 N 卡没有数据。2 秒缓存，值不可用时 reported=false。
+            // 独显（NVIDIA）利用率：驱动 2.6.3 起由内核每秒采样并发布到 NVAccel 的
+            // PerformanceStatistics，这里只是读 IORegistry（见 NativeNVAccel）。
+            // 核显那套 IOAccelerator 对 N 卡没有数据。值不可用时 reported=false。
             "dgpu": NVAccelUtil.snapshot(),
             "disk_temp": diskTemp() as Any,
             "smart": smartList(),
@@ -545,10 +546,12 @@ enum NativeSystem {
                 svc, "PerformanceStatistics" as CFString, kCFAllocatorDefault, 0) else { return }
             guard let raw = unmanaged.takeRetainedValue() as? [String: Any] else { return }
             var e: [String: Any] = ["stats": jsonSafe(raw)]
+            var ioClass = ""
             if let u = IORegistryEntryCreateCFProperty(
                 svc, "IOClass" as CFString, kCFAllocatorDefault, 0),
                let s = u.takeRetainedValue() as? String {
                 e["io_class"] = s
+                ioClass = s
             }
             if let u = IORegistryEntryCreateCFProperty(
                 svc, "model" as CFString, kCFAllocatorDefault, 0),
@@ -558,7 +561,11 @@ enum NativeSystem {
             for key in ["Device Utilization %", "GPU Activity(%)"] {
                 if let n = raw[key] as? NSNumber {
                     e["utilization"] = n.intValue
-                    vals.append(n.intValue)
+                    // `gpu_usage`（概览 KPI / 菜单栏 / 核显那一行）只认核显。
+                    // 驱动 2.6.3 起 NVAccel 也发布 "Device Utilization %"（见
+                    // NativeNVAccel 顶部注释），再取「所有加速器的最大值」就会让
+                    // 独显忙的时候把核显那个数字顶上去 —— 两个数字各归各的。
+                    if !isNvidiaAccelerator(ioClass) { vals.append(n.intValue) }
                     break
                 }
             }
@@ -580,6 +587,17 @@ enum NativeSystem {
         gpuLock.lock()
         defer { gpuLock.unlock() }
         return gpuUsageCache
+    }
+
+    /// 这条 IOAccelerator 是不是 NVIDIA 驱动的那条。
+    ///
+    /// 2.6.3 之前 NVAccel 不发布 "Device Utilization %"，所以「所有加速器取最大」
+    /// 恰好只等于核显；现在 N 卡也有了，必须把两条区分开，否则 `gpu_usage`
+    /// 会在独显满载时跳到独显的数字（核显那一格、概览 KPI、菜单栏全跟着错）。
+    /// 独显的数字走 `dgpu`（NativeNVAccel），这里只服务核显。
+    private static func isNvidiaAccelerator(_ ioClass: String) -> Bool {
+        let s = ioClass.lowercased()
+        return s.contains("nvaccel") || s.contains("nvrm") || s.contains("nvidia")
     }
 
     /// 精简版 GPU 统计（1 秒轮询用）：只留利用率与显存几项，丢掉上百个

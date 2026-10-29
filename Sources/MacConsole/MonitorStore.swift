@@ -49,14 +49,6 @@ final class MonitorStore: ObservableObject {
     /// 计数归零后 helper 侧的租约 10 秒内自然过期，EC 读取彻底停下。
     private var liveFanDemand = 0
     private var lightingDemand = 0
-    /// 独显利用率的需求计数（NVAccel RM 通道）。
-    /// 与上面两个不同：归零**不停止**采集 —— 菜单栏和 90 秒曲线读的是同一份快照，
-    /// 停了就会显示冻结的旧值。归零只是把 RM 查询从 1 秒一次降到 10 秒一次
-    /// （一次查询要拷 55,888 字节回来，没必要在没人看的时候每秒做一遍）。
-    private var dgpuDemand = 0
-    /// 已经告诉 helper 的状态。只在变化时发 XPC，不是每秒发。
-    private var dgpuWantedSent: Bool?
-
     func demandLiveFan(_ on: Bool) {
         liveFanDemand = max(0, liveFanDemand + (on ? 1 : -1))
     }
@@ -65,32 +57,9 @@ final class MonitorStore: ObservableObject {
         lightingDemand = max(0, lightingDemand + (on ? 1 : -1))
     }
 
-    func demandDgpu(_ on: Bool) {
-        dgpuDemand = max(0, dgpuDemand + (on ? 1 : -1))
-        syncDgpuDemand()
-    }
-
-    /// 把「有没有人在看独显利用率」告诉 helper。
-    ///
-    /// ⚠ 必须经 XPC：真正读 NVAccel 的是 **helper 进程**（`/api/snapshot` 在那边组包），
-    /// `NVAccelUtil` 的静态状态跟着进程走，在 app 里直接调 `setWanted()` 改的是
-    /// 另一份没人用的副本，对 helper 毫无影响（这个坑 2026-10-26 踩过）。
-    private func syncDgpuDemand() {
-        guard let backend else { return }   // 还没 attach：attach() 结尾会补一次
-        let want = dgpuDemand > 0
-        guard dgpuWantedSent != want else { return }
-        dgpuWantedSent = want
-        Task {
-            _ = try? await backend.getJSON(want ? "/api/dgpu/want" : "/api/dgpu/idle")
-        }
-    }
-
     func attach(_ backend: BackendService) {
         guard self.backend == nil else { return }
         self.backend = backend
-        // 独显利用率的按需信号可能在 attach 之前就被页面登记过（视图先于后端起来），
-        // 这里补发一次。预热本身在 helper 进程里做，见 MacConsoleHelper/main.swift。
-        syncDgpuDemand()
         loop = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.refresh()
@@ -157,8 +126,8 @@ final class MonitorStore: ObservableObject {
         add("up", BackendService.double(net, "up_kbs"))
         add("diskTemp", diskTemp)
         // 独显利用率只在驱动真的上报时才进曲线，否则整条 0 线会误导。
-        // 用 5 秒均值而不是瞬时值：固件按整秒统计，瞬时值在 90 点折线上是一格一个台阶，
-        // 而均值本来就在同一次查询里算好，不多花一次 RM 调用。
+        // 用 5 秒均值而不是瞬时值：驱动按整秒发布，瞬时值在 90 点折线上是一格一个台阶，
+        // 而均值是本进程在 payload 里算好的本地滑动平均，不多花一次 IORegistry 读。
         add("dgpu", dgpuReported ? dgpuUtilAvg5 : nil)
         history = h
     }
@@ -188,18 +157,20 @@ final class MonitorStore: ObservableObject {
     var net: [String: Any] { BackendService.dict(overview, "net") ?? [:] }
     var gpus: [[String: Any]] { (BackendService.array(overview, "gpus") as? [[String: Any]]) ?? [] }
 
-    /// 独显利用率（NVAccel RM 通道，issue #324）
-    /// `reported == false` 表示驱动把样本结构写回来了但 util 恒为 0（本机 2.4.3 就是这个状态），
-    /// 界面必须显示「未上报」而不是 0%。
+    /// 独显利用率（NVAccel 发布的 PerformanceStatistics，驱动 2.6.3 起）
+    ///
+    /// `available == false`：NVAccel 服务不在（驱动没装 / 没加载）。
+    /// `reported == false`：服务在，但这一拍没有利用率键 —— 驱动查询失败，
+    /// 或样本超过 5 秒没更新时会**把键删掉**（「缺遥测 ≠ 空闲」），界面必须显示「—」。
     var dgpu: [String: Any] { BackendService.dict(overview, "dgpu") ?? [:] }
     var dgpuReported: Bool { BackendService.bool(dgpu, "reported") ?? false }
     var dgpuAvailable: Bool { BackendService.bool(dgpu, "available") ?? false }
-    /// GR（3D 引擎）瞬时占用率。固件按整秒统计，所以它是一秒一跳的台阶值，
+    /// GR（3D 引擎）瞬时占用率。驱动按整秒发布，所以它是一秒一跳的台阶值，
     /// 只适合放进 tooltip 或做差值判断，**不要直接拿来画曲线**。
     var dgpuUtil: Double { BackendService.double(dgpu, "gr_pct") ?? 0 }
-    /// GR 最近 5 / 15 秒均值。72 条样本（72 秒历史）本来就在同一次查询里拿到了，
-    /// 求均值是纯加法、零额外开销。界面显示用这两个。
-    /// 兜底取瞬时值：驱动版本较旧、payload 里没有均值字段时也不至于显示 0。
+    /// GR 最近 5 / 15 秒均值（本地滑动平均，见 NativeNVAccel 的 `ring`）。
+    /// 界面显示用这两个：驱动只给瞬时值，历史是我们自己按拍记的。
+    /// 兜底取瞬时值：payload 里没有均值字段时（老 helper）也不至于显示 0。
     var dgpuUtilAvg5: Double { BackendService.double(dgpu, "gr_avg5_pct") ?? dgpuUtil }
     var dgpuUtilAvg15: Double { BackendService.double(dgpu, "gr_avg15_pct") ?? dgpuUtil }
 
@@ -207,7 +178,8 @@ final class MonitorStore: ObservableObject {
     ///
     /// FB（framebuffer）不是「没用」：这台机器的 dGPU 挂着 NVK 注册的虚拟显示
     /// （Main Display / 144Hz / Master Mirror），维持那块 surface 的扫描合成恒定占
-    /// 0.27% 左右 —— 这就是 dGPU 的固定开销，也是 GR 显示 0% 时唯一非零的引擎。
+    /// 一点点 —— 这就是 dGPU 的固定开销，也是 GR 显示 0% 时唯一非零的引擎。
+    /// 注意 2.6.3 的口径是「显存**带宽**占用」，不是显存用量。
     /// 没有均值字段时回退到瞬时值（旧 helper）。
     var dgpuFbAvg5: Double {
         BackendService.double(dgpu, "fb_avg5_pct") ?? BackendService.double(dgpu, "fb_pct") ?? 0
@@ -218,8 +190,10 @@ final class MonitorStore: ObservableObject {
     var dgpuDecAvg5: Double {
         BackendService.double(dgpu, "dec_avg5_pct") ?? BackendService.double(dgpu, "dec_pct") ?? 0
     }
-    /// GPUMON 报告的在用进程 pid（0xFFFFFFFF 表示没有）
-    var dgpuProcId: UInt32 { BackendService.double(dgpu, "proc_id").map { UInt32($0) } ?? 0xFFFF_FFFF }
+    /// 15 秒窗口里实际有几拍（排障用：一直是 1 说明快照没在刷新）
+    var dgpuSamples: Int { BackendService.int(dgpu, "samples") ?? 0 }
+    /// 均值窗口长度（秒），界面字段网格里显示
+    var dgpuWindow: Int { BackendService.int(dgpu, "window_s") ?? 15 }
 
     /// 独显温度：2.7.6 起由 NVAccel 上报的 GPU 核心温度（PR #323），不再读 EC 0x044F。
     /// 驱动未就绪/未上报时为 0，调用方按「不可用」处理。

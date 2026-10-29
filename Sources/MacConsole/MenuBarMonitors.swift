@@ -302,9 +302,6 @@ final class MenuBarMonitors: NSObject {
         buttonKinds[ObjectIdentifier(button)] = kind
         items[kind] = item
         itemViews[kind] = view
-        // 菜单栏本身就是「有人在看」——不加这一句，用户切到别的页面看菜单栏时
-        // 独显那一格会 10 秒才动一次（NVAccelUtil 的按需节流），看着像卡住了。
-        if kind == .gpu { MonitorStore.shared.demandDgpu(true) }
         updateView(kind)   // 立即填一次值，避免首帧空白
     }
 
@@ -338,8 +335,6 @@ final class MenuBarMonitors: NSObject {
             if let b = it.button { buttonKinds.removeValue(forKey: ObjectIdentifier(b)) }
             NSStatusBar.system.removeStatusItem(it)
         }
-        // 与 createItem 里的登记配对，别漏 —— 漏了会让 MonitorStore 的需求计数只增不减
-        if kind == .gpu, items[kind] != nil { MonitorStore.shared.demandDgpu(false) }
         items[kind] = nil
         itemViews[kind] = nil
     }
@@ -508,13 +503,14 @@ final class MenuBarMonitors: NSObject {
         BackendService.double(overview, "gpu_usage")
     }
 
-    /// 独显占用率：NVAccel RM 的 GPUMON perfmon（issue #324），取 GR 引擎 **5 秒均值**。
+    /// 独显占用率：NVAccel 发布的 PerformanceStatistics（驱动 2.6.3 起），
+    /// 取 GR 引擎的 **5 秒均值**。
     ///
-    /// 为什么用均值：固件按整秒统计，瞬时值是一秒一跳的台阶（实测 0% → 99% 一步到位），
-    /// 菜单栏只有一行字，跳起来比进度条更刺眼。均值在同一次查询里就算好了，零额外开销。
+    /// 为什么用均值：驱动按整秒发布，瞬时值是一秒一跳的台阶（实测 0% → 99% 一步到位），
+    /// 菜单栏只有一行字，跳起来比进度条更刺眼。均值是本机按拍记的本地滑动平均。
     ///
-    /// 驱动没上报时返回 nil → 界面显示「—」而不是 0%。这条很重要：
-    /// 2.4.3 + NVK 时期的驱动会把样本结构完整写回但 util 恒为 0，
+    /// 驱动这一拍没发布时返回 nil → 界面显示「—」而不是 0%。这条很重要：
+    /// 驱动遇到查询失败 / 样本超过 5 秒没更新时会**删键**（不是写 0），
     /// 显示成 0% 会让人以为「独显真的闲着」。
     static func dgpuUsage(_ overview: [String: Any]) -> Double? {
         let d = BackendService.dict(overview, "dgpu") ?? [:]

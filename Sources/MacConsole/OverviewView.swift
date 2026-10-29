@@ -45,20 +45,6 @@ struct OverviewView: View {
         }
         .background(Theme.bg)
         .task { await probe() }
-        .onAppear {
-            // 概览页只有把 KPI 切到「独显」时才需要 1 秒一次查 NVAccel；
-            // 默认看核显，那一套走 IOAccelerator，不碰 RM 通道。
-            if gpuTarget == "dgpu" { store.demandDgpu(true) }
-        }
-        .onDisappear {
-            // 只释放自己真正持有过的那一份，否则会把性能页的登记一起减掉
-            if gpuTarget == "dgpu" { store.demandDgpu(false) }
-        }
-        .onChange(of: gpuTarget) { old, new in
-            // 页面还在、只是换了目标：按 old → new 精确增减，不能只加不减
-            if old == "dgpu" { store.demandDgpu(false) }
-            if new == "dgpu" { store.demandDgpu(true) }
-        }
     }
 
     // MARK: 头部
@@ -447,8 +433,8 @@ struct OverviewView: View {
 
     // MARK: - GPU 使用率（2.7.6：可选核显 / 独显）
 
-    /// 核显走 IOAccelerator 的 "Device Utilization %"；独显走 NVAccel RM 的 3D 引擎
-    /// （NV2080_CTRL_CMD_PERF_GET_GPUMON_PERFMON_UTIL_SAMPLES_V2，见 NativeNVAccel）。
+    /// 核显走 IOAccelerator 的 "Device Utilization %"；独显走 NVAccel 发布的
+    /// PerformanceStatistics 利用率键（驱动 2.6.3 起，见 NativeNVAccel）。
     private var gpuUsageValue: Double? {
         if gpuTarget == "dgpu" {
             guard store.dgpuAvailable, store.dgpuReported else { return nil }
@@ -465,9 +451,10 @@ struct OverviewView: View {
     /// 这个百分比是「引擎占用率」，不是显存占用 —— 用户专门问过，写进 tooltip 里说明清楚。
     private var gpuUsageHelp: String {
         if gpuTarget == "dgpu" {
-            return "dGPU：NVAccel RM 的 GPUMON perfmon（NV2080_CTRL_CMD_PERF_GET_GPUMON_PERFMON_UTIL_SAMPLES_V2），"
+            return "dGPU：NVAccel 的 PerformanceStatistics[\"GPU Core Utilization %\"]"
+                 + "（驱动 2.6.3 每秒向 NVRM 要一次 RM 的 GR 引擎利用率并发布），"
                  + "取 GR（3D 图形引擎）的忙碌时间占比。\n"
-                 + "不是显存占用率。固件按整秒统计，这里显示的是最近 5 秒均值；"
+                 + "不是显存占用率。驱动按整秒发布，这里显示的是最近 5 秒均值；"
                  + "瞬时 \(Fmt.tridiagonal(store.dgpuUtil))%，15 秒均值 \(Fmt.tridiagonal(store.dgpuUtilAvg15))%。"
         }
         return "iGPU：IOAccelerator 的 Device Utilization %，GPU 渲染引擎的忙碌时间占比。\n"
@@ -478,7 +465,7 @@ struct OverviewView: View {
         if gpuTarget == "dgpu" {
             if !store.dgpuAvailable { return dgpuName + " · NVAccel 未就绪" }
             return store.dgpuReported ? dgpuName + " · 3D 引擎"
-                                      : dgpuName + " · 驱动未上报利用率"
+                                      : dgpuName + " · 这一拍没有遥测"
         }
         return igpuName
     }

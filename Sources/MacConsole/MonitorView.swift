@@ -57,13 +57,12 @@ struct MonitorView: View {
         .onAppear {
             // 2.8.15：本页显示实时转速 → 声明需求，helper 才按租约读 EC。
             // 切走即收回，10 秒后 EC 读取归零。
+            // （独显利用率不再需要登记：驱动 2.6.3 自己每秒采样并发布，
+            //   我们只是读 IORegistry，一次是微秒级，不存在「谁在看」的开关。）
             store.demandLiveFan(true)
-            // 本页的「显卡」卡片常驻显示独显那一行 → 独显利用率按 1 秒查。
-            store.demandDgpu(true)
         }
         .onDisappear {
             store.demandLiveFan(false)
-            store.demandDgpu(false)
         }
     }
 
@@ -219,8 +218,9 @@ struct MonitorView: View {
         store.gpus.first { (BackendService.string($0, "bus") ?? "") != "PCIe" } ?? [:]
     }
 
-    /// 核显的 IOAccelerator 统计（IntelAccelerator）。nv_accel 那条没有
-    /// PerformanceStatistics，所以按 io_class 挑，别按顺序猜。
+    /// 核显的 IOAccelerator 统计（IntelAccelerator）。驱动 2.6.3 起 NVAccel 也发布
+    /// PerformanceStatistics 了（利用率 + 温度），所以这里**必须**按 io_class 挑，
+    /// 别按顺序猜，也别再用「第一条就是核显」那种假设。
     private var igpuStatEntry: [String: Any] {
         let stats = (BackendService.array(store.overview, "gpu_stats") as? [[String: Any]]) ?? []
         if let intel = stats.first(where: {
@@ -422,7 +422,7 @@ struct MonitorView: View {
                     ("Metal", BackendService.string(detail, "Metal Support") ?? "—"),
                     ("设备 ID", BackendService.string(detail, "Device ID") ?? "—"),
                     ("90 秒峰值", peak.map { String(format: "%.0f%%", $0) } ?? "—"),
-                    ("采样窗口", "72 秒"),
+                    ("均值窗口", "\(store.dgpuWindow) 秒"),
                     ("槽位", BackendService.string(detail, "Slot") ?? "—"),
                 ], columns: 3)
 
@@ -447,12 +447,12 @@ struct MonitorView: View {
         let detail = BackendService.dict(dgpuInfo, "detail")
         let dev = BackendService.string(detail, "Device ID") ?? "—"
         let slot = BackendService.string(detail, "Slot") ?? "—"
-        let proc = store.dgpuProcId
-        let procText = proc == 0xFFFF_FFFF ? "无" : "pid \(proc)"
         return "GR（3D 引擎）最近 5 秒均值 \(Fmt.tridiagonal(store.dgpuUtilAvg5))%，"
              + "15 秒均值 \(Fmt.tridiagonal(store.dgpuUtilAvg15))%，瞬时 \(Fmt.tridiagonal(store.dgpuUtil))%。\n"
-             + "数据来自 GPUMON perfmon：72 条 × 1 秒的环形缓冲，均值取时间戳最新的 5 / 15 条。\n"
-             + "设备 \(dev) · \(slot) · 在用进程 \(procText)"
+             + "数据来自 NVAccel 的 PerformanceStatistics（驱动 2.6.3 每秒采样一次并发布，"
+             + "已四舍五入成整数百分比）；均值是本机按拍记的 \(store.dgpuWindow) 秒窗口，"
+             + "现有 \(store.dgpuSamples) 拍。\n"
+             + "设备 \(dev) · \(slot)"
     }
 
     /// 单个引擎格子：名称 + 中文说明 + 百分比 + 细条
@@ -481,11 +481,11 @@ struct MonitorView: View {
     /// 异常状态的说明。正常时返回 nil，卡片底部就不会多一行字。
     private var dgpuHint: String? {
         if !store.dgpuAvailable {
-            return "未找到 NVAccel 服务 —— 驱动未加载或版本不含 RM 通道，dGPU 利用率不可用。"
+            return "未找到 NVAccel 服务 —— 驱动未加载或版本太旧，dGPU 利用率不可用。"
         }
         if !store.dgpuReported {
-            return "RM 通道已连通，但开机以来 72 秒窗口内四个引擎始终为 0，"
-                 + "无法区分「一直空闲」与「驱动未上报」。跑个 3D 程序就会转为正常显示。"
+            return "NVAccel 在，但这一拍没有利用率键：驱动查询失败，或样本超过 5 秒没更新"
+                 + "（驱动遇这两种情况会删键，而不是报 0）。稍等或跑个 3D 程序看看。"
         }
         return nil
     }
