@@ -291,9 +291,12 @@ struct RGBView: View {
             if !hideCardSubs {
                 Text(isKeymap
                      ? "逐键自定义会先发 0x08（固件码 0x33）进入逐键模式，再按 6 行 × 21 列逐行写 64 字节行数据；颜色同样先过原厂补偿。"
-                     : "颜色先写命名色槽位 1-\(paletteSize)（HID 0x14），再发 0x08；"
-                       + "0x08 的颜色字节写的是 ColorIndex（None/Single/Circular），不是颜色个数。"
-                       + "颜色会先过原厂补偿表，所以纯白在 EC 里是 255,50,170 而不是 255,255,255。")
+                     : (currentEffect == .single
+                        ? "单色常亮走逐键模式：先发 0x08（固件码 0x33）进 UserMode，再把 6 行 × 21 列全部灌成同一个颜色。"
+                          + "原厂 StaticMode 就是这么做的 —— 固件码 0x01 在本机 19.x 固件上不生效。"
+                        : "颜色先写命名色槽位 1-\(paletteSize)（HID 0x14），再发 0x08；"
+                          + "0x08 的颜色字节写的是 ColorIndex（None/Single/Circular），不是颜色个数。"
+                          + "颜色会先过原厂补偿表，所以纯白在 EC 里是 255,50,170 而不是 255,255,255。"))
                     .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
                     .fixedSize(horizontal: false, vertical: true)
             }

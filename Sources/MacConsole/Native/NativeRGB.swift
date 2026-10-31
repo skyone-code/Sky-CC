@@ -125,7 +125,10 @@ private let planeRed = 1 + 2 * numCols   // 43
 // MARK: - 固件灯效码（原厂 Translate_ITE_EffectIndex 全表）
 
 enum KeyboardEffect: UInt8, CaseIterable {
-    case single    = 0x01   // 单色常亮 Static
+    /// ⚠️ 3.0.3.1 起这个码**不再用于下发**：原厂 `StaticMode` 发的是 0x33（见
+    /// `setStyle` 里 `.single` 分支），本机 19.x 固件对 0x01 静默忽略。
+    /// 保留这个 rawValue 只是为了存档/回读的兼容（老配置里 style 可能是 "single"）。
+    case single    = 0x01   // 单色常亮 Static（原厂实际走 0x33）
     case breathing = 0x02   // 呼吸
     case wave      = 0x03   // 波浪
     case reactive  = 0x04   // 按下响应
@@ -549,6 +552,22 @@ final class KeyboardRGB {
                              colour: ColorIndex.none.rawValue, program2: 0, save: save)
         }
 
+        // 3.0.3.1：**单色常亮必须走 UserMode（0x33）+ 6 行同一颜色**，不能发固件码 0x01。
+        //
+        // 原厂 `Set_ITE_Effect_Type_StaticMode`（IL RVA 0x277A8）第 3 条指令起就是
+        //   `HID_Set_Effect_Type_08H(ctrl=2, effect=51, speed=0, light, color=0, dir=0, save)`
+        // 然后才开 65 字节缓冲逐行灌。整份 `oem-ite-il2.txt` 里 `HID_Set_Effect_Type_08H`
+        // **只有两个调用点**（StaticMode 0x277A8 / UserMode 0x2757C），effect 全是 51。
+        // 原厂从来没发过 0x01 —— 那是从 `ite8291r3-ctl` 抄来的 8291**r3** 协议，
+        // 本机 19.7 固件收下不报错、也不生效（2026-11-01 实测：回读 program=1 正常、
+        // 画面不变；改发 0x33 + 全红矩阵立刻整块变红）。
+        if effect == .single {
+            let c = rgb ?? (palette?.first ?? [255, 255, 255])
+            let row: [[Int]] = Array(repeating: c, count: numCols)
+            let rows: [[[Int]]] = Array(repeating: row, count: numRows)
+            return try setKeyMatrix(rows, brightness: brightness, save: save)
+        }
+
         // ① 先写调色板
         if ci != .none {
             if ci == .single {
@@ -682,12 +701,16 @@ final class KeyboardRGB {
         return last
     }
 
-    /// 把整个键盘设成单一颜色（完整流程：0x14 槽 1 → 0x08 单色）
+    /// 把整个键盘设成单一颜色。
+    ///
+    /// 3.0.3.1：改成走 UserMode（0x33）+ 6 行同色矩阵。旧实现是
+    /// 「0x14 槽 1 → 0x08 固件码 0x01」，在本机 19.7 固件上 0x01 不生效
+    /// （原因见 `setStyle` 里 `.single` 分支的长注释）。
     func setColor(r: Int, g: Int, b: Int, brightness: Int = 75, save: Int = 1, repeat count: Int = 1) throws -> Int {
-        _ = setNamedColor(slot: 1, r: r, g: g, b: b)
-        usleep(2_000)
-        return apply(.single, speed: 0, brightness: brightness,
-                     colorIndex: .single, direction: 0, save: save)
+        let c = [r, g, b]
+        let row: [[Int]] = Array(repeating: c, count: numCols)
+        let rows: [[[Int]]] = Array(repeating: row, count: numRows)
+        return try setKeyMatrix(rows, brightness: brightness, save: save)
     }
 }
 
