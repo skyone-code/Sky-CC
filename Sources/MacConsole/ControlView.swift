@@ -80,7 +80,7 @@ struct ControlView: View {
             }
             .padding(22)
         }
-        .background(Theme.bg)
+
         .onAppear {
             // 3.0.4.5：风扇卡已迁去「概览」页，实时转速租约随之搬走，本页不再声明。
             // 2.8.15（用户要求）：进控制页**读一次**当前设置（只这一次，不轮询）。
@@ -201,6 +201,7 @@ struct ControlView: View {
                 HStack(alignment: .top, spacing: 8) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("启用基准模式").font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(Theme.txt)
                         if !hideCardSubs {
                             Text("0x751=0x40 风扇全速，实测 5600 RPM；开启期间上面的散热档与功耗档会被接管")
                                 .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
@@ -220,6 +221,7 @@ struct ControlView: View {
                 HStack(alignment: .top, spacing: 8) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("禁用被动散热模式").font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(Theme.txt)
                         if !hideCardSubs {
                             Text("EC 0x7A3 bit6，BIOS 持久设置项（三次实测双向确认）")
                                 .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
@@ -251,6 +253,7 @@ struct ControlView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack(alignment: .center, spacing: 10) {
                         Text("控制方式").font(.system(size: 12.5, weight: .medium))
+                            .foregroundStyle(Theme.txt)
                             .foregroundStyle(Theme.dim).frame(width: 62, alignment: .leading)
                         SegmentedPicker(options: [("normal", "自动"), ("custom", "手动"), ("curve", "曲线")],
                                         selection: fanModeBinding)

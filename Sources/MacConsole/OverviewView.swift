@@ -41,7 +41,7 @@ struct OverviewView: View {
             }
             .padding(22)
         }
-        .background(Theme.bg)
+
         .onAppear {
             // 风扇卡在本页：声明实时转速租约（helper 才按 1 秒读 EC），离开即收回
             store.demandLiveFan(true)

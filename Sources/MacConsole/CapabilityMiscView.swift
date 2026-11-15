@@ -9,11 +9,16 @@ import ServiceManagement
 struct MiscView: View {
     @EnvironmentObject var backend: BackendService
     @EnvironmentObject var store: MonitorStore
+    // 皮肤（2026-11-15）：页面背景更换（预设配色 / 自定义图片）
+    @EnvironmentObject private var skin: SkinCenter
     // 开机自启（SMAppService，替代旧「Sky CC开机启动.app」独立 toggle）
     @State private var launchAtLogin = false
     @State private var launchNote: String?
     // 外观（v2.4.3：浅色 / 深色 / 随系统，UserDefaults 持久化）
     @State private var appearance: AppAppearance = AppAppearance.current
+    // 自身检查更新（2026-11-15）：逻辑抽到 AppUpdater 全局单例（启动期要静默检查，
+    // 那时设置页可能没打开，状态/弹窗都不能挂这里）。本视图只放触发按钮 + 展示状态。
+    @ObservedObject private var updater = AppUpdater.shared
 
     var body: some View {
         ScrollView {
@@ -29,6 +34,11 @@ struct MiscView: View {
                     GridRow {
                         menuBarCard.gridEqual().gridCellColumns(2)
                     }
+                    // 皮肤（2026-11-15）：独立通栏卡 —— 不塞进外观卡（会多两行、
+                    // 和旁边版本卡留白失衡），单独全宽一行放菜单栏卡下面
+                    GridRow {
+                        skinCard.gridEqual().gridCellColumns(2)
+                    }
                 }
                 // 「系统调整」整卡（显卡路由已并入，见 SystemTweakCard.swift）
                 SystemTweakSection()
@@ -37,10 +47,44 @@ struct MiscView: View {
             }
             .padding(22)
         }
-        .background(Theme.bg)
+
         .toastOverlay()
+        // 检查/下载/安装的 sheet 与两个 alert 都挂在根视图（MacConsoleApp），
+        // 启动期静默检查发现更新时设置页可能根本没打开
         .task {
             refreshLaunchState()
+        }
+    }
+
+    /// 皮肤背景选图（2026-11-15）：本地选一张，拷贝进 App 支持目录持久化，整页立即生效
+    private func pickSkinImage() {
+        let panel = NSOpenPanel()
+        panel.title = "选择背景图片"
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.allowedFileTypes = ["png", "jpg", "jpeg", "heic", "tiff", "gif", "bmp", "webp"]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        if skin.setCustomImage(from: url) {
+            ToastCenter.shared.show("背景图片已应用")
+        } else {
+            ToastCenter.shared.show("图片加载失败，请换一张试试")
+        }
+    }
+
+    /// 侧边栏背景选图（2026-11-15）：不选时侧边栏跟随页面公共背景层
+    private func pickSidebarImage() {
+        let panel = NSOpenPanel()
+        panel.title = "选择侧边栏背景图片"
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.allowedFileTypes = ["png", "jpg", "jpeg", "heic", "tiff", "gif", "bmp", "webp"]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        if skin.setSidebarImage(from: url) {
+            ToastCenter.shared.show("侧边栏背景已应用")
+        } else {
+            ToastCenter.shared.show("图片加载失败，请换一张试试")
         }
     }
 
@@ -54,7 +98,16 @@ struct MiscView: View {
         let os = BackendService.dict(store.overview, "os")
         return Card(title: "版本") {
             VStack(spacing: 0) {
-                KVRow(key: "控制台版本", value: "Sky CC \(AppVersion.short) (Build \(AppVersion.build))")
+                KVRow(key: "控制台版本", value: "Build \(AppVersion.build)",
+                      trailing: AnyView(
+                          Button(updater.checkingUpdate ? "检查中…" : "检查更新") {
+                              updater.check(silent: false)
+                          }
+                          .buttonStyle(.borderedProminent)
+                          .tint(Theme.blue)
+                          .controlSize(.small)
+                          .disabled(updater.checkingUpdate || updater.updatePhase != .idle)
+                      ))
                 KVRow(key: "硬件后端", value: "MacConsole/1.0 · \(AppVersion.backend)")
                 KVRow(key: "运行系统", value: "\(BackendService.string(os, "name") ?? "macOS") \(BackendService.string(os, "version") ?? "—") (\(BackendService.string(os, "build") ?? "—"))")
                 KVRow(key: "机型", value: BackendService.string(store.overview, "model") ?? "—")
@@ -114,12 +167,15 @@ private struct MenuBarIconToggleRow: View {
                 .foregroundStyle(Theme.blue)
             Text(kind.title)
                 .font(.system(size: 12.5, weight: .medium))
+                .foregroundStyle(Theme.txt)
                 .frame(width: 40, alignment: .leading)
             if kind.supportsMetric {
                 MenuBarMetricPicker(kind: kind)
-                if kind == .disk {
-                    MenuBarDiskPicker()
-                }
+            }
+            // 2026-11-15：选盘下拉原来挂在 supportsMetric 下面 —— 11-14 硬盘去掉
+            // 指标切换（supportsMetric=false）时把选盘也一起藏掉了。拆出来独立显示。
+            if kind == .disk {
+                MenuBarDiskPicker()
             }
             Spacer(minLength: 6)
             Toggle("", isOn: $on)
@@ -161,42 +217,163 @@ private struct MenuBarMetricPicker: View {
     }
 }
 
-/// 硬盘图标看哪块盘（2.7.5）：菜单里列出 overview.smart 里的所有 NVMe
+/// 硬盘图标看哪块盘（2.7.5）：菜单里列出 overview.smart 里的所有 NVMe。
+/// 2026-11-15（用户反馈「只剩一块盘」）：本机明明两块 NVMe，菜单却只列一块 ——
+/// 根因是这个 struct 没观察 MonitorStore，overview 是后台逐秒轮询来的，
+/// 打开设置页那一刻如果还没到位（或只有一拍旧数据），菜单就定格在那一瞬间，
+/// 之后数据更新了视图也不会重画。加 @ObservedObject 让它跟着 overview 走；
+/// 菜单项加当前选中勾选，label 显示选中的盘名（含型号），没选时仍显示「默认盘」。
 private struct MenuBarDiskPicker: View {
+    @ObservedObject private var store = MonitorStore.shared
     @AppStorage(MenuBarIconKind.diskTargetKey) private var target: String = ""
 
     private var disks: [[String: Any]] {
-        (BackendService.array(MonitorStore.shared.overview, "smart") as? [[String: Any]]) ?? []
+        (BackendService.array(store.overview, "smart") as? [[String: Any]]) ?? []
+    }
+
+    /// 当前选中的盘的 SMART 条目（label 显示它；没选或选中的盘不在了回第一条）
+    private var selected: [String: Any]? {
+        let list = disks
+        return list.first { ($0["bsd"] as? String) == target } ?? list.first
     }
 
     var body: some View {
         Menu {
-            ForEach(Array(disks.enumerated()), id: \.offset) { _, d in
-                let bsd = d["bsd"] as? String ?? ""
-                let model = d["model"] as? String ?? ""
+            if disks.isEmpty {
+                Text("正在读取磁盘…")
+            } else {
+                // 「默认盘」= 不指定，跟 SMART 首块可用盘（与 diskEntry 行为一致）
                 Button {
-                    target = bsd
+                    target = ""
                     MenuBarMonitors.shared.refreshTitles()
                 } label: {
-                    Text(model.isEmpty ? bsd : "\(bsd) · \(model)")
+                    if target.isEmpty {
+                        Label("默认盘", systemImage: "checkmark")
+                    } else {
+                        Text("默认盘")
+                    }
+                }
+                ForEach(Array(disks.enumerated()), id: \.offset) { _, d in
+                    let bsd = d["bsd"] as? String ?? ""
+                    let model = d["model"] as? String ?? ""
+                    Button {
+                        target = bsd
+                        MenuBarMonitors.shared.refreshTitles()
+                    } label: {
+                        if target == bsd {
+                            Label(model.isEmpty ? bsd : "\(bsd) · \(model)", systemImage: "checkmark")
+                        } else {
+                            Text(model.isEmpty ? bsd : "\(bsd) · \(model)")
+                        }
+                    }
                 }
             }
         } label: {
             HStack(spacing: 3) {
-                Text(target.isEmpty ? "默认盘" : target)
+                Text(diskLabel)
                 Image(systemName: "chevron.down").font(.system(size: 7.5))
             }
             .font(.system(size: 11))
             .foregroundStyle(Theme.dim)
+            .lineLimit(1)
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
-        .frame(width: 74)
+        .frame(width: 110)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var diskLabel: String {
+        if target.isEmpty { return "默认盘" }
+        if let s = selected {
+            let bsd = s["bsd"] as? String ?? target
+            let model = s["model"] as? String ?? ""
+            return model.isEmpty ? bsd : bsd
+        }
+        return target
     }
 }
 
     // MARK: - 开机自启（SMAppService）
     //
+    // 皮肤卡（2026-11-15）：独立通栏卡。色板选预设配色 / 按钮选自定义图片，
+    // 二者互斥（点色板自动清图片）；只换页面背景，卡片配色不动，切换即时生效。
+    // 2026-11-15 第三轮：背景图片三件套加框（panel2 底圆角，样式同核心温度块），
+    // 下方新增「侧边栏背景」行（样式一致；侧边栏默认跟随页面公共背景层）。
+    private var skinCard: some View {
+        Card(title: "皮肤") {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 10) {
+                    Text("配色").font(.system(size: 12.5, weight: .medium)).foregroundStyle(Theme.txt)
+                    HStack(spacing: 9) {
+                        ForEach(SkinCenter.Preset.allCases) { p in
+                            // 色板圆点 = 当前外观实际生效的那一档底色
+                            Circle()
+                                .fill(p.swatchColor)
+                                .frame(width: 22, height: 22)
+                                .overlay(Circle().strokeBorder(Theme.line, lineWidth: 1))
+                                .overlay {
+                                    // 当前生效（选了图片时不算任何预设，只亮底色描边）
+                                    if skin.preset == p && !skin.isCustomImage {
+                                        Circle().strokeBorder(Theme.blue, lineWidth: 1.8)
+                                            .padding(-3.5)
+                                    }
+                                }
+                                .contentShape(Circle())
+                                .onTapGesture { withAnimation(.easeOut(duration: 0.18)) { skin.select(p) } }
+                                .help("背景配色：\(p.label)")
+                        }
+                    }
+                    Spacer(minLength: 0)
+                }
+                skinImageRow(label: "背景图片",
+                             hasImage: skin.isCustomImage,
+                             imageName: currentImageName(forKey: SkinCenter.imagePathKey, present: skin.isCustomImage),
+                             pick: { pickSkinImage() },
+                             clear: { skin.clearCustomImage() })
+                skinImageRow(label: "侧边栏背景",
+                             hasImage: skin.hasSidebarImage,
+                             imageName: currentImageName(forKey: SkinCenter.sidebarImagePathKey, present: skin.hasSidebarImage),
+                             pick: { pickSidebarImage() },
+                             clear: { skin.clearSidebarImage() })
+                Text("色板更换页面背景配色；选图片后整页铺图并压一层底色蒙层。侧边栏不单独选图时跟随页面背景。预设与图片二选一。")
+                    .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .cardNote()
+            }
+        }
+    }
+
+    /// 读当前已选图片的文件名（present=false 或没记录时返回 nil）
+    private func currentImageName(forKey key: String, present: Bool) -> String? {
+        guard present, let path = UserDefaults.standard.string(forKey: key) else { return nil }
+        return (path as NSString).lastPathComponent
+    }
+
+    /// 背景图片 / 侧边栏背景 行：panel2 底 + 11pt 圆角框（样式与性能页核心温度块一致）
+    private func skinImageRow(label: String, hasImage: Bool, imageName: String?,
+                              pick: @escaping () -> Void, clear: @escaping () -> Void) -> some View {
+        HStack(spacing: 10) {
+            Text(label).font(.system(size: 12.5, weight: .medium)).foregroundStyle(Theme.txt)
+            if hasImage, let name = imageName {
+                Text("当前：\(name)")
+                    .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
+                    .lineLimit(1).truncationMode(.middle)
+            }
+            Spacer(minLength: 10)
+            Button("选择图片") { pick() }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            if hasImage {
+                Button("恢复默认") { clear() }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .background(Theme.panel2, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+    }
+
     // 2026-10-17：从「Sky CC开机启动.app」（AppleScript toggle + autostart.sh
     // 的 LaunchAgent）迁移到 app 内设置。SMAppService 注册的登录项与
     // 系统设置 → 通用 → 登录项 是同一份数据，只是管理入口挪到了 app 里。
@@ -208,7 +385,7 @@ private struct MenuBarDiskPicker: View {
                 // 一致（168 宽 small），右对齐，同行左侧加「外观」文字。
                 // （不用 allCases —— 枚举声明序是 light/dark/system，那是存储顺序不动）
                 HStack(spacing: 8) {
-                    Text("外观").font(.system(size: 12.5, weight: .medium))
+                    Text("外观").font(.system(size: 12.5, weight: .medium)).foregroundStyle(Theme.txt)
                     Spacer(minLength: 4)
                     Picker("", selection: $appearance) {
                         Text("随系统").tag(AppAppearance.system)
@@ -236,6 +413,7 @@ private struct MenuBarDiskPicker: View {
                     HStack(alignment: .top, spacing: 8) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("开机自动启动").font(.system(size: 12.5, weight: .medium))
+                                .foregroundStyle(Theme.txt)
                             Text("登录后自动打开 Sky CC（菜单栏常驻 + 硬件后台服务）")
                                 .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
                                 .cardNote()
@@ -268,6 +446,7 @@ private struct MenuBarDiskPicker: View {
                 HStack(spacing: 8) {
                     // 2026-11-14（用户要求）：文字颜色与「开机自动启动」一致（主色，不再置灰）
                     Text("状态栏主图标").font(.system(size: 12.5, weight: .medium))
+                        .foregroundStyle(Theme.txt)
                     Spacer(minLength: 4)
                     MenuBarIconStylePicker()
                 }

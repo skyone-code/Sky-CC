@@ -39,8 +39,9 @@ enum UIShot {
         func page<V: View>(_ v: V) -> some View {
             v.environmentObject(backend)
                 .environmentObject(store)
+                .environmentObject(SkinCenter.shared)   // 2026-11-15：pageBackground 依赖皮肤中心
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Theme.bg)
+                .pageBackground()
         }
 
         let items: [(String, AnyView)] = [

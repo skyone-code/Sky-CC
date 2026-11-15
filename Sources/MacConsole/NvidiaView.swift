@@ -40,11 +40,10 @@ struct NvidiaView: View {
                 header
                 heroCard
                 componentsCard
-                gpuCard
             }
             .padding(22)
         }
-        .background(Theme.bg)
+
         .onAppear(perform: refresh)
         .confirmationDialog("确认卸载 NVIDIA 驱动？", isPresented: $showUninstallConfirm,
                             titleVisibility: .visible) {
@@ -175,12 +174,6 @@ struct NvidiaView: View {
                         .disabled(state.isChecking || installPhase.isBusy)
                     }
 
-                    Button("打开发布页") {
-                        open(release?.pageURL ?? NvidiaUpdate.releasesURL)
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(installPhase.isBusy)
-
                     // 卸载：只有本机确实装了驱动才出现
                     if state.installedVersion != nil, !installPhase.isBusy {
                         Button("卸载驱动…", role: .destructive) {
@@ -273,6 +266,48 @@ struct NvidiaView: View {
     private var componentsCard: some View {
         Card(title: "驱动组件") {
             VStack(alignment: .leading, spacing: 0) {
+                // 显卡信息并入组件卡（2026-11-15 用户要求：样式与组件行一致，行间横线隔断）
+                if !dgpu.isEmpty {
+                    HStack(spacing: 10) {
+                        Circle()
+                            .fill(store.dgpuReported ? Theme.green : Theme.amber)
+                            .frame(width: 7, height: 7)
+
+                        Text(BackendService.string(dgpu, "name") ?? "—")
+                            .font(.system(size: 12, weight: .medium).monospaced())
+                            .textSelection(.enabled)
+                            .lineLimit(1)
+
+                        Spacer()
+
+                        Chip(text: store.dgpuReported ? "Metal 在线" : "遥测无数据",
+                             color: store.dgpuReported ? Theme.green : Theme.amber)
+                    }
+                    .padding(.vertical, 6)
+                    Divider().opacity(0.5)
+
+                    HStack(spacing: 10) {
+                        Circle()
+                            .fill(store.dgpuReported ? Theme.green : Theme.amber)
+                            .frame(width: 7, height: 7)
+
+                        Text("遥测")
+                            .font(.system(size: 12, weight: .medium).monospaced())
+
+                        Spacer()
+
+                        Chip(text: store.dgpuReported ? "在线" : "无数据",
+                             color: store.dgpuReported ? Theme.green : Theme.amber)
+                    }
+                    .padding(.vertical, 6)
+                    Divider().opacity(0.5)
+                } else {
+                    Text("没有检测到 NVIDIA 显卡（等性能页采集到后显示）")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(Theme.dim)
+                        .padding(.vertical, 6)
+                    Divider().opacity(0.5)
+                }
                 ForEach(Array(components.enumerated()), id: \.element.id) { index, item in
                     HStack(spacing: 10) {
                         Circle()
@@ -308,54 +343,14 @@ struct NvidiaView: View {
         }
     }
 
-    // MARK: - 显卡
+    // MARK: - 显卡（并入驱动组件卡；原独立显卡卡已删）
 
     /// gpuInfo() 的 bus 是 PCIe 的那条就是独显（与性能页同一数据源）
     private var dgpu: [String: Any] {
         store.gpus.first { (BackendService.string($0, "bus") ?? "") == "PCIe" } ?? [:]
     }
 
-    private var gpuCard: some View {
-        Card(title: "显卡") {
-            VStack(alignment: .leading, spacing: 6) {
-                if !dgpu.isEmpty {
-                    let detail = BackendService.dict(dgpu, "detail") ?? [:]
-                    HStack(spacing: 10) {
-                        Text(BackendService.string(dgpu, "name") ?? "—")
-                            .font(.system(size: 13.5, weight: .semibold))
-                            .foregroundStyle(Theme.txt)
-                            .textSelection(.enabled)
-                        Spacer()
-                        Chip(text: store.dgpuReported ? "Metal 在线" : "遥测无数据",
-                             color: store.dgpuReported ? Theme.green : Theme.amber)
-                    }
-                    .padding(.bottom, 2)
-                    KVRow(key: "厂商", value: (detail["Vendor"] as? String) ?? "—",
-                          valueColor: Theme.dim)
-                    KVRow(key: "Device ID", value: (detail["Device ID"] as? String) ?? "—")
-                    if let slot = detail["Slot"] as? String, !slot.isEmpty {
-                        KVRow(key: "插槽", value: slot)
-                    }
-                    if let vram = detail["VRAM (Total)"] as? String {
-                        KVRow(key: "显存", value: vram)
-                    }
-                    KVRow(key: "遥测",
-                          value: store.dgpuReported ? "NVAccel 在线" : "无数据",
-                          valueColor: store.dgpuReported ? Theme.green : Theme.amber)
-                } else {
-                    Text("没有检测到 NVIDIA 显卡（等性能页采集到后显示）")
-                        .font(.system(size: 11.5))
-                        .foregroundStyle(Theme.dim)
-                }
-            }
-        }
-    }
-
     // MARK: - 通用
-
-    private func open(_ string: String) {
-        if let url = URL(string: string) { NSWorkspace.shared.open(url) }
-    }
 
     // MARK: - 一键下载安装
 

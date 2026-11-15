@@ -68,7 +68,7 @@ struct MonitorView: View {
             }
             .padding(22)
         }
-        .background(Theme.bg)
+
         .onAppear {
             // 2026-11-08（性能）：本页需要 1 秒逐拍刷新，在这里登记「快速轮询」需求；
             // 切到别的页面后自动降到 3 秒。

@@ -30,6 +30,8 @@ struct NvidiaRelease {
     var published: Date?
     var pageURL: String
     var notes: String
+    /// 检查更新时 API 给的离线包精确下载地址（Gitee/GitHub 都可能），nil = 未拿到
+    var assetURL: String? = nil
 }
 
 enum NvidiaUpdateState: Equatable {
@@ -96,12 +98,26 @@ enum NvidiaUpdate {
     static let releasesURL = "https://github.com/\(repo)/releases"
     private static let latestURL = "https://github.com/\(repo)/releases/latest"
     private static let apiURL = "https://api.github.com/repos/\(repo)/releases/latest"
+    // Gitee 镜像仓（GitHub 不通时的兜底，tag 与 GitHub 一致但无 v 前缀）
+    static let giteeRepo = "nvidia-macos-driver-LAPQC71"
+
+    /// 最近一次检查成功用的源（GitHub 不通走 Gitee 后，下载也要跟着走 Gitee）
+    private static let sourceKey = "nvidia.latestSource"
+    static var lastSource: ReleaseFallback.Source {
+        get { ReleaseFallback.Source(rawValue: UserDefaults.standard.string(forKey: sourceKey) ?? "") ?? .github }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: sourceKey) }
+    }
 
     /// 离线包资产名（release 上传时统一成 ASCII 名，URL 不用转义）。
     /// 不能带 NullMoth 字样——这是 fork 的发布，避免被当成官方包。
     static func assetName(tag: String) -> String { "LAPQC71-NVIDIA-\(tag)-fork.zip" }
     static func downloadURL(tag: String) -> String {
-        "https://github.com/\(repo)/releases/download/v\(tag)/\(assetName(tag: tag))"
+        // 检查更新时 API 给过精确资产地址就优先用（哪个源通的就用哪个）
+        if let r = cachedRelease, r.tag == tag, let u = r.assetURL, !u.isEmpty { return u }
+        if lastSource == .gitee {
+            return "https://gitee.com/\(ReleaseFallback.giteeOwner)/\(giteeRepo)/releases/download/\(tag)/\(assetName(tag: tag))"
+        }
+        return "https://github.com/\(repo)/releases/download/v\(tag)/\(assetName(tag: tag))"
     }
 
     /// 自动检查的最小间隔（手动点按钮不受限）
@@ -115,17 +131,26 @@ enum NvidiaUpdate {
             && s.allSatisfy { $0.isNumber || $0 == "." }
     }
 
+    /// release 风格版本号：在纯数字点分之外放行带字母/连字符的段（"3.0-Patch.1"，2026-11-15
+    /// 用户实测已装版本显示 3.0.1 而不是 3.0-Patch.1，根因就是这里把 ShortVersion 判为不合法）
+    private static func looksLikeReleaseVersion(_ s: String) -> Bool {
+        !s.isEmpty && s.count <= 32 && s.first?.isNumber == true
+            && s.allSatisfy { $0.isNumber || $0 == "." || $0 == "-" || $0.isLetter }
+    }
+
     static func installedVersion() -> String? {
-        // 1) kext 的 Info.plist —— 与本机实际运行的二进制一一对应，最可信
+        // 1) kext 的 Info.plist —— 与本机实际运行的二进制一一对应，最可信。
+        //    读 CFBundleShortVersionString（release 风格，如 3.0-Patch.1）；
+        //    CFBundleVersion 是 kmutil 要求的纯数字备份号（3.0.1），不是对外版本
         for name in componentNames {
             let path = "/Library/Extensions/\(name).kext/Contents/Info.plist"
             if let dict = NSDictionary(contentsOfFile: path) as? [String: Any],
                let v = dict["CFBundleShortVersionString"] as? String,
-               looksLikeVersion(v) {
+               looksLikeReleaseVersion(v) {
                 return v
             }
         }
-        // 2) 安装脚本写的版本文件
+        // 2) 安装脚本写的版本文件（纯数字点分）
         if let s = try? String(contentsOfFile: "/Library/NullMoth/driver-version", encoding: .utf8) {
             let v = s.trimmingCharacters(in: .whitespacesAndNewlines)
             if looksLikeVersion(v) { return v }
@@ -211,6 +236,7 @@ enum NvidiaUpdate {
         static let notes = "nvidia.latestNotes"
         static let published = "nvidia.latestPublished"
         static let checkedAt = "nvidia.checkedAt"
+        static let assetURL = "nvidia.latestAssetURL"   // 离线包精确下载地址（源感知）
     }
 
     static var lastChecked: Date? {
@@ -224,11 +250,19 @@ enum NvidiaUpdate {
         if let s = UserDefaults.standard.string(forKey: Keys.published) {
             published = ISO8601DateFormatter().date(from: s)
         }
+        // 2026-11-15：fork 仓 release 文案已把「官方」改为「nullmoth」，但旧缓存里
+        // 还是老文案（不点检查更新就一直显示）→ 读取时就地改写并回写 UserDefaults
+        var notes = UserDefaults.standard.string(forKey: Keys.notes) ?? ""
+        if notes.contains("在官方 3.0") {
+            notes = notes.replacingOccurrences(of: "在官方 3.0", with: "在 nullmoth 3.0")
+            UserDefaults.standard.set(notes, forKey: Keys.notes)
+        }
         return NvidiaRelease(tag: tag,
                              name: UserDefaults.standard.string(forKey: Keys.name) ?? "",
                              published: published,
                              pageURL: UserDefaults.standard.string(forKey: Keys.page) ?? releasesURL,
-                             notes: UserDefaults.standard.string(forKey: Keys.notes) ?? "")
+                             notes: notes,
+                             assetURL: UserDefaults.standard.string(forKey: Keys.assetURL))
     }
 
     private static func save(_ release: NvidiaRelease) {
@@ -240,6 +274,7 @@ enum NvidiaUpdate {
         let iso = ISO8601DateFormatter()
         d.set(release.published.map { iso.string(from: $0) } ?? "", forKey: Keys.published)
         d.set(iso.string(from: Date()), forKey: Keys.checkedAt)
+        d.set(release.assetURL ?? "", forKey: Keys.assetURL)
     }
 
     /// 用缓存 + 本地版本算出当前状态（不发网络请求）
@@ -281,8 +316,40 @@ enum NvidiaUpdate {
         return tag.isEmpty ? nil : tag
     }
 
-    /// 第一步：拿最新版本号（0 字节、不耗 API 配额）
+    /// 第一步：拿最新版本号（0 字节、不耗 API 配额）。
+    /// GitHub 失败 → Gitee 镜像 API 兜底（2026-11-15），成功时记录 lastSource
+    /// 供下载 URL 跟随同一源。
     private static func fetchTag(completion: @escaping (Result<String, Error>) -> Void) {
+        fetchTagFromGitHub { result in
+            switch result {
+            case .success(let tag):
+                lastSource = .github
+                completion(.success(tag))
+            case .failure(let error):
+                fetchTagFromGitee { gtag in
+                    if let gtag {
+                        lastSource = .gitee
+                        completion(.success(gtag))
+                    } else {
+                        completion(.failure(error))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Gitee 镜像拿 tag（releases/latest API 的 tag_name，无 v 前缀；带 v 也剥掉）
+    private static func fetchTagFromGitee(_ completion: @escaping (String?) -> Void) {
+        ReleaseFallback.getDict(ReleaseFallback.giteeAPI(giteeRepo),
+                                userAgent: "MacConsole/3.0") { dict in
+            var tag = dict?["tag_name"] as? String ?? ""
+            if tag.hasPrefix("v") { tag.removeFirst() }
+            completion(tag.isEmpty ? nil : tag)
+        }
+    }
+
+    /// 第一步的 GitHub 路径（302 拦截拿 tag）
+    private static func fetchTagFromGitHub(completion: @escaping (Result<String, Error>) -> Void) {
         guard let url = URL(string: latestURL) else {
             completion(.failure(NSError(domain: "nvidia", code: 1,
                                         userInfo: [NSLocalizedDescriptionKey: "URL 无效"])))
@@ -316,9 +383,18 @@ enum NvidiaUpdate {
         }.resume()
     }
 
-    /// 第二步（可选）：只有版本号变了才查 API，补充发布说明与时间
+    /// 第二步（可选）：只有版本号变了才查 API，补充发布说明与时间。
+    /// 2026-11-15：GitHub 拿不到时换 Gitee 镜像；同时捕获离线包精确下载地址
+    /// （assets 里按资产名匹配，安装时优先用它，下载源与检查源保持一致）。
     private static func fetchDetail(tag: String, completion: @escaping (NvidiaRelease?) -> Void) {
-        guard let url = URL(string: apiURL) else { completion(nil); return }
+        if lastSource == .gitee {
+            fetchDetailFromGitee(tag: tag, completion: completion)
+            return
+        }
+        guard let url = URL(string: apiURL) else {
+            fetchDetailFromGitee(tag: tag, completion: completion)
+            return
+        }
         var request = URLRequest(url: url)
         request.timeoutInterval = 10
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
@@ -329,7 +405,8 @@ enum NvidiaUpdate {
                   (response as? HTTPURLResponse)?.statusCode == 200,
                   let data,
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                completion(nil)
+                // GitHub 不通 → Gitee 兜底
+                fetchDetailFromGitee(tag: tag, completion: completion)
                 return
             }
             var published: Date?
@@ -347,8 +424,34 @@ enum NvidiaUpdate {
                                      published: published,
                                      pageURL: (obj["html_url"] as? String)
                                         ?? "https://github.com/\(repo)/releases/tag/v\(tag)",
-                                     notes: notes))
+                                     notes: notes,
+                                     assetURL: ReleaseFallback.assetURL(in: obj, named: assetName(tag: tag))))
         }.resume()
+    }
+
+    /// 发布说明的 Gitee 路径（body 取第一行非空行，与 GitHub 路径的提取逻辑一致）
+    private static func fetchDetailFromGitee(tag: String, completion: @escaping (NvidiaRelease?) -> Void) {
+        ReleaseFallback.getDict(ReleaseFallback.giteeAPI(giteeRepo),
+                                userAgent: "MacConsole/3.0") { dict in
+            guard let dict else { completion(nil); return }
+            var published: Date?
+            // Gitee 的 release 对象可能只有 created_at（带时区偏移，ISO8601 能解析）
+            if let s = (dict["published_at"] as? String) ?? (dict["created_at"] as? String) {
+                published = ISO8601DateFormatter().date(from: s)
+            }
+            let body = (dict["body"] as? String) ?? ""
+            let notes = body
+                .split(separator: "\n")
+                .first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
+                .map { String($0).trimmingCharacters(in: .whitespaces) } ?? ""
+            completion(NvidiaRelease(tag: tag,
+                                     name: (dict["name"] as? String) ?? tag,
+                                     published: published,
+                                     pageURL: (dict["html_url"] as? String)
+                                        ?? "https://gitee.com/\(ReleaseFallback.giteeOwner)/\(giteeRepo)/releases/tag/\(tag)",
+                                     notes: notes,
+                                     assetURL: ReleaseFallback.assetURL(in: dict, named: assetName(tag: tag))))
+        }
     }
 
     /// 异步：查最新版本，写缓存，回调在主线程。
@@ -368,7 +471,9 @@ enum NvidiaUpdate {
                     return
                 }
 
-                let pageURL = "https://github.com/\(repo)/releases/tag/v\(tag)"
+                let pageURL = lastSource == .gitee
+                    ? "https://gitee.com/\(ReleaseFallback.giteeOwner)/\(giteeRepo)/releases/tag/\(tag)"
+                    : "https://github.com/\(repo)/releases/tag/v\(tag)"
                 let basic = NvidiaRelease(tag: tag, name: tag, published: nil,
                                           pageURL: pageURL, notes: "")
                 save(basic)
@@ -690,7 +795,8 @@ struct DriverInstaller {
     // MARK: - shell / AppleScript 引号
 
     /// shell 单引号字面量
-    private static func sh(_ s: String) -> String {
+    /// AppleScript 字符串转义（网卡页安装脚本同样要用）
+    static func sh(_ s: String) -> String {
         "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
@@ -702,7 +808,8 @@ struct DriverInstaller {
     }
 
     /// 以管理员权限执行某个可执行文件；执行期间每 1.2 秒回调一次（已用秒数 + 日志新增的最后一行）。
-    private static func runWithAdminPrivileges(executable path: String,
+    /// （2026-11-15 从 private 放开为 internal：网卡驱动页 NetworkInstaller 复用同一套提权/日志轮询机制）
+    static func runWithAdminPrivileges(executable path: String,
                                                logURL: URL,
                                                deadline: TimeInterval,
                                                onTick: @escaping (Int, String?) -> Void)

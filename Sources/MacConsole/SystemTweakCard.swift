@@ -30,6 +30,7 @@ struct MiscToggleRow: View {
         HStack(alignment: .top, spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Theme.txt)
                 // 副标题（寄存器说明）默认不显示；代码保留
                 if !hideCardSubs {
                     Text(sub).font(.system(size: 11)).foregroundStyle(Theme.dim2)
@@ -73,6 +74,7 @@ struct SystemTweakSection: View {
                 HStack(spacing: 8) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("显示屏电源").font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(Theme.txt)
                         if !hideCardSubs {
                             Text("单击关闭内屏，动鼠标或按任意键恢复")
                                 .font(.system(size: 11)).foregroundStyle(Theme.dim2)

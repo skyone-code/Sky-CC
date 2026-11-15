@@ -225,7 +225,7 @@ struct RGBView: View {
                 .frame(minHeight: geo.size.height, alignment: .top)
             }
         }
-        .background(Theme.bg)
+
         .onAppear {
             // 2.8.15：海岸灯没有软件记忆，状态只能从 EC 读。进灯效页读一次，
             // 切走即停（lightingDemand 门控 slowLoop）。键盘灯效仍读存档。
@@ -286,13 +286,14 @@ struct RGBView: View {
             HStack(spacing: 8) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("键盘灯").font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(Theme.txt)
                     Text(kbOn ? "已开启" : "已关闭")
                         .font(.system(size: 11)).foregroundStyle(Theme.dim2)
                 }
                 Spacer(minLength: 4)
                 Toggle("", isOn: kbOnBinding)
                     .toggleStyle(.switch)
-                    .tint(Theme.purple)
+                    .tint(Theme.blue)
                     .labelsHidden()
                     .disabled(!rgbAvailable)
             }
@@ -351,6 +352,7 @@ struct RGBView: View {
             if KeyboardCatalog.supportsDirection(currentEffect) {
                 HStack(spacing: 10) {
                     Text("方向").font(.system(size: 12.5, weight: .medium))
+                        .foregroundStyle(Theme.txt)
                         .foregroundStyle(Theme.dim).frame(width: 34, alignment: .leading)
                     SegmentedPicker(options: [(1.0, "右"), (2.0, "左"), (3.0, "上"), (4.0, "下")],
                                     selection: directionBinding)
@@ -511,7 +513,12 @@ struct RGBView: View {
                     .font(.system(size: 13, weight: .semibold).monospacedDigit())
                     .foregroundStyle(Theme.txt)
             }
-            Slider(value: value, in: range, step: 1)
+            // 2026-11-15（用户反馈）：`step: 1` 会让 macOS 在滑条下方画刻度小圆点，
+            // 去掉 step 改为在绑定 setter 里取整，整数步进不变、小点点消失
+            Slider(value: Binding(
+                get: { value.wrappedValue },
+                set: { value.wrappedValue = $0.rounded() }
+            ), in: range)
                 .tint(tint)
             Text(sub).font(.system(size: 10)).foregroundStyle(Theme.dim2)
         }
@@ -546,16 +553,15 @@ struct RGBView: View {
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8),
                                          count: max(1, min(7, paletteSize))), spacing: 8) {
                     ForEach(0..<min(7, paletteSize), id: \.self) { i in
-                        VStack(spacing: 5) {
-                            ColorPicker("", selection: $palette[i], supportsOpacity: false)
-                                .labelsHidden()
-                                .onChange(of: palette[i]) { _, _ in effectDirty = true }
-                            Text("槽 \(i + 1)").font(.system(size: 9.5)).foregroundStyle(Theme.dim2)
-                        }
-                        .padding(.vertical, 8)
-                        .background(Theme.panel2, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous)
-                            .strokeBorder(Theme.line, lineWidth: 1))
+                        // 2026-11-15（用户反馈）：「槽 1…7」提示小字删除，只留色块
+                        ColorPicker("", selection: $palette[i], supportsOpacity: false)
+                            .labelsHidden()
+                            .onChange(of: palette[i]) { _, _ in effectDirty = true }
+                            .padding(.vertical, 10)
+                            .frame(maxWidth: .infinity)
+                            .background(Theme.panel2, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .strokeBorder(Theme.line, lineWidth: 1))
                     }
                 }
             }
@@ -908,13 +914,14 @@ struct RGBView: View {
                 HStack(spacing: 8) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("海岸灯").font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Theme.txt)
                         Text(lbMode == "off" ? "已关闭（CTRL_OFF）" : "已开启")
                             .font(.system(size: 11)).foregroundStyle(Theme.dim2)
                     }
                     Spacer(minLength: 4)
                     Toggle("", isOn: lbOnBinding)
                         .toggleStyle(.switch)
-                        .tint(Theme.purple)
+                        .tint(Theme.blue)
                         .labelsHidden()
                 }
                 Divider().overlay(Theme.line)
@@ -935,6 +942,7 @@ struct RGBView: View {
                 HStack(spacing: 8) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("睡眠展示").font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(Theme.txt)
                         Text("接入电源睡眠时灯带展现灯效（电池下固件不亮）")
                             .font(.system(size: 11)).foregroundStyle(Theme.dim2)
                             .fixedSize(horizontal: false, vertical: true)
@@ -942,7 +950,7 @@ struct RGBView: View {
                     Spacer(minLength: 4)
                     Toggle("", isOn: lbBreathingBinding)
                         .toggleStyle(.switch)
-                        .tint(Theme.purple)
+                        .tint(Theme.blue)
                         .labelsHidden()
                         .disabled(lbMode == "off")
                 }
@@ -997,6 +1005,7 @@ struct RGBView: View {
                 HStack(spacing: 8) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("AP 心跳").font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(Theme.txt)
                         if !hideCardSubs {
                             Text("控制中心在线标志 · 60 秒续期")
                                 .font(.system(size: 11)).foregroundStyle(Theme.dim2)

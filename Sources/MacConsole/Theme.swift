@@ -48,6 +48,11 @@ extension View {
 // 订阅 SkinCenter：设置页换皮肤 / 换图后，所有挂了本修饰器的页面立即重绘。
 struct PageBackgroundModifier: ViewModifier {
     @EnvironmentObject private var skin: SkinCenter
+    @Environment(\.colorScheme) private var colorScheme
+
+    /// 图片蒙层不透明度：2026-11-15 用户定案 —— 浅色外观下背景图太淡，
+    /// 多给 20% 显示（0.72 → 0.52）；深色维持 0.72。
+    private var maskOpacity: Double { colorScheme == .light ? 0.52 : 0.72 }
 
     func body(content: Content) -> some View {
         ZStack {
@@ -61,7 +66,7 @@ struct PageBackgroundModifier: ViewModifier {
                         .ignoresSafeArea()
                 }
                 .ignoresSafeArea()
-                skin.bgColor.opacity(0.72).ignoresSafeArea()
+                skin.bgColor.opacity(maskOpacity).ignoresSafeArea()
             } else {
                 skin.bgColor.ignoresSafeArea()
             }
@@ -75,6 +80,39 @@ extension View {
     func pageBackground() -> some View { modifier(PageBackgroundModifier()) }
 }
 
+// MARK: - 侧边栏背景（2026-11-15）
+//
+// 公共背景层在根视图（RootView 整个 NavigationSplitView 外面铺一次），
+// 侧边栏 List 只铺半透明 panel 透下去。本修饰器处理「侧边栏专属图片」：
+// 选了侧边栏背景图时，在 panel 下面铺图 + 蒙层（遮住公共层）；没选则不铺、
+// 直接透到公共背景层 —— 不再有独立的第二层背景。
+struct SidebarBackgroundModifier: ViewModifier {
+    @EnvironmentObject private var skin: SkinCenter
+    @Environment(\.colorScheme) private var colorScheme
+
+    func body(content: Content) -> some View {
+        content.background {
+            if let img = skin.sidebarImage {
+                GeometryReader { geo in
+                    ZStack {
+                        Image(nsImage: img)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: geo.size.width, height: geo.size.height)
+                            .clipped()
+                        skin.bgColor.opacity(colorScheme == .light ? 0.52 : 0.72)
+                    }
+                }
+            }
+        }
+    }
+}
+
+extension View {
+    /// 侧边栏背景：选了专属图就铺图+蒙层，否则透明透到公共背景层
+    func sidebarBackground() -> some View { modifier(SidebarBackgroundModifier()) }
+}
+
 enum Theme {
     // 底色系（浅色 / 深色）
     // 2.8.11（用户要求）：深色下页面底太黑，按系统设置（macOS 深色）的观感整体提亮：
@@ -82,28 +120,36 @@ enum Theme {
     //   原来是 0x17191d / 0x22252a / 0x2c3037，确实压得太死。
     static let bg = Theme.dyn(light: 0xf6f7f9, dark: 0x1e1f21)        // 页面底
 
-    // 表面色（卡片 / 控件 / 进度条底）—— 皮肤感知（2026-11-15 用户反馈：
-    // 皮肤应用后卡片、标识等全是实色，背景看不到）。
+    // 表面色（卡片 / 控件 / 进度条底）—— 皮肤 + 外观双感知（2026-11-15 用户定案）：
     // 默认皮肤（ink 且无图片）= 原值实色，观感与历史版本完全一致；
-    // 非默认预设配色 / 自定义图片时按透明度返色，背景从卡片下面透出来。
-    // 透明度基准 = hero 条的 panel 0.72（2026-11-15 用户定：「都做成 hero 那种」）。
-    // panel2 / barBg 是**叠在卡片内**的二级表面：卡片已经 0.72，二级表面必须
-    // 更透（0.38 / 0.45）才不会把卡片那层又盖成实色。
-    // 用 computed var：所有 fill/background(Theme.panel*) 调用点一次性生效。
-    static var panel: Color { surface(dyn(light: 0xffffff, dark: 0x2a2b2e), alpha: 0.72) } // 卡片
-    static var panel2: Color { surface(dyn(light: 0xeef0f4, dark: 0x34353a), alpha: 0.38) } // 卡片内磁贴 / 控件底
-    static var barBg: Color { surface(dyn(light: 0xe6e9ee, dark: 0x3a3b40), alpha: 0.45) }  // 进度条底
+    // 非默认预设配色 / 自定义图片时按透明度返色，背景从下面透出来。
+    // 深色透明度基准 = hero 条的 panel 0.72（2026-11-15 用户定：「都做成 hero 那种」）；
+    // **浅色外观整体再多透 10%**（panel 0.62 / panel2 0.28 / barBg 0.35）——
+    // 用户反馈浅色下卡片、胶囊、侧边栏透明度不够。
+    // panel2 / barBg 是**叠在卡片内**的二级表面：必须比卡片那层更透，否则叠成实色。
+    // 用 computed var + 外观动态提供器：所有 fill/background(Theme.panel*) 调用点一次性生效。
+    static var panel: Color { surfaceSkin(light: 0xffffff, dark: 0x2a2b2e, alphaLight: 0.62, alphaDark: 0.72) } // 卡片
+    static var panel2: Color { surfaceSkin(light: 0xeef0f4, dark: 0x34353a, alphaLight: 0.28, alphaDark: 0.38) } // 卡片内磁贴 / 控件底
+    static var barBg: Color { surfaceSkin(light: 0xe6e9ee, dark: 0x3a3b40, alphaLight: 0.35, alphaDark: 0.45) }  // 进度条底
     static let line = Theme.dyn(light: 0xe0e3e9, dark: 0x3e3f44)      // 描边
 
-    /// 表面色的皮肤开关：非默认皮肤返 alpha 透明版
-    private static func surface(_ base: Color, alpha: Double) -> Color {
+    /// 表面色的皮肤 + 外观开关：默认皮肤返实色；否则按当前外观给不同透明度
+    /// （透明度也要随外观切换，所以不能在 base 上简单 .opacity —— 包一层动态提供器）
+    private static func surfaceSkin(light: UInt32, dark: UInt32,
+                                    alphaLight: Double, alphaDark: Double) -> Color {
         let skin = SkinCenter.shared
-        if skin.preset == .ink && !skin.isCustomImage { return base }
-        return base.opacity(alpha)
+        if skin.preset == .ink && !skin.isCustomImage { return Theme.dyn(light: light, dark: dark) }
+        return Color(nsColor: NSColor(name: nil, dynamicProvider: { appearance in
+            let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            return NSColor(hex: isDark ? dark : light)
+                .withAlphaComponent(isDark ? alphaDark : alphaLight)
+        }))
     }
 
     // 文字系（灰阶；深色下整体提亮，不用纯白）
-    static let txt = Theme.dyn(light: 0x2a2f37, dark: 0xe8eaef)       // 主文字
+    // txt 浅色 0x2a2f37 → 0x4d545e（2026-11-15 用户反馈：浅色下黑字太扎眼，改灰；
+    // 但必须比小提示的灰（dim 0x626b78）更深，不能撞色 —— 0x4d545e 介于两者之间）
+    static let txt = Theme.dyn(light: 0x4d545e, dark: 0xe8eaef)       // 主文字
     static let dim = Theme.dyn(light: 0x626b78, dark: 0xa6aeb9)       // 次文字
     static let dim2 = Theme.dyn(light: 0x8b94a1, dark: 0x7b8290)      // 弱文字
 
@@ -275,12 +321,14 @@ struct Card<Content: View>: View {
 struct KVRow: View {
     var key: String
     var value: String
-    var valueColor: Color = Theme.txt
+    var valueColor: Color = Theme.dim   // 值比键浅一截（2026-11-15 用户定案）
     /// 行尾附加视图（2026-11-15：设置页版本行加「检查更新」按钮用；nil = 不加，所有旧调用不变）
     var trailing: AnyView? = nil
     var body: some View {
         HStack {
-            Text(key).font(.system(size: 12.5)).foregroundStyle(Theme.dim)
+            // 2026-11-15 用户定案（第三轮）：键 = 标题颜色（Theme.txt，与侧边栏标题同灰），
+            // 值比键浅一截（Theme.dim）。KVRow 全工程只有版本卡在用。
+            Text(key).font(.system(size: 12.5)).foregroundStyle(Theme.txt)
             Spacer()
             Text(value).font(.system(size: 12.5, weight: .medium))
                 .monospacedDigit()

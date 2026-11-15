@@ -39,6 +39,16 @@ enum AppPolicy {
         // 2.7.8：setActivationPolicy 会重新向 WindowServer 注册进程，把已挂上的
         // Carbon 热键打掉 —— 每次改完策略必须重挂，否则触控板手势会静默失效
         GestureHotkey.shared.reregister(reason: "toRegular")
+        hideWindowTitle()
+    }
+
+    /// 2026-11-15 用户要求：窗口标题栏的「Sky CC」文字去掉（每页顶上都顶着，不好看）。
+    /// 只藏文字（titleVisibility = .hidden），标题栏本身保留 —— 拖拽区和红绿灯不受影响。
+    /// 每次切回 regular 都刷一遍，防止 SwiftUI 重建窗口后失效。
+    static func hideWindowTitle() {
+        for w in NSApp.windows where !(w is NSPanel) && w.title == "Sky CC" {
+            w.titleVisibility = .hidden
+        }
     }
     static func toAccessory() {
         if NSApp.activationPolicy() != .accessory { NSApp.setActivationPolicy(.accessory) }
@@ -291,6 +301,8 @@ struct MacConsoleApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @StateObject private var backend = BackendService.shared
     @StateObject private var store = MonitorStore.shared
+    // 皮肤中心（2026-11-15）：页面背景更换，设置页改配色/图片后全页面即时跟随
+    @StateObject private var skin = SkinCenter.shared
 
     // 菜单栏监控项开关（Stats 式：每项一个图标 + 实时数值）
 
@@ -331,6 +343,7 @@ struct MacConsoleApp: App {
             RootView()
                 .environmentObject(backend)
                 .environmentObject(store)
+                .environmentObject(skin)
                 .frame(minWidth: 1020, minHeight: 660)
                 .onAppear {
                     Task { await backend.start() }
@@ -738,7 +751,7 @@ struct VisualEffectBackground: NSViewRepresentable {
 // 顶部，设备/本机/系统三张身份卡挪到设置页（见 SystemIdentity.swift）。
 struct RootView: View {
     enum Page: String, CaseIterable, Identifiable {
-        case overview, performance, control, lighting, nvidia, alldata, settings
+        case overview, performance, control, lighting, nvidia, network, alldata, settings
         var id: String { rawValue }
 
         var title: String {
@@ -748,6 +761,7 @@ struct RootView: View {
             case .control: return "控制"
             case .lighting: return "灯效"
             case .nvidia: return "NVIDIA 驱动"
+            case .network: return "网卡驱动"
             case .alldata: return "全部信息"
             case .settings: return "设置"
             }
@@ -759,6 +773,7 @@ struct RootView: View {
             case .control: return "散热 / 功耗 / 风扇手动 / 充电"
             case .lighting: return "键盘 RGB / 逐键投影 / 海岸灯"
             case .nvidia: return "版本对照 / 组件 / 一键安装"
+            case .network: return "Wi-Fi / 蓝牙 · 一键更新"
             case .alldata: return "原生采集的每个字段"
             case .settings: return "外观 / 菜单栏 / 系统调整"
             }
@@ -770,6 +785,7 @@ struct RootView: View {
             case .control: return "slider.horizontal.3"
             case .lighting: return "keyboard"
             case .nvidia: return "chip"
+            case .network: return "wifi"
             case .alldata: return "list.bullet.rectangle"
             case .settings: return "gearshape"
             }
@@ -781,6 +797,7 @@ struct RootView: View {
             case .control: return Theme.amber
             case .lighting: return Theme.purple
             case .nvidia: return Theme.green
+            case .network: return Theme.cyan
             case .alldata: return Theme.green
             case .settings: return Theme.dim
             }
@@ -789,11 +806,12 @@ struct RootView: View {
         var group: String {
             switch self {
             case .overview, .performance: return "监测"
-            case .control, .lighting, .nvidia: return "硬件"
+            case .control, .lighting: return "硬件"
+            case .nvidia, .network: return "驱动"
             case .alldata, .settings: return "系统"
             }
         }
-        static let groups = ["监测", "硬件", "系统"]
+        static let groups = ["监测", "硬件", "驱动", "系统"]
         /// 侧边栏可见项。`alldata`（全部信息）按用户要求隐藏——原生字段表是排障用的，
         /// 留在代码里（case 与 AllDataView 都还在），需要时把这里过滤去掉即可恢复。
         static func inGroup(_ g: String) -> [Page] {
@@ -807,32 +825,9 @@ struct RootView: View {
 
     var body: some View {
         NavigationSplitView {
-            List(selection: $page) {
-                // 侧边栏顶部：app 图标 + 名称 + 版本号（v2.4.3 新增）
-                Section {
-                    appHeaderRow
-                }
-                .listRowSeparator(.hidden)
-
-                ForEach(Page.groups, id: \.self) { g in
-                    Section {
-                        ForEach(Page.inGroup(g)) { p in
-                            navRow(p)
-                                .tag(p)
-                                .listRowSeparator(.hidden)
-                        }
-                    } header: {
-                        Text(g)
-                            .font(.system(size: 9.5, weight: .semibold))
-                            .foregroundStyle(.tertiary)
-                            .tracking(1.0)
-                    }
-                }
-            }
-            .listStyle(.sidebar)
-            .navigationSplitViewColumnWidth(min: 210, ideal: 232, max: 270)
-            // 侧边栏左下角：连接状态 + 退出控制台
-            .safeAreaInset(edge: .bottom) { footerRow }
+            // 2026-11-15：body 拆小（sidebar / RootUpdateOverlays modifier）——
+            // 整块写在 body 里编译器 type-check 会超时
+            sidebar
         } detail: {
             detailView
             // 2026-11-14（用户要求）：去掉详情列顶部工具条里的小字页名 ——
@@ -843,6 +838,88 @@ struct RootView: View {
             if let raw = note.object as? String, let p = Page(rawValue: raw) {
                 page = p
             }
+        }
+        // 2026-11-15 用户定案（第三轮）：公共背景层提到整窗（侧边栏 + 详情共用一张图/一个底色），
+        // 各页不再单独铺背景
+        .pageBackground()
+        // 2026-11-15（用户要求）：App 自更新 UI 挂根视图 —— 启动期静默检查发现更新时
+        // 设置页可能根本没打开，sheet/alert 必须任何页面都能弹（拆进独立 ViewModifier，
+        // 避免 body 太大触发编译器 type-check 超时）
+        .modifier(RootUpdateOverlays())
+    }
+
+    /// 侧边栏（从 body 拆出，2026-11-15：body 整块太大编译器会超时）
+    private var sidebar: some View {
+        List(selection: $page) {
+            // 侧边栏顶部：app 图标 + 名称 + 版本号（v2.4.3 新增）
+            Section {
+                appHeaderRow
+            }
+            .listRowSeparator(.hidden)
+
+            ForEach(Page.groups, id: \.self) { g in
+                Section {
+                    ForEach(Page.inGroup(g)) { p in
+                        navRow(p)
+                            .tag(p)
+                            .listRowSeparator(.hidden)
+                    }
+                } header: {
+                    Text(g)
+                        .font(.system(size: 9.5, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                        .tracking(1.0)
+                }
+            }
+        }
+        .listStyle(.sidebar)
+        .navigationSplitViewColumnWidth(min: 210, ideal: 232, max: 270)
+        // 2026-11-15 用户定案（第三轮）：侧边栏**透到公共背景层**，不再有独立背景层 ——
+        // 公共背景（皮肤预设色 / 背景图）在根视图整窗铺一次（见 body 最外层 .pageBackground()），
+        // 侧边栏只隐藏 List 系统底 + 铺与卡片同款的半透明 panel；若选了侧边栏专属图，
+        // sidebarBackground() 在 panel 底下再铺那张图（遮住公共层），没选就直达公共层。
+        .scrollContentBackground(.hidden)
+        .background(Theme.panel)
+        .sidebarBackground()
+        // 侧边栏左下角：连接状态 + 退出控制台
+        .safeAreaInset(edge: .bottom) { footerRow }
+    }
+
+    /// App 自更新 UI（sheet + 两个 alert + 启动静默检查），挂根视图的 modifier。
+    /// 拆出独立类型（2026-11-15）：body 里全写在一起编译器 type-check 超时。
+    /// @ObservedObject 持有单例：@Published 状态变化时这里重算，sheet/alert 才会弹出来。
+    private struct RootUpdateOverlays: ViewModifier {
+        @ObservedObject private var updater = AppUpdater.shared
+        func body(content: Content) -> some View {
+            content
+                // sheet：手动检查的转圈 / 下载进度 / 安装进度（AppUpdateSheet）
+                .sheet(isPresented: Binding(
+                    get: { updater.sheetVisible },
+                    set: { if !$0 { updater.sheetDismissed() } })) {
+                    AppUpdateSheet()
+                }
+                // 静默/手动检查发现新版本 → 确认框（更新 / 取消）
+                .alert("发现新版本", isPresented: Binding(
+                    get: { updater.showUpdateAlert },
+                    set: { updater.showUpdateAlert = $0 }),
+                    presenting: updater.updateInfo) { info in
+                    Button("更新") { updater.startUpdate() }
+                    Button("取消", role: .cancel) {}
+                } message: { info in
+                    // 文案在 AppUpdater.updateConfirmMessage 生成（ViewBuilder 里写复杂插值会超时）
+                    Text(AppUpdater.updateConfirmMessage(info))
+                }
+                // 安装完成 → 重启确认
+                .alert("更新完成", isPresented: Binding(
+                    get: { updater.showRelaunchAlert },
+                    set: { updater.showRelaunchAlert = $0 })) {
+                    Button("重启 Sky CC") { updater.relaunchApp() }
+                    Button("稍后", role: .cancel) {}
+                } message: {
+                    Text("新版本已安装完成，重启 Sky CC 后生效。")
+                }
+                // 进入软件自动检查更新（静默）：延迟 5 秒跑一次，有更新才弹窗，没有/失败无声
+                .task { updater.launchSilentCheck() }
         }
     }
 
@@ -866,10 +943,13 @@ struct RootView: View {
                                 in: RoundedRectangle(cornerRadius: 7, style: .continuous))
             }
             VStack(alignment: .leading, spacing: 1) {
+                // 2026-11-15 用户反馈：浅色下侧边栏黑字（默认 primary）太扎眼 → 主文字灰；
+                // 选中项在蓝色高亮底上必须反白（浅色下深灰字看不清）
                 Text(p.title).font(.system(size: 12.5, weight: .medium))
+                    .foregroundStyle(p == page ? Color.white : Theme.txt)
                 Text(p.subtitle)
                     .font(.system(size: 9.5))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(p == page ? Color.white.opacity(0.75) : Theme.dim2)
                     .lineLimit(1)
             }
             Spacer(minLength: 0)
@@ -886,6 +966,7 @@ struct RootView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Sky CC")
                     .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(Theme.txt)
                 Text("版本 \(AppVersion.short)")
                     .font(.system(size: 10.5))
                     .foregroundStyle(.secondary)
@@ -930,10 +1011,8 @@ struct RootView: View {
         .padding(.horizontal, 12)
         .padding(.top, 4)
         .padding(.bottom, 8)
-        // 2026-11-08（性能）：侧边栏底部原来是 NSVisualEffectView(.sidebar)，
-        // 每次拖动窗口都要实时重算一次背后模糊。侧边栏底色本来就是纯色，
-        // 换成实色后拖动明显跟手。
-        .background(Theme.panel)
+        // 2026-11-15：List 整体已铺 Theme.panel（侧边栏统一底），这里不再叠一层
+        // （叠两层同款半透明会把底部颜色加深，和卡片不一致）
     }
 
     @ViewBuilder
@@ -944,6 +1023,7 @@ struct RootView: View {
         case .control: ControlView()
         case .lighting: RGBView()
         case .nvidia: NvidiaView()
+        case .network: NetworkView()
         case .alldata: AllDataView()
         case .settings: MiscView()
         }
