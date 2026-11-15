@@ -111,9 +111,75 @@ struct RGBView: View {
     @State private var lbLastMode: String = "cycle"
     /// 海岸灯草稿是否被改过（草稿期间不被 5 秒回读覆盖）
     @State private var lbDirty = false
+    /// 固定色选择后直接下发的防抖任务（色板拖动时 onChange 会连发，
+    /// 停止 350ms 后才写一次 EC，2026-11-14 用户要求去掉「确定生效」按钮）
+    @State private var lbColorTask: Task<Void, Never>?
+    /// 睡眠展示（移植文档 §3.4）：接电源睡觉时灯带展现灯效。EC 0x748 bit3 反逻辑。
+    @State private var lbBreathing = true
+
+    // 键盘灯总开关（2026-11-14 用户要求：样式与海岸灯开关一致）
+    @State private var kbOn = true
+
+    // 键盘灯效列表展开 / 收起（2026-11-14 用户要求：收起只显示一行）
+    @State private var effectsExpanded = false
+    /// AP 心跳（EC 0x741 bit0）：控制中心在线标志。真实值从 EC 读，不信偏好 ——
+    /// 守夜可能被 FAN_ABNORMAL 挡住没补写，界面要显示 EC 现在的态度。
+    @State private var apPresent = true
 
     /// 2.8.9：卡片说明默认隐藏（实验性页放行）
     @Environment(\.hideCardSubs) private var hideCardSubs
+
+    // 2026-11-14（用户要求，首帧记忆）：构造时同步读软件记忆镜像，首帧即上次选择。
+    // 灯效草稿的真值在 helper 的 profile 存档（异步），但 UI 每次采用存档后都会
+    // 把草稿抄进 UserDefaults（见 syncFromBackend 尾部的 mirrorDraft()），
+    // 所以 init() 从镜像读出来的就是上次应用的状态；EC/存档回读对不上时再可见校正。
+    init() {
+        _effect = State(initialValue: UIControlPrefs.string(UIControlPrefs.K.rgbEffect) ?? "rainbow")
+        _effectSpeed = State(initialValue: Double(UIControlPrefs.int(UIControlPrefs.K.rgbSpeed) ?? 5))
+        _effectBright = State(initialValue: Double(UIControlPrefs.int(UIControlPrefs.K.rgbBright) ?? 75))
+        _effectDirection = State(initialValue: Double(UIControlPrefs.int(UIControlPrefs.K.rgbDirection) ?? 1))
+        // 调色板镜像：7 色 × 6 位 hex = 42 字符；解析失败就落到默认调色板
+        if let p = UIControlPrefs.string(UIControlPrefs.K.rgbPalette), p.count == 42 {
+            var pal: [Color] = []
+            for i in stride(from: 0, to: 42, by: 6) {
+                pal.append(Color(hex: Self.hexAt(p, i) ?? 0))
+            }
+            _palette = State(initialValue: pal)
+        }
+        // 逐键矩阵镜像：126 键 × 6 位 hex = 756 字符（行优先）
+        if let k = UIControlPrefs.string(UIControlPrefs.K.rgbKeymap), k.count == 756 {
+            var idx = 0
+            var rows: [[Color]] = []
+            for _ in 0..<6 {
+                var row: [Color] = []
+                for _ in 0..<21 {
+                    row.append(Color(hex: Self.hexAt(k, idx) ?? 0))
+                    idx += 6
+                }
+                rows.append(row)
+            }
+            _keymap = State(initialValue: rows)
+        }
+        // 海岸灯 / 键盘灯总开关 / AP 心跳 / 睡眠展示
+        _lbMode = State(initialValue: UIControlPrefs.string(UIControlPrefs.K.lightbarMode) ?? "cycle")
+        if let hex = UIControlPrefs.string(UIControlPrefs.K.lightbarHex), hex.count == 6,
+           let v = UInt32(hex, radix: 16) {
+            _lbColor = State(initialValue: Color(hex: v))
+        }
+        _lbLastMode = State(initialValue: UIControlPrefs.string(UIControlPrefs.K.lightbarMode) ?? "cycle")
+        _lbBreathing = State(initialValue: UIControlPrefs.bool(UIControlPrefs.K.lightbarBreathing) ?? true)
+        _kbOn = State(initialValue: UIControlPrefs.bool(UIControlPrefs.K.rgbKbOn)
+                      ?? UIControlPrefs.bool(UIControlPrefs.K.kbBacklight) ?? true)
+        _apPresent = State(initialValue: UIControlPrefs.bool(UIControlPrefs.K.apbeat) ?? true)
+    }
+
+    /// 镜像字符串里取第 slot 个 6 位 hex（RGB）→ UInt32；越界/非 hex 返回 nil
+    private static func hexAt(_ s: String, _ slot: Int) -> UInt32? {
+        let a = s.index(s.startIndex, offsetBy: slot)
+        let b = s.index(a, offsetBy: 6)
+        guard b <= s.endIndex, let v = UInt32(s[a..<b], radix: 16) else { return nil }
+        return v
+    }
 
     @StateObject private var locks = EditLocks()
     /// 音乐律动引擎（2026-10-25：固件 0x22 不自带动画，靠它抓系统音频实时上色）
@@ -141,10 +207,10 @@ struct RGBView: View {
                             // 左：键盘灯效（宽，内容最多）
                             effectCard
                                 .frame(maxWidth: .infinity, alignment: .top)
-                            // 右：海岸灯 + 通用
+                            // 右：海岸灯 + AP 心跳（灯效通用已删，用户要求）
                             VStack(spacing: 14) {
                                 lightbarCard
-                                generalCard
+                                apBeatCard
                                 Spacer(minLength: 0)
                             }
                             .frame(width: 360)
@@ -166,6 +232,8 @@ struct RGBView: View {
             store.demandLighting(true)
             syncFromBackend()
             Task { await store.refreshLightingOnce(backend) }
+            // AP 心跳只有一次 EC 读（~65ms），进页读一把，之后以本地状态为准
+            Task { await refreshAPBeat() }
         }
         .onDisappear {
             store.demandLighting(false)
@@ -211,38 +279,70 @@ struct RGBView: View {
         }
     }
 
-    // MARK: - 键盘灯效（先调好再点「确定应用」）
+    // MARK: - 键盘灯效（先调好再点「应用」）
     private var effectCard: some View {
         Card(title: "键盘灯效") {
-            // 灯效按钮：宽列自适应 4-5 列，窗口收窄回落 3 列
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 100), spacing: 8)], spacing: 8) {
-                ForEach(effects, id: \.0) { eff in
-                    let active = effect == eff.0
-                    Button {
-                        effect = eff.0
-                        effectDirty = true
-                    } label: {
-                        Text(eff.1)
-                            .font(.system(size: 12, weight: active ? .semibold : .regular))
-                            .foregroundStyle(active ? .white : Theme.dim)
-                            .lineLimit(1)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 8)
-                            .background(RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                .fill(active ? Theme.purple : Theme.panel2))
-                            .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                .strokeBorder(active ? Theme.purple : Theme.line))
-                    }
-                    .buttonStyle(.plain)
+            // 键盘灯总开关（样式与海岸灯开关一致，2026-11-14 用户要求）
+            HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("键盘灯").font(.system(size: 13, weight: .medium))
+                    Text(kbOn ? "已开启" : "已关闭")
+                        .font(.system(size: 11)).foregroundStyle(Theme.dim2)
+                }
+                Spacer(minLength: 4)
+                Toggle("", isOn: kbOnBinding)
+                    .toggleStyle(.switch)
+                    .tint(Theme.purple)
+                    .labelsHidden()
+                    .disabled(!rgbAvailable)
+            }
+
+            Divider().overlay(Theme.line)
+
+            // 灯效按钮：宽列自适应 4-5 列，窗口收窄回落 3 列。
+            // 收起时只显示一行（高度钳制 + 裁切），展开显示全部。
+            Group {
+                if effectsExpanded {
+                    effectGrid
+                } else {
+                    effectGrid
+                        .frame(maxHeight: 34, alignment: .top)
+                        .clipped()
                 }
             }
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { effectsExpanded.toggle() }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: effectsExpanded ? "chevron.up.circle" : "chevron.down.circle")
+                        .font(.system(size: 11))
+                    Text(effectsExpanded ? "收起灯效列表" : "展开全部 \(effects.count) 种灯效")
+                        .font(.system(size: 11.5, weight: .medium))
+                    Spacer(minLength: 0)
+                    Text("当前 · \(effectName(effect))")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(Theme.dim2)
+                        .lineLimit(1)
+                }
+                .foregroundStyle(Theme.dim)
+                .padding(.horizontal, 10).padding(.vertical, 6)
+                .background(Theme.panel2, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(Theme.line, lineWidth: 1))
+            }
+            .buttonStyle(.plain)
 
             Divider().overlay(Theme.line)
 
             // 速度 + 亮度：两条滑条并排，占满整行
             HStack(spacing: 16) {
+                // 【2026-11-11 用户实测纠正】固件 speed 字节是**反序**的：1 = 最快，
+                // 10 = 最慢（原厂 `Translate_ITE_SpeedValue` 的档位表 {10,7,5,3,1}
+                // 也是把「最快」映射到 1）。以前标「1 慢 · 10 快」正好写反，
+                // 用户拖到 1 以为最慢、其实是满速。
                 sliderRow(title: "速度", value: speedBinding, range: 1...10, tint: Theme.cyan,
-                          display: "\(Int(effectSpeed))", sub: "1 慢 · 10 快")
+                          display: "\(Int(effectSpeed))", sub: "1 快 · 10 慢")
                 sliderRow(title: "亮度", value: brightBinding, range: 0...100, tint: Theme.amber,
                           display: "\(Int(effectBright))%", sub: "0-100 百分比")
             }
@@ -266,27 +366,6 @@ struct RGBView: View {
             } else {
                 paletteSection
             }
-
-            // 下发按钮 ＋ 未应用提示（整行，右对齐副文案，不留空）
-            HStack(spacing: 10) {
-                Button {
-                    Task { await applyEffectConfirmed() }
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "checkmark.circle.fill").font(.system(size: 12))
-                        Text("确定应用").font(.system(size: 12.5, weight: .semibold))
-                    }
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 16).padding(.vertical, 8)
-                    .background(Theme.purple, in: Capsule())
-                    .opacity(effectDirty ? 1 : 0.55)
-                }
-                .buttonStyle(.plain)
-                Text(effectDirty ? "有未应用的修改" : "灯效 / 速度 / 亮度 / 颜色都是本地草稿，点「确定应用」才下发")
-                    .font(.system(size: 11)).foregroundStyle(effectDirty ? Theme.amber : Theme.dim2)
-                Spacer(minLength: 0)
-            }
-            .padding(.top, 2)
 
             if !hideCardSubs {
                 Text(isKeymap
@@ -313,14 +392,14 @@ struct RGBView: View {
                         Text(music.running
                              ? "运行中 · 跟随系统输出（21 段频谱条 · 左低右高）"
                              : (music.lastError.map { "未启动：\($0)" }
-                                ?? "点「确定应用」开始抓取系统输出"))
+                                ?? "点「应用」开始抓取系统输出"))
                             .font(.system(size: 10.5))
                             .foregroundStyle(music.running ? Theme.dim : Theme.amber)
                         Spacer(minLength: 0)
                     }
                     if let h = music.hint {
                         HStack(alignment: .top, spacing: 8) {
-                            Text(h + "。授权后回来再点一次「确定应用」；仍无声就重启控制台。")
+                            Text(h + "。授权后回来再点一次「应用」；仍无声就重启控制台。")
                                 .font(.system(size: 10))
                                 .foregroundStyle(Theme.amber)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -331,6 +410,91 @@ struct RGBView: View {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// 灯效按钮网格（自适应 4-5 列，窗口收窄回落 3 列）
+    private var effectGrid: some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 100), spacing: 8)], spacing: 8) {
+            ForEach(effects, id: \.0) { eff in
+                let active = effect == eff.0
+                Button {
+                    effect = eff.0
+                    effectDirty = true
+                } label: {
+                    Text(eff.1)
+                        .font(.system(size: 12, weight: active ? .semibold : .regular))
+                        .foregroundStyle(active ? .white : Theme.dim)
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                        .background(RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .fill(active ? Theme.purple : Theme.panel2))
+                        .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .strokeBorder(active ? Theme.purple : Theme.line))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    /// 「应用」按钮（2026-11-14 用户要求改名，去掉右边的说明/提示小字）。
+    /// 与小标题同一行、右对齐；无改动时降透明度提示「当前无待下发草稿」。
+    private var applyButton: some View {
+        Button {
+            Task { await applyEffectConfirmed() }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "checkmark.circle.fill").font(.system(size: 12))
+                Text("应用").font(.system(size: 12.5, weight: .semibold))
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 14).padding(.vertical, 7)
+            .background(Theme.purple, in: Capsule())
+            .opacity(effectDirty ? 1 : 0.55)
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// 键盘灯总开关：开 = 恢复上次灯效（/api/rgb/apply），关 = CTRL_OFF。
+    /// 逻辑沿用原「灯效通用」卡的两个按钮（2026-11-14 该卡删除，功能并进这个开关）。
+    private var kbOnBinding: Binding<Bool> {
+        Binding(get: { kbOn }, set: { on in
+            kbOn = on
+            Task { await setKeyboardLight(on) }
+        })
+    }
+
+    private func setKeyboardLight(_ on: Bool) async {
+        if on {
+            let r = await backend.post("/api/rgb/apply", [:])
+            if r["ok"] as? Bool == true {
+                // 存档若是软件动画（霓虹/堆叠/冲击），固件里没有这个效果，
+                // 「重放」必须把帧引擎重新起来，否则灯会停在最后画的那一帧。
+                syncFromBackend()
+                if currentEffect.isSoftwareAnimation, !APEffectEngine.shared.isRunning {
+                    APEffectEngine.shared.start(currentEffect,
+                                                speed: Int(effectSpeed),
+                                                palette: apPaletteRGB(),
+                                                brightness: Int(effectBright))
+                }
+                ToastCenter.shared.show("键盘灯已开启 · 恢复上次灯效")
+            } else {
+                kbOn = false
+                ToastCenter.shared.show("开启失败：\(BackendService.string(r, "error") ?? "未知")")
+            }
+        } else {
+            music.stop()
+            // 软件动画（霓虹/堆叠/冲击）是逐帧往键盘推的，不停掉的话
+            // 关灯后下一帧又会把灯点亮。
+            APEffectEngine.shared.stop()
+            let r = await backend.post("/api/rgb", ["mode": "off"])
+            if r["ok"] as? Bool == true {
+                ToastCenter.shared.show("键盘灯已关闭")
+            } else {
+                kbOn = true
+                ToastCenter.shared.show("关闭失败：\(BackendService.string(r, "error") ?? "未知")")
             }
         }
     }
@@ -357,7 +521,9 @@ struct RGBView: View {
     // MARK: - 调色板（除「逐键自定义」外的灯效）
     private var paletteSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .firstTextBaseline) {
+            // 2026-11-14（用户要求）：「恢复 + 应用」直接与「灯效颜色」小标题同排，
+            // 右对齐（应用最右）；底部按钮行与说明小字全部删除。
+            HStack(alignment: .center, spacing: 8) {
                 GroupTitle(text: "灯效颜色", sub: "原厂 ColorBlock · \(paletteSize) 色")
                 Spacer(minLength: 8)
                 if paletteSize > 0 {
@@ -368,6 +534,7 @@ struct RGBView: View {
                         effectDirty = true
                     }
                 }
+                applyButton
             }
             if paletteSize == 0 {
                 if !hideCardSubs {
@@ -403,9 +570,11 @@ struct RGBView: View {
     // 每行 16 个网格位，大键按原厂宽度占位，标签就是键帽上的字。
     private var keymapSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .firstTextBaseline) {
+            HStack(alignment: .center, spacing: 8) {
                 GroupTitle(text: "键盘投影", sub: "US 布局 · 85 键 · 每键对应真实灯位")
                 Spacer(minLength: 8)
+                // 逐键模式没有调色板行，「应用」放在标题行右端（与灯效颜色行同构）
+                applyButton
                 if let p = picked {
                     Text("\(Self.layout[p.row][p.idx].label) · " + pickedHex)
                         .font(.system(size: 10.5).monospacedDigit())
@@ -550,15 +719,56 @@ struct RGBView: View {
         Binding(get: { effectDirection }, set: { effectDirection = $0; effectDirty = true })
     }
 
-    /// 点「确定应用」才真正下发
+    /// 点「应用」才真正下发
+    /// 当前调色板 → 软件动画用的 RGB 三元组（最多 7 色）。
+    /// 霓虹按 7 色循环、堆叠/冲击只取前 3 色，所以给 7 个就够。
+    private func apPaletteRGB() -> [[Int]] {
+        guard !palette.isEmpty else { return [[255, 0, 0]] }
+        let n = max(1, min(7, palette.count))
+        return (0..<n).map { i in
+            let c = i < palette.count ? palette[i] : palette[0]
+            let rgb = c.toHex().toRGB()
+            return [rgb.0, rgb.1, rgb.2]
+        }
+    }
+
     private func applyEffectConfirmed() async {
         // 音乐律动走另一条路：固件码 0x22 只是编号，芯片不会分析音频，
         // 原厂也是上位机抓音频自己做 FFT（见 MusicEngine.swift 顶部的说明）。
         if currentEffect == .music {
+            APEffectEngine.shared.stop()
             await applyMusic()
             return
         }
         music.stop()
+
+        // 【2026-11-11】霓虹 / 堆叠 / 冲击 = 原厂 AP 软件动画，固件没有这三个效果号。
+        // 以前当固件码发，芯片不认，三个效果看起来一模一样；现在改成界面侧逐帧算
+        // 126 个灯位的颜色、走 matrix 通道（原厂 AP_Effect_Task 同款做法）。
+        if currentEffect.isSoftwareAnimation {
+            APEffectEngine.shared.stop()
+            let colors = apPaletteRGB()
+            // 配置照存（重启 / 唤醒后按它重放），但**下发的不是固件效果号**
+            let saved: [String: Any] = [
+                "mode": "effect", "save": 1, "style": effect,
+                "speed": Int(effectSpeed), "brightness": Int(effectBright),
+                "direction": 0, "colors": colors,
+            ]
+            _ = await backend.post("/api/rgb", saved)
+            if APEffectEngine.shared.start(currentEffect, speed: Int(effectSpeed),
+                                           palette: colors, brightness: Int(effectBright)) {
+                effectDirty = false
+                locks.lock("effect", 4.0)
+                syncFromBackend()
+                ToastCenter.shared.show("已应用 · \(effectName(effect)) · 软件动画 \(Int(effectSpeed)) 档 · \(Int(effectBright))%")
+            } else {
+                showToast("动画启动失败：\(APEffectEngine.shared.lastError ?? "")")
+            }
+            return
+        }
+        // 切到任何固件灯效，先把上一轮软件动画停掉，否则它会一直往键盘推帧
+        APEffectEngine.shared.stop()
+
         var body: [String: Any] = ["save": 1, "brightness": Int(effectBright)]
         var summary: String
         if isKeymap {
@@ -643,7 +853,18 @@ struct RGBView: View {
     }
 
     private var lbColorBinding: Binding<Color> {
-        Binding(get: { lbColor }, set: { lbColor = $0; lbDirty = true })
+        Binding(get: { lbColor }, set: { c in
+            lbColor = c
+            lbDirty = true
+            // 2026-11-14（用户要求）：选固定色直接下发，不再点「确定生效」。
+            // 色板拖动时 onChange 连发，防抖 350ms，停手后才写一次 EC。
+            lbColorTask?.cancel()
+            lbColorTask = Task {
+                try? await Task.sleep(nanoseconds: 350_000_000)
+                guard !Task.isCancelled else { return }
+                await applyLightbar(nil)
+            }
+        })
     }
 
     /// 海岸灯总开关（2.8.8 用户要求）：关 = CTRL_OFF，开 = 回到上次的轮换/固定色
@@ -653,6 +874,17 @@ struct RGBView: View {
             lbDirty = true
             // 开关是即时动作，点了就写（不等「确定生效」）
             Task { await applyLightbar(nil) }
+        })
+    }
+
+    /// 睡眠展示开关：接电源睡眠时灯带亮。改完立刻下发。
+    /// 2026-11-14 修 bug：原来走 applyLightbar(nil)，toast 弹的是「已切换到多彩轮换」
+    /// —— 提示驴唇不对马嘴；现在用 toastOverride 指定睡眠展示自己的提示。
+    private var lbBreathingBinding: Binding<Bool> {
+        Binding(get: { lbBreathing }, set: { v in
+            lbBreathing = v
+            UIControlPrefs.set(UIControlPrefs.K.lightbarBreathing, v)
+            Task { await applyLightbar(nil, toastOverride: "睡眠展示已\(v ? "开启" : "关闭")") }
         })
     }
 
@@ -699,37 +931,38 @@ struct RGBView: View {
                             .foregroundStyle(Theme.dim)
                     }
                 }
-                HStack(spacing: 10) {
-                    Button {
-                        Task { await applyLightbar(nil) }
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "checkmark.circle.fill").font(.system(size: 12))
-                            Text("确定生效").font(.system(size: 12.5, weight: .semibold))
-                        }
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 14).padding(.vertical, 7)
-                        .background(Theme.purple, in: Capsule())
-                        .opacity(lbDirty ? 1 : 0.55)
+                Divider().overlay(Theme.line)
+                HStack(spacing: 8) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("睡眠展示").font(.system(size: 13, weight: .medium))
+                        Text("接入电源睡眠时灯带展现灯效（电池下固件不亮）")
+                            .font(.system(size: 11)).foregroundStyle(Theme.dim2)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                    .buttonStyle(.plain)
-                    Text(lbDirty ? "有未应用的修改" : "轮换 / 固定色都只改控制字节，不动颜色寄存器")
-                        .font(.system(size: 10.5)).foregroundStyle(lbDirty ? Theme.amber : Theme.dim2)
-                    Spacer(minLength: 0)
+                    Spacer(minLength: 4)
+                    Toggle("", isOn: lbBreathingBinding)
+                        .toggleStyle(.switch)
+                        .tint(Theme.purple)
+                        .labelsHidden()
+                        .disabled(lbMode == "off")
                 }
-                .padding(.top, 2)
+                .opacity(lbMode == "off" ? 0.45 : 1)
+                // 2026-11-14（用户要求）：「确定生效」按钮删除 —— 模式分段与固定色
+                // 都已即时/防抖下发，不再需要手动确认。
             }
             .kextGated(lightbarReason != "kext")
         }
     }
 
-    private func applyLightbar(_ mode: String?) async {
+    private func applyLightbar(_ mode: String?, toastOverride: String? = nil) async {
         let m = mode ?? lbMode
         var body: [String: Any] = ["ctrl": m]
         // 只有固定色才下发颜色；轮换/关闭不碰 RGB 寄存器，用户上次挑的色会被保留
         if m == "static" {
             body["hex"] = lbColor.toHex()
         }
+        // 睡眠展示（0x748 bit3）：只有开灯时才下发，关灯时固件要求无条件置 1
+        if m != "off" { body["breathing"] = lbBreathing }
         // 先记软件记忆（界面立刻以记忆为准），再写 EC
         UIControlPrefs.set(UIControlPrefs.K.lightbarMode, m)
         if m == "static" { UIControlPrefs.set(UIControlPrefs.K.lightbarHex, lbColor.toHex()) }
@@ -743,69 +976,68 @@ struct RGBView: View {
             }
             lbDirty = false
             if m != "off" { lbLastMode = m }
-            showToast("已切换到\(name)")
+            showToast(toastOverride ?? "已切换到\(name)")
         } else {
             showToast("海岸灯失败：\(BackendService.string(r, "error") ?? "未知")")
         }
     }
 
-    // MARK: - 灯效通用（记忆 + 关闭键盘灯）
-    private var generalCard: some View {
-        Card(title: "灯效通用") {
-            VStack(alignment: .leading, spacing: 10) {
-                // 360 宽的列里塞三个带文字的按钮会挤到换行，统一改紧凑版
-                compactButton("恢复上次", "arrow.clockwise", Theme.blue) {
-                    Task {
-                        let r = await backend.post("/api/rgb/apply", [:])
-                        showToast(r["ok"] as? Bool == true ? "已恢复上次灯效" : "恢复失败")
-                        // 2.8.10：恢复后按存档刷新界面即可，不回读 EC
-                        syncFromBackend()
+    // MARK: - 灯效通用卡已删除（2026-11-14 用户要求）：
+    //  「恢复上次 / 关闭键盘灯」并进「键盘灯」总开关；「清除记忆」随卡移除。
+
+    // MARK: - AP 心跳（EC 0x741 bit0）
+    //
+    // 这一位是文档 §4.2 的「AP exist / 控制中心在线」标志，不是风扇手动门。
+    // 原厂语义：控制台打开置 1、60 秒续期、退出清 0。置 1 期间 ITE 8291 键盘固件的
+    // 「十分钟没人管就熄灯」策略被关掉；清 0 就回到那个策略。
+    // 用户 2026-11-13 要求把它做成明面开关，放在灯效页（因为它最直接的作用就是熄灯）。
+    private var apBeatCard: some View {
+        Card(title: "AP 心跳 · EC 0x0741 bit0") {
+            VStack(alignment: .leading, spacing: 9) {
+                HStack(spacing: 8) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("AP 心跳").font(.system(size: 13, weight: .medium))
+                        if !hideCardSubs {
+                            Text("控制中心在线标志 · 60 秒续期")
+                                .font(.system(size: 11)).foregroundStyle(Theme.dim2)
+                        }
                     }
+                    Spacer(minLength: 4)
+                    Toggle("", isOn: Binding(
+                        get: { apPresent },
+                        set: { v in apPresent = v; Task { await setAPBeat(v) } }))
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                    .tint(Theme.blue)
+                    .disabled(!backend.kextLoaded)
                 }
-                compactButton("关闭键盘灯", "power", Theme.red) {
-                    Task {
-                        music.stop()
-                        let r = await backend.post("/api/rgb", ["mode": "off"])
-                        showToast(r["ok"] as? Bool == true ? "键盘灯已关闭" : "失败")
-                    }
-                }
-                compactButton("清除记忆", "trash", Theme.amber) {
-                    Task {
-                        let r = await backend.post("/api/rgb/forget", [:])
-                        showToast(r["ok"] as? Bool == true ? "已清除（开机不再恢复）" : "失败")
-                    }
-                }
-                if !hideCardSubs {
-                    Text("开机恢复由后台 helper 完成（不再单独注册登录项）；EC 断电会丢灯效，所以每次变更都会自动记忆。")
-                        .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+                Text("关掉后 EC 认为没有控制中心接管：键盘背光约 10 分 40 秒空闲后自动熄灭，"
+                     + "风扇档位写入也会被静默拒收（开关重开即恢复）。")
+                    .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
 
-    /// 右列专用的整行按钮（比 SecondaryButton 矮，一行放一个，不会换行）
-    private func compactButton(_ title: String, _ icon: String, _ tint: Color,
-                               _ action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack(spacing: 7) {
-                Image(systemName: icon).font(.system(size: 11.5))
-                Text(title).font(.system(size: 12.5, weight: .medium))
-                Spacer(minLength: 0)
+    /// 读 EC 真实状态。失败就保持界面现值，不弹提示 —— 进页那一下偶发超时很正常。
+    private func refreshAPBeat() async {
+        guard let d = try? await backend.getJSON("/api/apbeat") as? [String: Any],
+              let on = d["ap_present"] as? Bool else { return }
+        await MainActor.run { apPresent = on }
+    }
+
+    /// 写 0x741 bit0。后端返回的是**写后回读**的真实值，以它为准，不信本地假设。
+    private func setAPBeat(_ on: Bool) async {
+        let r = await backend.post("/api/fan", ["ap_present": on])
+        if r["ok"] as? Bool == true {
+            if let now = r["ap_present"] as? Bool {
+                await MainActor.run { apPresent = now }
             }
-            .foregroundStyle(Theme.txt)
-            .padding(.horizontal, 11).padding(.vertical, 7)
-            .frame(maxWidth: .infinity)
-            .background(Theme.panel2, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .strokeBorder(Theme.line, lineWidth: 1))
-            .overlay(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 2, style: .continuous)
-                    .fill(tint).frame(width: 2.5)
-                    .padding(.vertical, 6)
-            }
+            showToast(on ? "AP 心跳已置 1" : "AP 心跳已清 0")
+        } else {
+            await MainActor.run { apPresent = !on }   // 没写进去就把界面退回去
+            showToast("AP 心跳失败：\(BackendService.string(r, "error") ?? "未知")")
         }
-        .buttonStyle(.plain)
     }
 
     // MARK: - 设备信息（把版面填满的东西必须是真的有用）
@@ -863,7 +1095,9 @@ struct RGBView: View {
         // 这时候读到的还是上一笔的调色板报文，会把滑条刷成 0%）。
         // 只跳过「灯效草稿」这一段，海岸灯照常回读。
         // 音乐律动运行中也不回读：它不下发灯效、只刷行数据，回读会把选择刷回去。
-        if !effectDirty, !locks.locked("effect"), !music.running {
+        // 软件动画运行中也不回读：它是逐帧推 matrix，芯片 feature 里没有对应
+        // 效果号，回读只会把界面刷回存档值（和正在跑的画面不一致）。
+        if !effectDirty, !locks.locked("effect"), !music.running, !APEffectEngine.shared.isRunning {
             if profMode == "keymap" {
                 effect = KeyboardCatalog.key(for: .userMode)
                 if let rows = profile?["rows"] {
@@ -911,7 +1145,38 @@ struct RGBView: View {
             if let hex = UIControlPrefs.string(UIControlPrefs.K.lightbarHex), hex.count == 6 {
                 lbColor = Color(hex: UInt32(hex, radix: 16) ?? 0)
             }
+            // 睡眠展示：优先软件记忆，没有就用刚播种的 EC 真值
+            if let b = UIControlPrefs.bool(UIControlPrefs.K.lightbarBreathing) {
+                lbBreathing = b
+            } else if let b = store.lightbar["breathing"] as? Bool {
+                lbBreathing = b
+            }
         }
+
+        // 键盘灯总开关以芯片真实状态为准（state.off 由 HID 报文推导，NativeRGB 下发）
+        if let off = BackendService.dict(store.rgb, "state")?["off"] as? Bool {
+            kbOn = !off
+        }
+        // AP 心跳真值镜像（EC 0x741 bit0）
+        if let ap = store.rgb["ap_present"] as? Bool { apPresent = ap }
+
+        // 2026-11-14（首帧记忆）：把刚采用的草稿抄进 UserDefaults 镜像，
+        // 下次进页 init() 同步读出来，首帧即上次选择，不再「默认值起步再跳」。
+        mirrorDraft()
+    }
+
+    /// 当前草稿 → UserDefaults 镜像（调色板 7×6 位 hex、逐键矩阵 126×6 位 hex）
+    private func mirrorDraft() {
+        UIControlPrefs.set(UIControlPrefs.K.rgbEffect, effect)
+        UIControlPrefs.set(UIControlPrefs.K.rgbSpeed, Int(effectSpeed))
+        UIControlPrefs.set(UIControlPrefs.K.rgbBright, Int(effectBright))
+        UIControlPrefs.set(UIControlPrefs.K.rgbDirection, Int(effectDirection))
+        UIControlPrefs.set(UIControlPrefs.K.rgbPalette,
+                           palette.prefix(7).map { $0.toHex().lowercased() }.joined())
+        UIControlPrefs.set(UIControlPrefs.K.rgbKeymap,
+                           keymap.flatMap { $0 }.map { $0.toHex().lowercased() }.joined())
+        UIControlPrefs.set(UIControlPrefs.K.rgbKbOn, kbOn)
+        UIControlPrefs.set(UIControlPrefs.K.apbeat, apPresent)
     }
 
     /// 存档里的 rows → 界面用的 6×21 Color 矩阵

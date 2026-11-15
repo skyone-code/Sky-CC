@@ -1,8 +1,8 @@
 #!/bin/zsh
 # ============================================================================
-# 卸载Mac控制台.command —— 彻底卸载
+# 卸载Sky CC.command —— 彻底卸载
 #
-# 目标：把 Mac控制台 在这台机器上留下的**每一样东西**都清掉，
+# 目标：把 Sky CC 在这台机器上留下的**每一样东西**都清掉，
 #       不只是把 .app 拖进废纸篓。清完「系统设置 → 通用 → 登录项」、
 #       launchd、内核扩展、偏好设置里都不再有它的痕迹。
 #
@@ -14,24 +14,30 @@
 #               必须让 app 自己调 --unregister-all 注销
 #   ③ 内核扩展  /Library/Extensions/TongfangFan.kext
 #               + /Library/LaunchDaemons/com.macconsole.TongfangFan.plist
-#               + 开机加载器（支持库内「Mac控制台散热扩展」）
+#               + 开机加载器（支持库内「Sky CC散热扩展」）
 #               + kmutil unload（都需要管理员密码）
 #   ④ 登录项    ~/Library/LaunchAgents 下 com.macconsole.*（含历史 rgbrestore）
 #               以及旧版亮度守护 com.user.pwmwake / auxbright / auxsmooth
-#   ⑤ app       /Applications 与 ~/Applications 里的 Mac控制台（含旧「开机启动」app）
+#   ⑤ app       /Applications 与 ~/Applications 里的 Sky CC（含旧「开机启动」app）
 #   ⑥ 数据      ~/Library/Application Support/MacConsole（灯效档 / 风扇曲线 / 记忆 / 锁）
 #   ⑦ 偏好      com.macconsole.app 整个 UserDefaults 域（pref.* 全部设置项）
 #   ⑧ 缓存      Caches / Containers / HTTPStorages / WebKit / Saved Application State
 #   ⑨ 日志      ~/Library/Logs/macconsole*.log、pwmwake.out.log、/tmp/macconsole*
 #   ⑩ 旧工具    /usr/local/bin 下 auxbright / pwmwake / fanctl 之类历史残留
+#   ⑪ GPU 路由  /Library/GPUBundles/gpu-router.dylib、/usr/local/lib 软链，
+#               以及指向它的 DYLD_INSERT_LIBRARIES 注入开关
 #
 # 结束时会把「所有应该消失的路径」再扫一遍，列出仍然存在的残留。
 # ============================================================================
 set -u
 
 APP_DIRS=(
+  "/Applications/Sky CC.app"
+  "$HOME/Applications/Sky CC.app"
+  # 旧版本（≤3.0.4.4）的 app 名，升级换名后残留也要清
   "/Applications/Mac控制台.app"
   "$HOME/Applications/Mac控制台.app"
+  # 更早期的「开机启动」独立 app
   "/Applications/Mac控制台开机启动.app"
   "$HOME/Applications/Mac控制台开机启动.app"
 )
@@ -40,9 +46,16 @@ SUPPORT="$HOME/Library/Application Support/MacConsole"
 DAEMON_PLIST="/Library/LaunchDaemons/com.macconsole.TongfangFan.plist"
 KEXT_DST="/Library/Extensions/TongfangFan.kext"
 # 2.8.15：开机加载器放在控制台支持库里（/Library/PrivilegedHelperTools 被 SIP 挡住）
-LOADER_DST="$SUPPORT/bin/Mac控制台散热扩展"
+LOADER_DST="$SUPPORT/bin/Sky CC散热扩展"
+# 旧版本（≤3.0.4.4）加载器的名字，一并清
+LOADER_LEGACY="$SUPPORT/bin/Mac控制台散热扩展"
 # 早期试验版曾想把它放到这里，一并清掉
 LOADER_OLD="/Library/PrivilegedHelperTools/Mac控制台散热扩展"
+# 3.0.4.1 起：GPU 路由注入库由 pkg 装到 /Library/GPUBundles（App Sandbox 可读），
+# 并在 /usr/local/lib 留一条软链兼容旧路径。卸载时两处都要清，否则下次装别的版本
+# 会读到孤儿副本。
+GPU_DYLIB="/Library/GPUBundles/gpu-router.dylib"
+GPU_LEGACY="/usr/local/lib/gpu-router.dylib"
 UID_NUM=$(id -u)
 
 echo "=============================================="
@@ -65,22 +78,25 @@ echo
 # ---------------------------------------------------------------- ① 停进程
 echo "→ 1/9 停止正在运行的进程"
 for D in "${APP_DIRS[@]}"; do
-  BIN="$D/Contents/MacOS/Mac控制台"
+  for EXE in "Sky CC" "Mac控制台"; do
+  BIN="$D/Contents/MacOS/$EXE"
   [[ -x "$BIN" ]] || continue
   # --unregister-all 注销 helper / mainApp 两条现役注册，外加 autostart 历史残留
   # （3.0.1 起 bundle 不含 autostart plist，SMAppService 那条只能清旧机器）。
   # 必须在删 app 之前跑：注册记录在系统数据库里，只删文件清不掉。
   "$BIN" --unregister-all 2>/dev/null && echo "    已注销后台注册（$D）"
+  done
 done
 
-# 主程序（精确匹配可执行文件路径，避免误杀）
-PIDS="$(pgrep -f '/Mac控制台\.app/Contents/MacOS/Mac控制台$' 2>/dev/null || true)"
+# 主程序（精确匹配可执行文件路径，避免误杀；新旧两代 app 名都要匹配）
+PID_PAT='/(Sky CC|Mac控制台)\.app/Contents/MacOS/(Sky CC|Mac控制台)$'
+PIDS="$(pgrep -f "$PID_PAT" 2>/dev/null || true)"
 if [[ -n "$PIDS" ]]; then
   echo "$PIDS" | tr ' ' '\n' | while read -r p; do
     [[ -n "$p" ]] && kill "$p" 2>/dev/null
   done
   sleep 1
-  PIDS="$(pgrep -f '/Mac控制台\.app/Contents/MacOS/Mac控制台$' 2>/dev/null || true)"
+  PIDS="$(pgrep -f "$PID_PAT" 2>/dev/null || true)"
   if [[ -n "$PIDS" ]]; then
     echo "$PIDS" | tr ' ' '\n' | while read -r p; do
       [[ -n "$p" ]] && kill -9 "$p" 2>/dev/null
@@ -140,6 +156,9 @@ if [[ -d "$KEXT_DST" || -f "$DAEMON_PLIST" || -e "$LOADER_DST" || -e "$LOADER_OL
   # 否则 launchd 会在 KeepAlive/RunAtLoad 下拿不到程序反复失败。
   if [[ -e "$LOADER_DST" ]]; then
     sudo rm -f "$LOADER_DST" && echo "    已删除开机加载器（支持库）"
+  fi
+  if [[ -e "$LOADER_LEGACY" ]]; then
+    sudo rm -f "$LOADER_LEGACY" && echo "    已删除开机加载器（旧版名残留）"
   fi
   if [[ -e "$LOADER_OLD" ]]; then
     sudo rm -f "$LOADER_OLD" && echo "    已删除开机加载器（旧路径残留）"
@@ -211,6 +230,23 @@ for f in /usr/local/bin/auxbright /usr/local/bin/pwmwake /usr/local/bin/fanctl \
   fi
 done
 
+# GPU 路由注入库（3.0.4.1 起由 pkg 装入 /Library/GPUBundles）
+if [[ -e "$GPU_DYLIB" || -L "$GPU_LEGACY" || -e "$GPU_LEGACY" ]]; then
+  sudo -v || echo "    ⚠️ 没拿到管理员权限，路由库可能删不掉"
+  for f in "$GPU_DYLIB" "$GPU_LEGACY"; do
+    if [[ -e "$f" || -L "$f" ]]; then
+      sudo rm -f "$f" && echo "    已删除 $f"
+    fi
+  done
+  # 注入开关还指着这个库的话一并关掉，否则环境变量会指向不存在的文件，
+  # 之后所有新启动的 app 都会在 dyld 阶段报错
+  CUR_INJ="$(launchctl getenv DYLD_INSERT_LIBRARIES 2>/dev/null)"
+  if [[ "$CUR_INJ" == *gpu-router.dylib* ]]; then
+    launchctl unsetenv DYLD_INSERT_LIBRARIES 2>/dev/null \
+      && echo "    已关闭 GPU 路由注入开关（DYLD_INSERT_LIBRARIES）"
+  fi
+fi
+
 echo
 echo "—— 残留自检 ——"
 LEFT=0
@@ -222,7 +258,10 @@ check "$SUPPORT"
 check "$KEXT_DST"
 check "$DAEMON_PLIST"
 check "$LOADER_DST"
+check "$LOADER_LEGACY"
 check "$LOADER_OLD"
+check "$GPU_DYLIB"
+check "$GPU_LEGACY"
 check "$HOME/Library/Preferences/com.macconsole.app.plist"
 check "$HOME/Library/Caches/com.macconsole.app"
 check "$HOME/Library/Saved Application State/com.macconsole.app.savedState"
@@ -232,7 +271,7 @@ for LABEL in com.macconsole.helper com.macconsole.autostart com.macconsole.rgbre
     echo "  ✗ launchd 里仍有 $LABEL"; LEFT=$((LEFT+1))
   fi
 done
-if pgrep -f '/Mac控制台\.app/Contents/MacOS/Mac控制台$' >/dev/null 2>&1; then
+if pgrep -f '/(Sky CC|Mac控制台)\.app/Contents/MacOS/(Sky CC|Mac控制台)$' >/dev/null 2>&1; then
   echo "  ✗ 主程序进程仍在运行"; LEFT=$((LEFT+1))
 fi
 if pgrep -f 'MacConsoleHelper' >/dev/null 2>&1; then
@@ -246,7 +285,7 @@ else
   echo "⚠️ 还有 $LEFT 处残留（见上面 ✗）。多数情况重启一次就会彻底消失。"
 fi
 echo
-echo "提示：若「系统设置 → 通用 → 登录项」里仍看到 Mac控制台，"
+echo "提示：若「系统设置 → 通用 → 登录项」里仍看到 Sky CC，"
 echo "      那是旧版本注册的条目，手动点「−」删掉即可。"
 echo
 echo "按任意键关闭..."

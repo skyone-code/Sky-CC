@@ -10,3 +10,10 @@ swift-dmgroot/
 *.bak
 build-swift.shw*
 *~
+
+# 安装包产物不入库（05-安装包/ 存档）
+*.pkg
+*.dmg
+swift-pkgroot/
+build/
+*.app/

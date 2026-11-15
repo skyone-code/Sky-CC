@@ -83,10 +83,35 @@ final class HelperService: NSObject, MCHelperProtocol {
                 reply: @escaping ([String: Any]) -> Void) {
         // 生命周期动作在 helper 本地处理，不进 NativeAPI（那是硬件/业务路由）
         if path == "/api/helper/shutdown" {
+            // 升级 / 手动重启专用：**必须非零退出**。plist 的 KeepAlive 是
+            // SuccessfulExit=false —— 非零才会被 launchd 用新二进制拉起来；
+            // 写成 exit(0) 会变成「请求重启结果彻底没进程」。
             hlog("收到 shutdown 请求，退出以便 launchd 拉起新版本")
             reply(["ok": true])
             DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) {
-                hlog("exit(0)")
+                hlog("exit(75) —— 非零退出，交给 launchd 重启")
+                exit(75)
+            }
+            return
+        }
+        // 「退出控制台」专用（2026-11-13 用户要求）：把机器完整交还，然后正常退出。
+        //   ① 停曲线 / 交还风扇档位 —— helper 一走就没人守散热了，不能留着手动档位；
+        //   ② 清 0x741 bit0 —— 原厂语义「退出时清 0」，键盘背光回到固件空闲熄灯策略；
+        //   ③ exit(0) —— SuccessfulExit=false 下 launchd **不会**再拉起。
+        //      下次打开控制台时 XPC 连过来，MachServices 会按需把它启动起来。
+        if path == "/api/helper/quit-all" {
+            hlog("收到 quit-all：停曲线 → 交还风扇 → 清 0x741 bit0 → exit(0)")
+            FanCurveController.shared.stop()
+            let handBack = FanControl.shared.releaseManualDoor()
+            let cleared = FanControl.shared.clearAPPresentOnExit()
+            let c1 = FanControl.shared.appPresentState().raw
+            hlog("quit-all: 交还档位 ok=\(handBack?.ok ?? false) 清 bit0 ok=\(cleared?.ok ?? false) ctrl1=0x\(String(c1, radix: 16))")
+            reply(["ok": true,
+                   "released": handBack?.ok ?? false,
+                   "cleared": cleared?.ok ?? false,
+                   "ctrl1": Int(c1)])
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.25) {
+                hlog("exit(0) —— 正常退出，launchd 不再拉起")
                 exit(0)
             }
             return
@@ -148,6 +173,13 @@ DispatchQueue.global(qos: .userInitiated).async {
     // 所以正常情况下这里无事可做；留着是为了万一将来做成持久化锁，
     // 重启时能明确放开，不会出现「触控板永久锁死」。
     TrackpadLock.releaseAll()
+    // AP exist 常驻：先把 EC 0x741 bit0 立起来 —— 这是「控制中心接管」标志
+    // （文档 §4.2，原厂打开软件即下发），也是键盘灯 10 分钟熄灯的开关；
+    // 再跑启动序列，序列里的风扇对账会看这一位决定能不能写寄存器。
+    ECAPPresentKeeper.start()
+    // 3.0.4.3：移除睡眠守卫。用户实测 0x741 bit0 全程为 0 时仍会在进 S3 后 25ms
+    // 被一个未知 GPE 弹回，说明这一位与「睡下即醒」无关；守卫反而因 didWake 偶发
+    // 不送达而把 holdSuspended 卡在 true，导致 bit0 再也不置 1。此处恢复原行为。
     hlog("开始启动序列（恢复散热模式 / 键盘灯 / 亮度守护）")
     NativeAPI.startupSequence()
     // 独显利用率预热：让第一份 /api/snapshot 就带上 dgpu 的真值。

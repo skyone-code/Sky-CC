@@ -1,14 +1,26 @@
-Mac控制台 3.0 · 安装说明（LAPQC71 专版 · SwiftUI 原生 · 菜单栏常驻）
+Sky CC 3.0 · 安装说明（LAPQC71x · SwiftUI 原生 · 菜单栏常驻）
 ==============================================
 
 这是一个原生的 macOS 桌面应用：自己的窗口、菜单栏常驻图标、原生界面，
 不经过浏览器。散热/灯效/海岸灯等硬件控制由随包的后台服务负责
 （Swift 直调 IOKit，XPC 通信，无需 Python、也没有网页界面）。
 
-一、安装 app（一步）
+一、安装（双击一次，输入管理员密码）
     1. 打开这个磁盘映像
-    2. 把「Mac控制台.app」拖到 Applications
-    就这些。kext 和卸载器都不再单独放在磁盘映像里。
+    2. 双击磁盘映像里那个 .pkg 安装包（名字里带版本号，只有这一个）
+    3. 一路「继续」→「安装」，输入一次管理员密码
+    装完 app 在「应用程序」里，直接打开即可。
+
+    为什么是 pkg 而不是拖拽：显卡路由需要一个注入库 gpu-router.dylib，
+    它必须放在 /Library/GPUBundles/ 才能被沙箱 app（QQ、微信这类）读到 ——
+    这个目录只有管理员能写，所以只能由安装器来完成这一步。
+    安装器同时会：
+      · 把 app 放进 /Applications
+      · 把 gpu-router.dylib 装到 /Library/GPUBundles/gpu-router.dylib（root:wheel 644）
+      · 在 /usr/local/lib/ 建一条软链指过来（兼容旧路径）
+    安装日志：/tmp/macconsole-gpu-router-install.log
+
+    想彻底删掉：磁盘映像里那个「卸载Sky CC.command」，它会连路由库一起清。
 
 二、装散热内核扩展（一次性；装过可跳过）
     TongfangFan.kext **已经打包在 app 内部**，不需要在这里找文件。
@@ -19,7 +31,7 @@ Mac控制台 3.0 · 安装说明（LAPQC71 专版 · SwiftUI 原生 · 菜单栏
     安装日志：/tmp/macconsole-kext-install.log
 
 三、运行（菜单栏常驻）
-    双击 Mac控制台.app：窗口直接打开，同时菜单栏（屏幕顶部）出现
+    双击 Sky CC.app：窗口直接打开，同时菜单栏（屏幕顶部）出现
     风扇图标，显示 CPU 温度。页面：
       仪表盘：设备 / 系统 / 序列号一屏总览
       监控：温度 / 风扇转速 / 电池 / 功耗 / 磁盘 / 网络 / 进程
@@ -34,7 +46,7 @@ Mac控制台 3.0 · 安装说明（LAPQC71 专版 · SwiftUI 原生 · 菜单栏
 
 四、关于登录项（现在很干净）
     正常情况下，「系统设置 → 通用 → 登录项」里只会有：
-      · Mac控制台（后台服务 MacConsoleHelper，系统注册，随登录自动运行）
+      · Sky CC（后台服务 MacConsoleHelper，系统注册，随登录自动运行）
     键盘灯效恢复、面板模式保持这些后台动作都由 helper 自己完成，
     不再单独注册 bash 登录项。
 
@@ -49,22 +61,22 @@ Mac控制台 3.0 · 安装说明（LAPQC71 专版 · SwiftUI 原生 · 菜单栏
     面板的 PWM 模式由后台服务保持（DPCD 0x721），不占用登录项。
 
 七、卸载（彻底）
-    双击随附的「卸载Mac控制台.command」。
+    双击随附的「卸载Sky CC.command」。
     它会清掉：主程序 / 后台守护 / 内核扩展及其开机项 / 两条登录项注册 /
     软件记忆 / 偏好设置 / 缓存 / 日志，最后自动扫一遍残留并报告。
     需要一次管理员密码（卸载 kext 用）。
 
 ==============================================
 组件说明
-  Mac控制台.app            原生主程序（内含 TongfangFan.kext、mcutil）
-  卸载Mac控制台.command     彻底卸载器
+  Sky CC.app            原生主程序（内含 TongfangFan.kext、mcutil）
+  卸载Sky CC.command     彻底卸载器
   说明.txt                 本文件
 
 技术备注
   · 界面：SwiftUI 原生（macOS 14+）；硬件访问：TongfangFan.kext（EC）、
     USB HID（键盘灯）、SMC（传感器）、DPCD（面板模式）——全部 IOKit 直调
   · 架构：UI + 后台服务两个进程——
-    界面（Mac控制台）只管显示，EC/SMC/HID 读写全部由 MacConsoleHelper 负责，
+    界面（Sky CC）只管显示，EC/SMC/HID 读写全部由 MacConsoleHelper 负责，
     两者通过 XPC 通信；界面退出/崩溃都不影响散热与风扇曲线
     已无 Python 依赖、无本地网页、无 8787 端口
   · 命令行助手 mcutil（随包在 Contents/MacOS/）：`xpc ping` / `xpc get <path>` /

@@ -1,6 +1,6 @@
 //
 //  NativeTrackpadLock.swift
-//  Mac控制台 —— 触控板锁定（软件独占，2.7.7）
+//  Sky CC —— 触控板锁定（软件独占，2.7.7）
 //
 //  ── 为什么不用 EC 的 CTRL_4 bit6 ──
 //

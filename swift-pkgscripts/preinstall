@@ -1,0 +1,11 @@
+#!/bin/sh
+# ---------------------------------------------------------------------------
+# preinstall —— 升级前先让正在运行的旧版退出
+#
+# 不这么做的话，pkg 覆盖 /Applications/Mac控制台.app 时旧进程还持有旧二进制，
+# 装完用户点开的是新 app、但菜单栏还挂着旧进程，温度和风扇会显示两份。
+# 退出失败不阻断安装（|| true）。
+# ---------------------------------------------------------------------------
+/usr/bin/pkill -f "Mac控制台.app/Contents/MacOS/Mac控制台" 2>/dev/null || true
+/usr/bin/pkill -f "Mac控制台.app/Contents/MacOS/MacConsoleHelper" 2>/dev/null || true
+exit 0

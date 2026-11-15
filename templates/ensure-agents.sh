@@ -1,6 +1,6 @@
 #!/bin/zsh
 # ============================================================================
-# ensure-agents.sh —— 清理/让位 Mac控制台 的用户态 launchd 守护（幂等）
+# ensure-agents.sh —— 清理/让位 Sky CC 的用户态 launchd 守护（幂等）
 #
 # 【2.8.12 变更】本脚本不再**安装**任何登录项，只做清理。
 #   以前它给键盘灯效恢复装了一条 com.macconsole.rgbrestore（/bin/bash 跑

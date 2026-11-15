@@ -1,6 +1,6 @@
 //
 //  NativeFan.swift
-//  Mac控制台 —— TongfangFan.kext 用户态客户端（原生移植）
+//  Sky CC —— TongfangFan.kext 用户态客户端（原生移植）
 //
 //  对应 Python 版 app-resources/fanctl.py。
 //
@@ -12,12 +12,14 @@
 //        出参  8 字节: {i32 status, u32 result}
 //
 //  两个必须记住的坑（原样保留）：
-//    1. 写风扇相关寄存器前必须先置 CTRL_1(0x0741) bit0 开「手动门」，否则 EC 静默拒收；
+//    1. 写风扇相关寄存器前必须让 CTRL_1(0x0741) bit0 在位（AP exist：控制中心接管），
+//       否则 EC 静默拒收。这一位不是「手动门」，是控制软件在线标志（文档 §4.2）；
 //    2. 不要直写 PWM(0x1804/0x1809) —— 会让 EC 停转风扇，只写 FAN_CTRL 档位。
 //
 
 import Foundation
 import IOKit
+import IOKit.pwr_mgt
 
 // MARK: - kext 侧 selector（与 TongfangFan.hpp 一致）
 
@@ -42,13 +44,24 @@ func trace(_ s: String) {
 
 enum EC {
     static let fanCtrl: UInt32      = 0x0751   // bit4=TURBO bit5=AUTO bit6=BOOST, 0x80+n=级别
-    static let fanRPM1: UInt32      = 0x046C   // CPU 风扇转速（16位，大端）
-    static let fanRPM2: UInt32      = 0x0464   // GPU 风扇转速
+    static let fanRPM1: UInt32      = 0x0464   // **CPU 风扇**转速（16位，大端）
+    static let fanRPM2: UInt32      = 0x046C   // GPU 风扇转速
+    // 【2026-11-11 用户定案，之前标反了】
+    //   · 原厂口径：ADDR_EC_MAIN_FAN_RPM_BYTE1/2 = 0x464/0x465 是**主风扇（CPU）**，
+    //     原厂监测页只读这一路；0x46C/0x46D 是 qc71 驱动的 FAN_RPM_2 = 第二颗（GPU），
+    //     前程序才加上的扩展项。
+    //   · 2026-10-16 那次"转速更高的 0x046C 才是 CPU"是拿转速高低反推的，
+    //     判据本身不牢：两颗风扇型号/叶片不同，同样的占空比下转速本来就会有差异
+    //     （实测两路 PWM 恒等，0x1804 = 0x1809 = 60）。
+    //   · 2026-11-11 05:54 实测旁证：0x464 = 0x08D8 = 2264 RPM，0x46C = 0x0A16 = 2582 RPM，
+    //     而 CPU 板温 0x043E = 53℃、GPU 板温 0x044F = 41℃ —— 转得快的是 GPU 那颗，
+    //     与"同一占空比下 GPU 风扇转速偏高"一致，不构成 0x46C 是 CPU 的证据。
+    //   用户实物确认（换过 CPU 风扇）：**0x464 = CPU**。
     static let fanTemp1: UInt32     = 0x043E   // CPU 附近板级温度（°C）—— 仅登记地址，2.8.15 起无读取点
     static let fanTemp2: UInt32     = 0x044F   // GPU 附近板级温度（°C）—— 仅登记地址，2.7.6 起无读取点
     static let fanPWM1: UInt32      = 0x1809   // CPU 风扇占空比（量程 0-200）—— 仅登记地址，界面不显示
     static let fanPWM2: UInt32      = 0x1804   // GPU 风扇占空比 —— 仅登记地址，界面不显示
-    static let ctrl1: UInt32        = 0x0741   // bit0 = 手动风扇门（写事件，不是状态位）bit5 = 风扇异常
+    static let ctrl1: UInt32        = 0x0741   // bit0 = AP exist（控制中心接管标志，文档 §4.2）bit5 = 风扇异常
     static let ctrl2: UInt32        = 0x078C   // bit2-3 = TURBO_LEVEL(0-3)
     static let ctrl3: UInt32        = 0x07A5   // ApOem3：功耗档+散热档共同决定（0x88|…），基准期间 EC 自己维护
     static let fanModeIndex: UInt32 = 0x07AB   // 模式总开关 = (功耗档<<4)|散热档
@@ -103,9 +116,19 @@ enum EC {
     // 海岸灯控制字节（位定义见 qc71_laptop ec.h：
     //   LIGHTBAR_CTRL_ADDR 0x0748，BIT(1)=POWER_SAVE，BIT(2)=S0_OFF，
     //   BIT(3)=S3_OFF，BIT(7)=RAINBOW）
-    static let lightbarCycle: UInt8  = 0x80    // 多彩轮换动画（出厂基线 = RAINBOW）
-    static let lightbarStatic: UInt8 = 0x00    // 固定色（RAINBOW 关、S0_OFF 关）
-    static let lightbarOff: UInt8    = 0x84    // 关灯（RAINBOW + S0_OFF）
+    //
+    // 原厂位定义（移植文档 §4.6 / qc71_laptop ec.h 一致）：
+    //   bit0 = AP exist（MyLightBar.SetApExist，启动置 1、退出清 0）
+    //   bit1 = POWER_SAVE（qc71 定义，原厂文档未列，本机恒 0，不碰）
+    //   bit2 = S0_OFF  灯带关（1 = 关）
+    //   bit3 = S3_OFF  呼吸展示关（1 = 睡眠不展示）
+    //   bit7 = RAINBOW 多彩动画（1 = 开）
+    // 四个位各自是独立语义，**必须读改写**，不能用常量整字节覆盖
+    // （用 0x84 关灯会把 bit3 一起清成 0，等于顺手把「睡眠展示」打开）。
+    static let lightbarAPPresent: UInt8 = 0x01
+    static let lightbarS0Off: UInt8     = 0x04
+    static let lightbarS3Off: UInt8     = 0x08
+    static let lightbarRainbow: UInt8   = 0x80
     static let lightbarWritableMask: UInt8 = 0xCF
 
     // 2.7.6：RGB 三个通道**只接受 10 档**（0/4/8/…/36），不是 0-255。
@@ -122,7 +145,13 @@ enum EC {
     static let fanCtrlAuto: UInt8 = 0x20
     static let fanCtrlBoost: UInt8 = 0x40
     static let fanCtrlAutoMode: UInt8 = 0xA0  // 0x80 | AUTO —— 交回 EC 自动调度
-    static let ctrl1ManualMode: UInt8 = 0x01
+
+    /// `0x741` bit0 的正身（文档 §4.2）：**AP exist 心跳 —— 控制软件在线标志**。
+    /// 控制台打开即置 1、运行期续期、退出清 0。EC 只在这位置起时才接受整片
+    /// 风扇/灯带寄存器写入，所以它看起来像「手动门」，实际是「有控制中心接管」。
+    static let ctrl1APPresent: UInt8 = 0x01
+    /// 历史命名，语义同上（旧调用点仍在用，避免大面积改名引入风险）。
+    static let ctrl1ManualMode: UInt8 = ctrl1APPresent
     static let ctrl3FanQuiet: UInt8 = 0x04
     static let ctrl3Overboost: UInt8 = 0x10
     static let ctrl3HighPwr: UInt8 = 0x80
@@ -141,7 +170,11 @@ enum EC {
     /// 【2026-10-24 00:33 / 00:38 / 00:49 三次实测双向确认】
     ///   早先的注释写成「风扇常转」是错的 —— 包内 `EcMap.BiosOem3PassiveBit` 定案为禁用被动散热。
     static let biosOem3PassiveBit: UInt8 = 0x40
-    static let apOem3BenchmarkBit: UInt8 = 0x10       // 0x07A5 bit4 = 基准模式（EC 自己算的镜像，我们不写）
+    /// `0x7A5` bit4 = OverBoost（文档 §4.4）。基准模式置 1、切档强制清 0、退出清零。
+    /// 【2026-11-11 更正】旧注释写「EC 自己算的镜像，我们不写」是错的：文档 §3.3
+    /// 的开启链明确要求写这一位；此前失败是因为整字节写成了 0x99（多带 bit3），
+    /// 正确值是 (cur & 0x60) | 0x91。
+    static let apOem3BenchmarkBit: UInt8 = 0x10
     static let statusByteBoostBit: UInt8 = 0x04       // 0x0768 bit2 = 增压（基准模式期间为 1）
     static let statusByteWinLock: UInt8 = 0x01        // 0x0768 bit0 = Win 键锁定
     static let keyboardBacklightBit: UInt8 = 0x40     // 0x07C4 bit6
@@ -438,35 +471,39 @@ final class FanControl {
 
     func info() -> FanReply? { call(SEL_INFO) }
 
-    /// 交还 EC：**安全关闭** `0x741` 手动门（bit0）。
+    /// 交还风扇调度权：**先放档位、再确认接管标志在位**（不清 bit0）。
     ///
     /// 【2.8.14 用户要求】手动档位退出、温控曲线退出都必须调它。
-    /// 以前 `setLevel()` 只管开门不管关门，用完手动档或曲线之后门一直挂在 `0x01`，
-    /// `benchmarkMode()` 恒为真 —— 控制页的散热档 / 功耗档全被挡掉，
-    /// 界面上就表现为「点了没反应」。
+    /// 以前 `setLevel()` 只管置位不管收尾，用完手动档或曲线之后 0x751 停在 0x8n，
+    /// 界面就一直显示「自定义档」，散热档 / 功耗档点了没反应。
     ///
-    /// 【顺序不能反】包内定案：先放档位 `0x751←0x00`（此时门还开着，才写得进），
-    /// 最后才清门。反过来在 `0x751` 还挂着 `0x40` / `0x8n` 时直接清门，
+    /// 【2026-11-11 更正】这不是「关手动门」。`0x741` bit0 是 AP exist
+    /// （控制中心接管标志，文档 §4.2），常驻为 1，**不清零** —— 清了键盘灯 10 分钟
+    /// 就会灭。这里只把 `0x751` 放回 0x00 交还 EC 自动调度。
+    ///
+    /// 【顺序不能反】先放档位 `0x751←0x00`（此时接管标志在位，才写得进），
+    /// 再写回 `0x741`。反过来在 `0x751` 还挂着 `0x40` / `0x8n` 时清标志，
     /// EC 会置 FAN_ABNORMAL（bit5），之后**整片风扇寄存器拒写，只能重启**。
-    /// 放档位这一步失败就保留原样、不动门（风扇响着总比写不进去好）。
+    /// 放档位这一步失败就保留原样、不动标志（风扇响着总比写不进去好）。
     ///
-    /// - Returns: `status == 0` 表示门已处于关闭状态（含本来就没开）。
+    /// - Returns: `status == 0` 表示已交还（含本来就不在位的情况）。
     @discardableResult
     func releaseManualDoor() -> FanReply? {
         bizLock.lock()
         defer { bizLock.unlock() }
         let c1 = readByte(EC.ctrl1)
-        // 门本来就没开：什么都不用做
-        guard (c1 & EC.ctrl1ManualMode) != 0 else { return FanReply(status: 0, result: UInt32(c1)) }
+        // 接管标志不在位：0x751 写了也会被拒，直接返回
+        guard (c1 & EC.ctrl1APPresent) != 0 else { return FanReply(status: 0, result: UInt32(c1)) }
         // 已经 FAN_ABNORMAL 了：任何写入都会被拒，别再加一笔
         guard (c1 & 0x20) == 0 else { return FanReply(status: -3, result: UInt32(c1)) }
-        // ① 放档位（门还开着才写得进）
+        // ① 放档位（接管标志在位才写得进）
         let released = ecWriteVerified(EC.fanCtrl, 0x00)?.ok ?? false
         guard released else {
             return FanReply(status: -1, result: UInt32(readByte(EC.fanCtrl)))
         }
-        // ② 最后清门，EC 收回管辖权 → 自己按 0x7AB 重算 0x751
-        let r = ecWriteVerified(EC.ctrl1, 0x00)
+        // ② 写回接管标志：EC 收回风扇管辖权 → 自己按 0x7AB 重算 0x751。
+        //    写的是 0x01（bit0 保留）。实测这种状态 EC 照样按 0x7AB 调风扇（满载会爬速）。
+        let r = ecWriteVerified(EC.ctrl1, doorIdleValue)
         return r ?? FanReply(status: -1, result: UInt32(readByte(EC.ctrl1)))
     }
 
@@ -476,21 +513,20 @@ final class FanControl {
         defer { bizLock.unlock() }
         switch mode {
         case "normal":
-            // 「交还 EC」的**正确**做法：先放档位再关手动门，EC 自己按 0x7AB 重算
-            // 0x751 / 0x7A5。包内定案：「关闭：写 0x00 → EC 立刻收回管辖权，
-            // 0x751 自动回落到 0x7AB 对应的值」。
+            // 「交还 EC」的**正确**做法：先放档位，EC 自己按 0x7AB 重算 0x751 / 0x7A5。
+            // 包内定案：「关闭：写 0x00 → EC 立刻收回管辖权，0x751 自动回落到 0x7AB 对应的值」。
             // 2.8.14：改为调用 releaseManualDoor()——以前这里第一笔就是 `0x741←0x00`，
-            // 若此时 0x751 还挂着 0x40 / 0x8n，正好踩中包内 04:48 那个
-            // 「顺序反了 → FAN_ABNORMAL → 整片拒写」的坑。
+            // 若此时 0x751 还挂着 0x40 / 0x8n，正好踩中「顺序反了 → FAN_ABNORMAL → 整片拒写」的坑。
+            // 注意：它**不清** 0x741 bit0（AP exist 常驻），只把 0x751 交还。
             let r = releaseManualDoor()
-            // 个别情况下 EC 关门后不会立刻重算 0x751，这里做一次
-            // 「开门 → 改正 → 再关门」的兜底（关门同样走安全顺序）。
+            // 个别情况下 EC 收权后不会立刻重算 0x751，这里做一次
+            // 「断言接管 → 改正 → 再交还」的兜底（交还同样走安全顺序）。
             let t = thermalLevel()
             if (1...3).contains(t) {
                 let want = EC.fanControlFor(t)
                 let cur = readByte(EC.fanCtrl)
                 if cur != want {
-                    if (ecWriteVerified(EC.ctrl1, EC.ctrl1ManualMode)?.ok ?? false) {
+                    if (ecWriteVerified(EC.ctrl1, readByte(EC.ctrl1) | EC.ctrl1APPresent)?.ok ?? false) {
                         writeIfDifferent(EC.fanCtrl, want)
                         writeIfDifferent(EC.ctrl3, EC.apOem3For(power: powerLevel(), thermal: t))
                     }
@@ -499,11 +535,10 @@ final class FanControl {
             }
             return r
         case "boost":
-            // 基准模式：包内 2026-10-24 05:00 定案的顺序 —— 断言手动门 → 0x751←0x40。
-            // 实测 2642 → 5615 RPM，0x768 由 EC 自己置成 0x04。
+            // 基准模式：文档 §3.3 完整开链，见 setBenchmarkMode(_:)。
             return setBenchmarkMode(true)
         default:
-            ecWriteVerified(EC.ctrl1, EC.ctrl1ManualMode)
+            _ = ecWriteVerified(EC.ctrl1, readByte(EC.ctrl1) | EC.ctrl1APPresent)
             return ecWriteVerified(EC.fanCtrl, 0x80)
         }
     }
@@ -523,23 +558,129 @@ final class FanControl {
     /// 功耗档（0x7AB 高半字节）：1 高性能 / 2 平衡 / 3 节能。
     func powerLevel() -> Int { Int((readByte(EC.fanModeIndex) >> 4) & 0x0F) }
 
-    /// 基准模式是否开启。判据是**手动门** `0x741` bit0 —— 硬件状态只有这一位，
-    /// `0x7A5` bit4 是 EC 按档位算出来的镜像，与基准无因果关系。
-    func benchmarkMode() -> Bool { (readByte(EC.ctrl1) & EC.ctrl1ManualMode) != 0 }
+    /// 基准模式是否开启。判据 = **`0x751 == 0x40`（风扇全速档）**。
+    ///
+    /// 文档 §3.3：基准模式是 FanView 的 `m_BenchmarkMode` 软件态，EC 侧唯一可靠投影
+    /// 就是 `0x751=0x40`（§4.5：0x40=全速 Boost，只有基准模式会出现）。文档里
+    /// 基准模式与 `0x741` bit0 **无关** —— bit0 是「控制中心接管」标志，软件开着
+    /// 就恒为 1，拿它参与判据等于恒真。
+    ///
+    /// 【2026-11-11 更正】上一版用「bit0 + 0x751==0x40」双条件，是把 bit0 误当
+    /// 手动门留下的历史包袱；按文档口径还原为只看档位。
+    func benchmarkMode() -> Bool {
+        readByte(EC.fanCtrl) == EC.fanCtrlBoost
+    }
 
     /// 风扇异常位（`0x741` bit5）。置起后整片风扇寄存器拒写，只能重启恢复。
     func fanAbnormal() -> Bool { (readByte(EC.ctrl1) & 0x20) != 0 }
 
-    /// 启动对账用：手动门开着，但**不是**基准模式（`0x751 ≠ 0x40`）。
+    // MARK: - AP exist / 控制中心接管（键盘灯 10 分钟熄灯的解药）
+
+    /// `0x741` bit0 = **AP exist：控制软件在线标志**（文档 §4.2）。
     ///
-    /// 这种状态只可能是「手动档位 / 温控曲线用完没关门」留下的残留：
-    /// 门挂在 `0x01` 会让 `benchmarkMode()` 恒为真，于是控制页的散热档、功耗档
-    /// 全被 `-2` 拒绝，用户看到的就是「设置失效」。
-    /// 基准模式（`0x751 = 0x40`）是用户显式打开的覆盖态，不能替他关。
-    func staleDoorOpen() -> Bool {
+    /// 语义定案（2026-11-11，用户口径 + 文档 + 实测三方一致）：
+    ///   · 控制台**打开就下发**（原厂 `AppAction.StartTimer_APExistToEC`：置 0x741 bit0=1，
+    ///     之后 60s 续期；退出时清 0）。它宣告的是「有控制中心在管这台机器」。
+    ///   · macOS 侧从来没有任何程序写过它，EC 认为无人接管 —— 于是 ITE 8291 键盘固件
+    ///     按自己的空闲策略在 **10 分 40 秒**后掐灯（期间每分钟重发整套行数据帧也救不回来）。
+    ///   · 置位常驻后同样不碰键盘，**13 分钟**灯仍然全亮，亮度字节一次都没被清零
+    ///     （`ctrl=2 eff=51 bri=38` 全程不变）。
+    ///
+    /// 【为什么可以常驻】同一次实验里位开着跑 60 秒 CPU 满载：转速 2619 → 4286 RPM
+    /// 自己爬上去了、`0x751` 保持 `0x00`，说明 EC 自动控风不受这一位影响
+    /// —— 它只管「软件有没有接管」，不是风扇手动门。
+    static let apPresentKey = "mcAPPresentHold"
+
+    /// 开关（默认开）。关闭后回到旧行为：只在风扇写事务期间短暂置位。
+    static var apPresentHold: Bool {
+        get {
+            let d = UserDefaults.standard
+            if d.object(forKey: apPresentKey) == nil { return true }
+            return d.bool(forKey: apPresentKey)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: apPresentKey) }
+    }
+
+    /// 断言「控制中心在线」：把 `0x741` bit0 置 1，其余位原样保留。
+    ///
+    /// 与文档一致：打开软件下发一次，运行期由 helper 的守夜复查（被清才补写）。
+    /// 已在位就**一笔都不写**（EC 写次数是稀缺资源，这一位是持久状态）。
+    /// `FAN_ABNORMAL`（bit5）置起时整片风扇寄存器拒写，直接返回 -3 不硬来。
+    @discardableResult
+    func assertAPPresent() -> FanReply? {
+        guard FanControl.apPresentHold else { return nil }
+        bizLock.lock()
+        defer { bizLock.unlock() }
         let c1 = readByte(EC.ctrl1)
-        guard (c1 & EC.ctrl1ManualMode) != 0, (c1 & 0x20) == 0 else { return false }
-        return readByte(EC.fanCtrl) != EC.fanCtrlBoost
+        guard (c1 & 0x20) == 0 else { return FanReply(status: -3, result: UInt32(c1)) }
+        guard (c1 & EC.ctrl1APPresent) == 0 else { return FanReply(status: 0, result: UInt32(c1)) }
+        return ecWriteVerified(EC.ctrl1, c1 | EC.ctrl1APPresent)
+    }
+
+    /// 显式设置「控制中心在线」标志 —— 灯效页「AP 心跳」开关走这里（2026-11-13）。
+    ///
+    /// 与 `assertAPPresent()` 的分工：那个只负责「置 1」（守夜补写），这个双向可写，
+    /// 并且**同步 `apPresentHold`** —— 关掉之后 60 秒守夜不会再把它顶回 1，
+    /// 风扇事务交还时的 `doorIdleValue` 也跟着变成 `0x00`（真的没人接管）。
+    ///
+    /// 副作用要讲清楚：这一位是 ITE 8291 判断「有没有控制中心」的依据，清掉之后
+    /// 键盘背光回到固件的 **10 分 40 秒空闲熄灯**策略；同时 EC 会拒收风扇档位写入
+    /// （`0x751` 写了也当没看见），直到重新置 1。
+    @discardableResult
+    func setAPPresent(_ on: Bool) -> FanReply? {
+        bizLock.lock()
+        defer { bizLock.unlock() }
+        let c1 = readByte(EC.ctrl1)
+        // FAN_ABNORMAL（bit5）期间整片风扇寄存器拒写，硬写只会多一笔无效流量
+        guard (c1 & 0x20) == 0 else { return FanReply(status: -3, result: UInt32(c1)) }
+        // 先落开关再写 EC：万一写失败，守夜也不会按旧值把用户的选择翻回去
+        FanControl.apPresentHold = on
+        let target = on ? (c1 | EC.ctrl1APPresent) : (c1 & ~EC.ctrl1APPresent)
+        guard target != c1 else { return FanReply(status: 0, result: UInt32(c1)) }
+        return ecWriteVerified(EC.ctrl1, target)
+    }
+
+    /// 退出控制台专用：**无条件**清 `0x741` bit0，不看 `apPresentHold`。
+    ///
+    /// 与 `setAPPresent(false)` 的区别：那个会改用户偏好（下次开 app 也不置 1），
+    /// 这个只清硬件状态 —— 用户开着心跳正常用，退出时按原厂语义交还硬件，
+    /// 下次启动 `ECAPPresentKeeper` 再按偏好决定要不要重新立起来。
+    @discardableResult
+    func clearAPPresentOnExit() -> FanReply? {
+        bizLock.lock()
+        defer { bizLock.unlock() }
+        let c1 = readByte(EC.ctrl1)
+        guard (c1 & EC.ctrl1APPresent) != 0 else { return FanReply(status: 0, result: UInt32(c1)) }
+        return ecWriteVerified(EC.ctrl1, c1 & ~EC.ctrl1APPresent)
+    }
+
+    /// 「AP 心跳」的真实状态：直接读 `0x741`，不查缓存也不查偏好。
+    /// 界面要显示的是「EC 现在认不认有控制中心」，不是「用户上次选了啥」——
+    /// 两者会分叉（比如守夜被 FAN_ABNORMAL 挡住没能补写）。
+    func appPresentState() -> (on: Bool, raw: UInt8) {
+        let c1 = readByte(EC.ctrl1)
+        return ((c1 & EC.ctrl1APPresent) != 0, c1)
+    }
+
+    /// 交还风扇调度权时的目标值：接管标志保持在线，写 `0x01`；只有用户显式关掉
+    /// `apPresentHold` 才真的写 `0x00`（会连带 10 分钟熄灯回来）。
+    private var doorIdleValue: UInt8 {
+        FanControl.apPresentHold ? EC.ctrl1APPresent : 0x00
+    }
+
+    /// 启动对账用：`0x751` 停在**手动定速档**（0x80..0x87）。
+    ///
+    /// 【2026-11-11 更正】旧版靠「bit0 开着但 0x751≠0x40」判断残留门，是把 bit0
+    /// 当手动门的历史包袱。bit0 现在是常驻的接管标志，永远为 1，不能作判据。
+    /// 真正需要善后的只有「上次停在手动定速、进程被强杀」这一种：
+    /// 0x751 还是 0x8n，交给 releaseManualDoor() 放回 0x00 即可（不动 bit0）。
+    func staleDoorOpen() -> Bool {
+        let f = readByte(EC.fanCtrl)
+        guard (0x80...0x87).contains(f) else { return false }
+        guard (readByte(EC.ctrl1) & 0x20) == 0 else { return false }
+        // 有正常的档位索引（0x11/0x22/0x33 …）却停在手动定速 → 上次没善后的残留
+        let idx = readByte(EC.fanModeIndex)
+        return idx >= 0x11 && (idx & 0x0F) <= 3
     }
 
     /// 切换散热档（写**四个**寄存器，包内 `FanService.SetMode` 同款序列）：
@@ -549,8 +690,8 @@ final class FanControl {
     ///   · `0x7B{功耗档-1}` 该功耗档自己的曲线索引槽
     /// 功耗档（高半字节）保持不变，原厂也不改它。
     ///
-    /// 基准模式下直接拒绝：此时 0x741 门开着、0x751=0x40 由 EC 维持，
-    /// 放行会把 0x751 打回 0x00/0xA0 —— 增压没了、门却还开着，
+    /// 基准模式下直接拒绝：此时 0x751=0x40（全速）由基准覆盖态维持，
+    /// 放行会把 0x751 打回 0x00/0xA0 —— 增压没了但基准开关还勾着，
     /// 必须取消再勾才恢复（原厂 UI 此时也整组置灰）。
     func setThermalLevel(_ level: Int) -> FanReply? {
         guard (1...3).contains(level) else { return nil }
@@ -582,52 +723,150 @@ final class FanControl {
                         result: UInt32(back), steps: steps)
     }
 
-    /// 开启前的档位索引，供关闭基准时兜底还原（正常情况 EC 自己会落回原档）。
-    private static var preBenchmarkIndex: UInt8 = 0
+    /// 基准模式快照（文档 §3.3 开启链第一步：快照 当前 PL/dstate/0x751/0x7A5/0x7A6/0x7AB）。
+    private struct BenchSnapshot {
+        var pl1: UInt8 = 0
+        var pl2: UInt8 = 0
+        var gpu: UInt8 = 0
+        var fanCtrl: UInt8 = 0
+        var ctrl3: UInt8 = 0        // 0x7A5
+        var ctrl4: UInt8 = 0        // 0x7A6
+        var index: UInt8 = 0        // 0x7AB
+        var valid = false
+    }
+    private static var benchSnapshot = BenchSnapshot()
 
-    /// 启用 / 关闭基准模式。
+    /// 读-改-写：只改 `mask` 覆盖的位，其余位原样保留。
+    private func rmwWrite(_ addr: UInt32, _ mask: UInt8, _ value: UInt8) -> Bool {
+        guard let r = ecRead(addr), r.ok else { return false }
+        let cur = UInt8(r.result & 0xFF)
+        let next = (cur & ~mask) | (value & mask)
+        if next == cur { return true }
+        return ecWriteVerified(addr, next)?.ok ?? false
+    }
+
+    /// 基准模式的 `0x7A5` 前两步（文档 §3.3 / §4.4）：bit7 PowerHigh=1 → bit4 OverBoost=1。
+    /// 第三步（低 2 位 LED=01、清 bit2/bit3）要等 DynamicTemp 之后单独写，顺序按文档。
+    /// 最终整字节 = `(cur & 0x60) | 0x91`。
     ///
-    /// 【顺序反了会出大事】基准生效期间直接清门（`0x741←0x00`）在极端情况下会让 EC
-    /// 置 FAN_ABNORMAL(bit5)，之后**整片风扇寄存器拒写**，只能重启恢复。
-    /// 正确路径：开门 → `0x751←0x40`；关闭时反过来 `0x751←0x00` → 关门。
-    /// 顺序反了会触发 FAN_ABNORMAL（`0x741` 变 `0xA3`）导致整片风扇寄存器拒写。
+    /// 【2026-11-11 更正】旧版一次写整字节 `0x99`（多带 bit3「用户高转速表」），
+    /// 这正是当时「写完 0x7A5 后 0x751←0x40 被打回」的原因；文档值是 0x91。
+    private func writeBenchmarkCtrl3Power() -> Bool {
+        guard rmwWrite(EC.ctrl3, EC.ctrl3HighPwr, EC.ctrl3HighPwr) else { return false }
+        return rmwWrite(EC.ctrl3, EC.ctrl3Overboost, EC.ctrl3Overboost)
+    }
+
+    /// 启用 / 关闭基准模式（文档 §3.3，与全量手册 line 73 的原厂链一致）。
     ///
-    /// 【绝对不要再写这几个字节】`0x7A5` / `0x768` / `0x7AB` 都是 EC 按档位算出来的镜像。
-    /// 实测 `0x7A5←0x99` 一写，紧接着的 `0x751←0x40` 就被打回（60ms 内回落）。
+    /// 开：快照 → Gaming PL(0x730/731→0x783/784) → dstate=1 → 0x7A5 bit7=1
+    ///     → OverBoost=1 → DynamicTemp=1(0x7A6 bit1 清) → LED=01 → 0x7AB=0x11
+    ///     → 0x751=0x40 →（高性能电源计划：macOS 无对应通道）
+    /// 关：0x751 先放 0x00 → 快照整字节恢复 → 按快照 0x7AB 重放 SetPowerMode+SetFanMode。
+    ///
+    /// 【安全线】`0x7A5` 写不进就**不再写 0x751**，直接回滚 —— 顺序反了会让 EC
+    /// 置 FAN_ABNORMAL(bit5)，之后整片风扇寄存器拒写，只能重启。
+    /// `0x741` bit0 是「控制中心接管」标志，全程保持在线，这里只断言、不清零。
     func setBenchmarkMode(_ on: Bool) -> FanReply? {
         bizLock.lock()
         defer { bizLock.unlock() }
+        return on ? beginBenchmark() : endBenchmark()
+    }
+
+    private func beginBenchmark() -> FanReply? {
+        var steps: [String] = []
+        // 0. 快照（已在基准中就不覆盖，避免把基准态当原态存下来）
+        if !benchmarkMode() || !FanControl.benchSnapshot.valid {
+            FanControl.benchSnapshot = BenchSnapshot(
+                pl1: readByte(EC.pl1), pl2: readByte(EC.pl2),
+                gpu: readByte(EC.fanGpuSetting), fanCtrl: readByte(EC.fanCtrl),
+                ctrl3: readByte(EC.ctrl3), ctrl4: readByte(EC.ctrl4),
+                index: readByte(EC.fanModeIndex), valid: true)
+            steps.append("snap=0x\(String(format: "%02X", FanControl.benchSnapshot.ctrl3))")
+        }
+        // ① 接管标志在位，否则后面整片写入都会被静默拒收
+        let c1 = readByte(EC.ctrl1)
+        if (c1 & EC.ctrl1APPresent) == 0 {
+            _ = ecWriteVerified(EC.ctrl1, c1 | EC.ctrl1APPresent)
+            steps.append("AP=1")
+        }
+        // ② Gaming PL
+        let gpl1 = Self.plDefault(EC.gamingPl1Default, 65)
+        let gpl2 = Self.plDefault(EC.gamingPl2Default, 100)
+        let p1 = ecWriteVerified(EC.pl1, gpl1)?.ok ?? false
+        let p2 = ecWriteVerified(EC.pl2, gpl2)?.ok ?? false
+        steps.append("PL=\(p1 ? 1 : 0)\(p2 ? 1 : 0)(\(gpl1)/\(gpl2))")
+        // ③ dstate 低 3 位 = 1
+        let g = rmwWrite(EC.fanGpuSetting, 0x07, 0x01)
+        steps.append("dstate=\(g ? 1 : 0)")
+        // ④⑤ 0x7A5 PowerHigh=1、OverBoost=1
+        let c3 = writeBenchmarkCtrl3Power()
+        // ⑥ DynamicTemp 开（0x7A6 bit1 反逻辑清 0）
+        let dt = modifyBit(EC.ctrl4, EC.ctrl4OverboostDynTempOff, false)?.ok ?? false
+        // ⑦ 电源 LED 低 2 位=01（清 bit2/bit3）
+        let led = c3 ? rmwWrite(EC.ctrl3, 0x0F, 0x01) : false
+        steps.append("7A5=\(c3 && led ? 1 : 0) dyn=\(dt ? 1 : 0)")
+        guard c3, led else {
+            // 0x7A5 没落地 → 绝不写 0x751，回滚快照
+            _ = restoreBenchSnapshot()
+            steps.append("abort:7A5")
+            return FanReply(status: -1, result: UInt32(readByte(EC.ctrl3)),
+                            steps: steps.joined(separator: " "))
+        }
+        // ⑦ 模式索引 0x11（高 4 位功耗 1 / 低 4 位风扇 1）
+        let i = ecWriteVerified(EC.fanModeIndex, 0x11)?.ok ?? false
+        steps.append("7AB=\(i ? 1 : 0)")
+        // ⑧ 风扇全速
+        let f = ecWriteVerified(EC.fanCtrl, EC.fanCtrlBoost)?.ok ?? false
+        steps.append("751=\(f ? 1 : 0)")
+        let ok = i && f && benchmarkMode()
+        if !ok { _ = restoreBenchSnapshot() }
+        // ⑨ 高性能电源计划：macOS 无等价物（系统「节能」面板无 API 可编程切换）
+        return FanReply(status: ok ? 0 : -1, result: UInt32(readByte(EC.fanCtrl)),
+                        steps: steps.joined(separator: " "))
+    }
+
+    private func endBenchmark() -> FanReply? {
+        guard benchmarkMode() || FanControl.benchSnapshot.valid else {
+            return FanReply(status: 0, result: 0)
+        }
+        var steps: [String] = []
+        // ① 先放全速档（接管标志仍在线，才写得进）
+        let first = ecWriteVerified(EC.fanCtrl, 0x00)?.ok ?? false
+        steps.append("751=\(first ? 1 : 0)")
+        // ② 快照整字节恢复
+        let snap = FanControl.benchSnapshot
+        if snap.valid {
+            let ok = restoreBenchSnapshot()
+            steps.append("restore=\(ok ? 1 : 0)")
+        }
+        // ③ 重放 SetPowerMode + SetFanMode 全链（文档 §3.3「关」第二步）
+        let idx = snap.valid ? snap.index : readByte(EC.fanModeIndex)
+        let power = Int((idx >> 4) & 0x0F)
+        let thermal = Int(idx & 0x0F)
+        var replay = true
+        if (1...3).contains(power), (1...3).contains(thermal) {
+            replay = applyPowerPreset(power, thermalLevel: thermal)?.ok ?? false
+            steps.append("replay=\(power)/\(thermal):\(replay ? 1 : 0)")
+        }
+        FanControl.benchSnapshot.valid = false
+        let ok = first && replay
+        return FanReply(status: ok ? 0 : -1, result: UInt32(readByte(EC.fanModeIndex)),
+                        steps: steps.joined(separator: " "))
+    }
+
+    /// 把快照里的字节原样写回（0x751 除外 —— 调用点自己按安全顺序处理）。
+    @discardableResult
+    private func restoreBenchSnapshot() -> Bool {
+        let s = FanControl.benchSnapshot
+        guard s.valid else { return false }
         var ok = true
-        if on {
-            // 【包内定案 25 号文档】`0x741` 是**写事件**，不是持久状态位：
-            // 即使读回已经是 0x01，也必须再写一次 —— 重写等于重新声明接管权。
-            // 实测「只写 0x751←0x40」在接管权已失效时会被 EC 静默拒收（rc=1 但读回 0x00），
-            // 「先写 0x741←0x01 再写 0x751←0x40」才会站住。所以这里**不做早退**。
-            // 只有门本来就是开的时候才无需重新采样原档位（0x7AB 基准期间本就不动）。
-            if !benchmarkMode() {
-                FanControl.preBenchmarkIndex = readByte(EC.fanModeIndex)
-            }
-            // ① 断言手动门。这一步失败就没必要往下写了。
-            ok = (ecWriteVerified(EC.ctrl1, EC.ctrl1ManualMode)?.ok ?? false)
-            // ② 门开了才写增压档；0x768 由 EC 自己置成 0x04
-            if ok { ok = (ecWriteVerified(EC.fanCtrl, EC.fanCtrlBoost)?.ok ?? false) }
-            return FanReply(status: ok ? 0 : -1, result: UInt32(readByte(EC.statusByte)))
-        }
-        // 关闭：只有门开着才需要「先放档位再关门」这套顺序
-        guard benchmarkMode() else { return FanReply(status: 0, result: 0) }
-        ok = (ecWriteVerified(EC.fanCtrl, 0x00)?.ok ?? false)
-        // 模式兜底：基准本身不碰 0x7AB，EC 会自己落回原档位（0xA0）。
-        // 这一步只防「基准期间被别处改过 0x7AB」，**必须在关门之前写** ——
-        // 0x7AB 也是风扇寄存器，门一关同样会被 EC 静默拒收。
-        if ok {
-            let pre = FanControl.preBenchmarkIndex
-            if pre >= 0x11, pre <= 0x33, readByte(EC.fanModeIndex) != pre {
-                _ = ecWriteVerified(EC.fanModeIndex, pre)
-            }
-        }
-        // ③ 最后清门，EC 收回管辖权，0x751 落到 0x7AB 对应档位
-        if ok { ok = (ecWriteVerified(EC.ctrl1, 0x00)?.ok ?? false) }
-        return FanReply(status: ok ? 0 : -1, result: 0)
+        ok = (ecWriteVerified(EC.ctrl3, s.ctrl3)?.ok ?? false) && ok
+        ok = (ecWriteVerified(EC.ctrl4, s.ctrl4)?.ok ?? false) && ok
+        ok = rmwWrite(EC.fanGpuSetting, 0x07, s.gpu & 0x07) && ok
+        ok = (ecWriteVerified(EC.pl1, s.pl1)?.ok ?? false) && ok
+        ok = (ecWriteVerified(EC.pl2, s.pl2)?.ok ?? false) && ok
+        ok = (ecWriteVerified(EC.fanModeIndex, s.index)?.ok ?? false) && ok
+        return ok
     }
 
     /// 原厂「系统功耗设置」的一档联动参数。
@@ -732,7 +971,8 @@ final class FanControl {
         guard (0...7).contains(level) else { return nil }
         bizLock.lock()
         defer { bizLock.unlock() }
-        ecWriteVerified(EC.ctrl1, EC.ctrl1ManualMode)
+        // 断言接管标志（读改写，保留 bit3 OnKey 等其它位），再写手动定速档
+        _ = ecWriteVerified(EC.ctrl1, readByte(EC.ctrl1) | EC.ctrl1APPresent)
         return ecWriteVerified(EC.fanCtrl, UInt8(0x80 | UInt8(level)))
     }
 
@@ -780,12 +1020,13 @@ final class FanControl {
         bizLock.lock()
         defer { bizLock.unlock() }
         let prev = UInt8((ecRead(EC.ctrl1)?.result ?? 0) & 0xFF)
-        _ = ecWrite(EC.ctrl1, EC.ctrl1ManualMode)
+        _ = ecWrite(EC.ctrl1, prev | EC.ctrl1APPresent)
         let cur = UInt8((ecRead(EC.ctrl2)?.result ?? 0) & 0xFF)
         let v = (cur & ~EC.ctrl2TurboLevelMask) | UInt8(level << 2)
         let r = ecWrite(EC.ctrl2, v)
-        if prev & EC.ctrl1ManualMode == 0 {
-            _ = ecWrite(EC.ctrl1, prev)
+        if prev & EC.ctrl1APPresent == 0 {
+            // 还原：保留 bit0（AP exist / 控制中心接管），只把其余位写回去
+            _ = ecWrite(EC.ctrl1, FanControl.apPresentHold ? (prev | EC.ctrl1APPresent) : prev)
         }
         return r
     }
@@ -993,37 +1234,72 @@ final class FanControl {
         return Int((Double(r) / Double(EC.lightbarLevelMax) * 255.0).rounded())
     }
 
+    /// 读一个字节（读失败返回 nil）
+    private func lbByte(_ addr: UInt32) -> UInt8? {
+        guard let r = ecRead(addr), r.ok else { return nil }
+        return UInt8(r.result & 0xFF)
+    }
+
     /// 海岸灯状态（读组无锁，v2.5.3.1）
     /// `rgb` 是 EC 原始档位（0-36），`rgb255` / `hex` 是展开到 0-255 的等价色。
+    /// `breathing` = 睡眠展示开关（bit3 反逻辑：0 = 睡时展示灯效）。
     func lightbarStatus() -> [String: Any]? {
-        func rb(_ a: UInt32) -> UInt8? {
-            guard let r = ecRead(a), r.ok else { return nil }
-            return UInt8(r.result & 0xFF)
-        }
-        guard let ctrl = rb(EC.lightbarCtrl),
-              let r = rb(EC.lightbarRed),
-              let g = rb(EC.lightbarGreen),
-              let b = rb(EC.lightbarBlue) else { return nil }
+        guard let ctrl = lbByte(EC.lightbarCtrl),
+              let r = lbByte(EC.lightbarRed),
+              let g = lbByte(EC.lightbarGreen),
+              let b = lbByte(EC.lightbarBlue) else { return nil }
         let mode: String
-        if ctrl & 0x04 != 0 { mode = "off" }              // bit2 关灯位优先级最高
-        else if ctrl & EC.lightbarCycle != 0 { mode = "cycle" }
+        if ctrl & EC.lightbarS0Off != 0 { mode = "off" }        // bit2 关灯位优先级最高
+        else if ctrl & EC.lightbarRainbow != 0 { mode = "cycle" }
         else { mode = "static" }
         let e = [Self.lightbarExpand(r), Self.lightbarExpand(g), Self.lightbarExpand(b)]
         return ["ctrl": ctrl, "mode": mode,
+                "breathing": (ctrl & EC.lightbarS3Off) == 0,
+                "ap_exist": (ctrl & EC.lightbarAPPresent) != 0,
                 "rgb": [r, g, b],
                 "rgb255": e,
                 "hex": String(format: "%02x%02x%02x", e[0], e[1], e[2])]
     }
 
-    /// 设置海岸灯。`rgb` 传 nil 表示**不动颜色寄存器**（切轮换/关灯时保留用户选的色）。
+    /// 设置海岸灯（按移植文档 §3.4 的位序，全是读改写）。
     ///
-    /// 写入顺序特意改成「先 RGB 再 ctrl」：ctrl 是固件侧的生效/latch 动作，
-    /// 放最后写能保证颜色先就位，不会出现「切固定色后第一下还是旧色」。
+    /// 文档顺序：① bit2 灯开关 ② bit3 睡眠展示（关灯时**无条件**置 1）
+    /// ③ bit7 多彩 ④ 最后才写颜色（原厂第 ③ 步是 BIOS RAM Combine，macOS 无该通道，
+    /// 等价动作就是 EC 0x749-0x74B 直写）。
+    ///
+    /// - Parameters:
+    ///   - rgb: 传 nil 表示**不动颜色寄存器**（切轮换/关灯时保留用户选的色）。
+    ///   - mode: off / cycle / static
+    ///   - breathing: 睡眠展示开关；nil = 不改这一位（只有关灯时被强制置 1）
     @discardableResult
-    func lightbarSet(_ rgb: [Int]?, ctrl: UInt8) -> [String: Any]? {
-        let c = ctrl & EC.lightbarWritableMask
+    func lightbarSet(_ rgb: [Int]?, mode: String, breathing: Bool?) -> [String: Any]? {
         bizLock.lock()
-        if let rgb = rgb {
+        defer { bizLock.unlock() }
+        guard var c = lbByte(EC.lightbarCtrl) else { return nil }
+        let off = (mode == "off")
+
+        // ① bit2 灯带开关
+        if off { c |= EC.lightbarS0Off } else { c &= ~EC.lightbarS0Off }
+
+        // ② bit3 睡眠展示：关灯时无条件置 1（文档「睡眠展示 关」条），
+        //    开灯时按开关走；没传就保持原值。
+        if off {
+            c |= EC.lightbarS3Off
+        } else if let b = breathing {
+            c = b ? (c & ~EC.lightbarS3Off) : (c | EC.lightbarS3Off)
+        }
+
+        // ③ bit7 多彩
+        if mode == "cycle" { c |= EC.lightbarRainbow } else { c &= ~EC.lightbarRainbow }
+
+        // bit0 AP exist 常驻（原厂启动即置位，软件在场标志）
+        c |= EC.lightbarAPPresent
+        c &= EC.lightbarWritableMask
+
+        ecWriteVerified(EC.lightbarCtrl, c)
+
+        // ④ 颜色（状态位之后才落颜色，与原厂「先位后色」一致）
+        if let rgb = rgb, !off {
             let r = UInt8(max(0, min(255, rgb.count > 0 ? rgb[0] : 0)))
             let g = UInt8(max(0, min(255, rgb.count > 1 ? rgb[1] : 0)))
             let b = UInt8(max(0, min(255, rgb.count > 2 ? rgb[2] : 0)))
@@ -1031,9 +1307,19 @@ final class FanControl {
             ecWriteVerified(EC.lightbarGreen, Self.lightbarQuantize(Int(g)))
             ecWriteVerified(EC.lightbarBlue, Self.lightbarQuantize(Int(b)))
         }
-        ecWriteVerified(EC.lightbarCtrl, c)
-        bizLock.unlock()
         return lightbarStatus()
+    }
+
+    /// 启动置 `0x748` bit0（原厂 MyLightBar.SetApExist，移植文档 §3.4「启动初始化」第一步）。
+    /// 已经在位就零写入。
+    @discardableResult
+    func lightbarAssertAPPresent() -> Bool {
+        guard let c = lbByte(EC.lightbarCtrl) else { return false }
+        if c & EC.lightbarAPPresent != 0 { return true }
+        bizLock.lock()
+        defer { bizLock.unlock() }
+        let want = (c | EC.lightbarAPPresent) & EC.lightbarWritableMask
+        return ecWriteVerified(EC.lightbarCtrl, want)?.ok ?? false
     }
 
     /// 一次性探测本机 EC 能力位（读组无锁，v2.5.3.1）
@@ -1059,7 +1345,7 @@ final class FanControl {
             "modeindex": mi,
             "thermal_level": Int(mi & 0x0F),
             "power_level": Int((mi >> 4) & 0x0F),
-            "benchmark": (rb(EC.ctrl1) & EC.ctrl1ManualMode) != 0,
+            "benchmark": rb(EC.fanCtrl) == EC.fanCtrlBoost,
             "passive_cooling_disabled": (rb(EC.biosCtrl3) & EC.biosOem3PassiveBit) != 0,
             "osd": (rb(EC.apBiosByte) & EC.osdBit) != 0,
             "keyboard_backlight": (rb(EC.keyboardBacklightState) & EC.keyboardBacklightBit) != 0,
@@ -1128,7 +1414,7 @@ final class FanControl {
     /// 实时组：**只读两个转速**。
     ///
     /// 2.8.15 按「EC 只在需要时读」重排：
-    ///   * 保留 `0x046C` / `0x0464`（转速 —— 唯一真正需要实时的 EC 数据）
+    ///   * 保留 `0x0464` / `0x046C`（转速 —— 唯一真正需要实时的 EC 数据）
     ///   * 删除 `0x1809` / `0x1804`（PWM，界面不再显示这个数据）
     ///   * 删除 `0x043E`（EC 板级温度 —— 温度一律走 SMC / NVAccel）
     ///   * 移出 `0x0751` / `0x0741` / `0x07A5` / `0x07AB` → 见 modeStatus()，按需读一次
@@ -1148,10 +1434,11 @@ final class FanControl {
             // 温度不走 EC：CPU 取 SMC 封装温度，GPU 取 SMC（本机无键时退 NVAccel 驱动上报）。
             "temp_cpu": TempSources.cpuCelsius(),
             "temp_gpu": TempSources.gpuCelsius(),
+            "temp_gpu_edge": TempSources.gpuEdgeCelsius(),
         ]
     }
 
-    /// 模式状态组：`0x0751`(风扇控制) / `0x0741`(手动门+异常位) /
+    /// 模式状态组：`0x0751`(风扇控制) / `0x0741`(AP exist + 异常位) /
     /// `0x07A5`(ApOem3) / `0x07AB`(功耗档<<4|散热档)，共 4 读。
     ///
     /// 只在「控制 / 实验性」页打开时读一次（或写操作后回读），不进轮询。
@@ -1163,6 +1450,10 @@ final class FanControl {
         let ctrl1 = ecRead(EC.ctrl1)
         let c3 = ecRead(EC.ctrl3)
         let mi = ecRead(EC.fanModeIndex)
+        // 【2026-11-11】4 读全成功才算有效。EC 限速/争用时 ecRead 会失败，
+        // 老代码把失败当 0 再被上层缓存一整天 —— 表现就是「基准模式明明全速，
+        // 界面却显示未开启、0x751=0」。加这一位让上层拒绝缓存失败结果。
+        let readOK = [ctrl, ctrl1, c3, mi].allSatisfy { ($0?.ok ?? false) }
 
         var mode: [String] = []
         let v = byteOf(ctrl)
@@ -1172,18 +1463,17 @@ final class FanControl {
         if v >= 0x80 { mode.append("LV\(v & 7)") }
         let prof = byteOf(c3)
 
-        // EC 里的真实状态，用来校准界面显示
-        let manual = (byteOf(ctrl1) & EC.ctrl1ManualMode) != 0
+        // EC 里的真实状态，用来校准界面显示。
+        // 【2026-11-11】判据只看 0x751：0x40=基准全速 / 0x80..0x87=手动定速 /
+        // 其余（0x00、0xA0…）=EC 自动调度。`0x741` bit0 是常驻的接管标志，不参与。
         let actual: String
         let actualLevel: Int
-        if !manual {
-            actual = "normal"; actualLevel = 0
-        } else if v & EC.fanCtrlBoost != 0 {
+        if v == EC.fanCtrlBoost {
             actual = "boost"; actualLevel = 0
-        } else if v >= 0x80 {
+        } else if v >= 0x80 && v <= 0x87 {
             actual = "custom"; actualLevel = Int(v & 7)
         } else {
-            actual = "custom"; actualLevel = 0
+            actual = "normal"; actualLevel = 0
         }
 
         // 2.7.10：散热档 / 功耗档分开给出（0x7AB 的高低半字节），
@@ -1193,11 +1483,16 @@ final class FanControl {
         let thermal = Int(miByte & 0x0F)
         let power = Int((miByte >> 4) & 0x0F)
 
+        // 「manual」字段是历史输出键，含义已更正为「0x751 被手动定速档占用」；
+        // 「benchmark」按文档口径只看 0x751=0x40，与 0x741 bit0（常驻接管标志）无关。
+        let manualHeld = (v >= 0x80 && v <= 0x87)
+
         return [
             "fan_ctrl": v,
             "ctrl_1": byteOf(ctrl1),
-            "manual": manual,
-            "benchmark": manual,
+            "_read_ok": readOK,
+            "manual": manualHeld,
+            "benchmark": v == EC.fanCtrlBoost,
             "fan_abnormal": (byteOf(ctrl1) & 0x20) != 0,
             "actual": actual,
             "actual_level": actualLevel,
@@ -1242,6 +1537,12 @@ enum TempSources {
     /// GPU 温度（℃）。驱动未就绪/未上报时为 0。
     static func gpuCelsius() -> Int {
         NVAccelUtil.coreTemperatureC() ?? 0
+    }
+
+    /// GPU 核心边缘温度（℃）。与 `gpuCelsius()` 是两个不同测点，见 `edgeTemperatureC()`。
+    /// 驱动只发一个温度键时返回 0，界面按「只有一个」降级显示。
+    static func gpuEdgeCelsius() -> Int {
+        NVAccelUtil.edgeTemperatureC() ?? 0
     }
 }
 
@@ -1290,9 +1591,9 @@ enum FanStateStore {
         } else if st["mode"] as? String == "boost" {
             r = fc.setBenchmarkMode(true)
         } else {
-            // 2.8.14：先清残留的手动门。上次若停在「手动 / 曲线」而进程是被强杀的
-            // （或旧版本根本没关门），门会一直挂在 0x01，导致下面 setThermalLevel
-            // 直接被 benchmarkMode() 挡成 -2 —— 用户看到的就是「重启后散热档调不动」。
+            // 2.8.14：先清残留的手动定速档。上次若停在「手动 / 曲线」而进程是被强杀的
+            // （或旧版本根本没交还档位），0x751 会一直挂在 0x8n，界面显示成「自定义」。
+            // 处置只是把 0x751 放回 0x00，**不动 0x741 bit0**（那是在线标志）。
             // 基准模式（0x751=0x40）不在此列，不动。
             if fc.staleDoorOpen() {
                 _ = fc.releaseManualDoor()

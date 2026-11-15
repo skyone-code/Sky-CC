@@ -1,6 +1,6 @@
 //
 //  NativeSystem.swift
-//  Mac控制台 —— 系统信息采集（原生移植）
+//  Sky CC —— 系统信息采集（原生移植）
 //
 //  对应 Python 版 server.py 的数据采集段。策略：
 //    * sysctl / host_statistics / host_processor_info / getifaddrs / IORegistry
@@ -141,6 +141,43 @@ private func ioForEach(_ className: String, _ body: (io_registry_entry_t) -> Voi
         body(svc)
         IOObjectRelease(svc)
     }
+}
+
+/// 读 PCI 节点上的 u32 属性。`vendor-id` / `device-id` / `class-code` 都是 4 字节
+/// **小端** Data（例：`<00000300>` → 0x00030000，基础类 0x03 在 bit16..23）。
+/// 少数节点（合成驱动 / 老机型）会给 NSNumber，两种都认。
+private func pciU32(_ svc: io_registry_entry_t, _ key: String) -> UInt32? {
+    guard let unmanaged = IORegistryEntryCreateCFProperty(
+        svc, key as CFString, kCFAllocatorDefault, 0) else { return nil }
+    let any = unmanaged.takeRetainedValue()
+    if let n = any as? NSNumber { return n.uint32Value }
+    guard let d = any as? Data, d.count >= 4 else { return nil }
+    let b = [UInt8](d)
+    return UInt32(b[0]) | (UInt32(b[1]) << 8) | (UInt32(b[2]) << 16) | (UInt32(b[3]) << 24)
+}
+
+/// 读 PCI 节点上的字符串属性（`model` / `AAPL,slot-name`）。
+///
+/// 注意 IODeviceTree 里 `model` **不是** CFString，而是装着 C 字符串的 OSData
+/// （ioreg 里显示成 `"model" = <"Intel UHD Graphics 630">`，尖括号就是 Data）。
+/// 只认 as? String 会拿到 nil，型号就退化成兜底名。
+private func pciString(_ svc: io_registry_entry_t, _ key: String) -> String? {
+    guard let unmanaged = IORegistryEntryCreateCFProperty(
+        svc, key as CFString, kCFAllocatorDefault, 0) else { return nil }
+    let any = unmanaged.takeRetainedValue()
+    if let s = any as? String { return s }
+    if let d = any as? Data {
+        let bytes = [UInt8](d).prefix { $0 != 0 }
+        return String(bytes: bytes, encoding: .utf8)
+    }
+    return nil
+}
+
+/// 读 PCI 节点上的数值属性（`VRAM,totalMB`）。
+private func pciNumber(_ svc: io_registry_entry_t, _ key: String) -> NSNumber? {
+    guard let unmanaged = IORegistryEntryCreateCFProperty(
+        svc, key as CFString, kCFAllocatorDefault, 0) else { return nil }
+    return unmanaged.takeRetainedValue() as? NSNumber
 }
 
 /// 进程总数：libproc 的 proc_listallpids（Swift 没导出声明，手动绑定符号）。
@@ -453,13 +490,25 @@ enum NativeSystem {
         return "\(v.majorVersion).\(v.minorVersion)"
     }
 
-    // MARK: GPU 信息（system_profiler 解析，与 Python 版同算法，缓存 30s）
+    // MARK: GPU 信息（纯 IORegistry：IODeviceTree 的 IOPCIDevice，缓存 30s）
+    //
+    // 2026-11-07 换掉 system_profiler。原因：`system_profiler SPDisplaysDataType`
+    // 会为每张卡建一个 IOAccel 用户客户端去问 Metal 支持情况，而 NVRM 驱动在 RTD3
+    // 待机（GC6，显卡已断电）时，任何**非遥测**的用户客户端 / 平台函数调用都会把
+    // 整张独显叫醒（一次 rm_resume ≈ 900ms）。原来的 30s 缓存 = 每 30 秒必被叫醒
+    // 一次，独显永远睡不住 —— 实测跑一次 system_profiler，`debug.nvrm_rm_by_uc`
+    // 就跳 300+，`debug.nvrm_rtd3_state` 从 2 掉回 0。
+    //
+    // IODeviceTree 的 PCI 节点里型号（model）、显存（VRAM,totalMB）、槽位
+    // （AAPL,slot-name）、厂商/设备 ID 全都有，读属性是纯内存操作，不进驱动、
+    // 不开连接、不 fork 子进程。输出结构与旧的 system_profiler 解析版完全一致：
+    //   ["name": String, "bus": String, "vendor": String, "detail": [String: String]]
+    // 界面按 bus 区分独显（"PCIe"）与核显（"Built-In"），别改这个语义。
 
     private static var gpuCacheTime: Double = 0
     private static var gpuCache: [[String: Any]]?
 
-    /// macOS 下独显没驱动（本机 NVIDIA），system_profiler 只给 Device ID。
-    /// 常见 NVIDIA Device ID → 型号（PCI 数据库实测）。
+    /// 拿不到 `model` 属性时的兜底：常见 NVIDIA Device ID → 型号（PCI 数据库实测）。
     private static let nvidiaIDs: [String: String] = [
         "1e81": "RTX 2080 Super", "1e82": "RTX 2080", "1e84": "RTX 2070 Super",
         "1e87": "RTX 2080", "1e89": "RTX 2060", "1e90": "RTX 2080 Max-Q",
@@ -473,51 +522,62 @@ enum NativeSystem {
     static func gpuInfo() -> [[String: Any]] {
         let now = Date().timeIntervalSince1970
         if now - gpuCacheTime < 30, let v = gpuCache { return v }
-        let out = sh(["/usr/sbin/system_profiler", "SPDisplaysDataType"], timeout: 20)
+
         var gpus: [[String: Any]] = []
-        var cur: [String: Any]? = nil
-        for line in out.split(separator: "\n", omittingEmptySubsequences: true) {
-            let indent = line.prefix(while: { $0 == " " }).count
-            let s = String(line).trimmingCharacters(in: .whitespaces)
-            // GPU 名称：缩进恰为 4 个空格且以冒号结尾（子项缩进为 6、8，要排除）
-            if indent == 4 && s.hasSuffix(":") {
-                if let c = cur { gpus.append(c) }
-                cur = ["name": String(s.dropLast()), "detail": [String: String]()]
-                continue
+        ioForEach("IOPCIDevice") { svc in
+            // class-code 的 bit16..23 是 PCI 基础类：0x03 = 显示控制器（显卡）。
+            // 同一张卡的音频/桥功能是 0x04 / 0x0c，这样一过就滤掉了。
+            guard let cls = pciU32(svc, "class-code"), (cls >> 16) & 0xff == 0x03 else { return }
+
+            let vendorID = pciU32(svc, "vendor-id") ?? 0
+            let deviceID = pciU32(svc, "device-id") ?? 0
+            let devHex = String(format: "0x%04x", deviceID)
+            let model = pciString(svc, "model") ?? ""
+            let slot = pciString(svc, "AAPL,slot-name") ?? ""
+
+            var detail: [String: String] = ["Type": "GPU", "Device ID": devHex]
+            var name = model
+            var bus = ""
+            if vendorID == 0x8086 {
+                detail["Vendor"] = "Intel"
+                bus = "Built-In"          // 核显没有 Bus 字段，旧版也是这个值
+                // 核显没有独立显存：macOS 报的「动态上限」自 UHD 6xx 起固定 1536 MB
+                detail["VRAM (Dynamic, Max)"] = "1536 MB"
+                if name.isEmpty { name = "Intel GPU" }
+            } else {
+                detail["Vendor"] = vendorID == 0x10de
+                    ? "NVIDIA (0x10de)"
+                    : String(format: "0x%04x", vendorID)
+                bus = "PCIe"
+                if !slot.isEmpty { detail["Slot"] = slot }
+                if let mb = pciNumber(svc, "VRAM,totalMB")?.intValue, mb > 0 {
+                    detail["VRAM (Total)"] = mb >= 1024
+                        ? (mb % 1024 == 0
+                            ? "\(mb / 1024) GB"
+                            : String(format: "%.1f GB", Double(mb) / 1024))
+                        : "\(mb) MB"
+                }
+                if name.isEmpty { name = nvidiaIDs[String(format: "%04x", deviceID)] ?? devHex }
             }
-            if var c = cur, indent >= 6, let sep = s.firstIndex(of: ":") {
-                var detail = c["detail"] as? [String: String] ?? [:]
-                detail[String(s[..<sep]).trimmingCharacters(in: .whitespaces)] =
-                    String(s[s.index(after: sep)...]).trimmingCharacters(in: .whitespaces)
-                c["detail"] = detail
-                cur = c
-            }
+            detail["Bus"] = bus
+
+            let entry: [String: Any] = [
+                "name": name,
+                "detail": detail,
+                "bus": bus,
+                "vendor": detail["Vendor"] ?? "",
+            ]
+            gpus.append(entry)
         }
-        if let c = cur { gpus.append(c) }
-        gpus = gpus.map { normalizeGPU($0) }
+
+        // 核显在前、独显在后（与旧 system_profiler 的输出顺序一致）。
+        // 界面是按 bus 挑的，不依赖顺序；这里只是让展示稳定。
+        gpus.sort { (($0["bus"] as? String) == "PCIe" ? 1 : 0)
+                  < (($1["bus"] as? String) == "PCIe" ? 1 : 0) }
+
         gpuCacheTime = now
         gpuCache = gpus
         return gpus
-    }
-
-    private static func normalizeGPU(_ g: [String: Any]) -> [String: Any] {
-        var out = g
-        let detail = g["detail"] as? [String: String] ?? [:]
-        var name = g["name"] as? String ?? ""
-        let model = (detail["Chipset Model"] ?? "").trimmingCharacters(in: .whitespaces)
-        if !model.isEmpty { name = model }
-        if name.isEmpty || name == "Display" || name == "Graphics/Displays" {
-            var vendor = (detail["Vendor"] ?? "")
-            vendor = String(vendor.split(separator: "(").first ?? "").trimmingCharacters(in: .whitespaces)
-            let dev = (detail["Device ID"] ?? "").trimmingCharacters(in: .whitespaces)
-            let model2 = nvidiaIDs[dev.lowercased().replacingOccurrences(of: "0x", with: "")]
-            name = [vendor, model2 ?? dev].filter { !$0.isEmpty }.joined(separator: " ")
-            if name.isEmpty { name = "GPU" }
-        }
-        out["name"] = name
-        out["bus"] = detail["Bus"] ?? ""
-        out["vendor"] = detail["Vendor"] ?? ""
-        return out
     }
 
     // MARK: GPU 占用率（IORegistry IOAccelerator PerformanceStatistics，缓存 1s）
@@ -889,18 +949,30 @@ enum NativeSystem {
                 iDown = Double(diff(v.0, prev.0)) / dt / 1024
             }
             let f = flags[name] ?? 0
-            ifList.append([
-                "name": name,
-                "up": (f & UInt32(IFF_UP)) != 0,
-                "running": (f & UInt32(IFF_RUNNING)) != 0,
-                "loopback": (f & UInt32(IFF_LOOPBACK)) != 0,
-                "sent": v.1, "recv": v.0,
-                "up_kbs": (iUp * 10).rounded() / 10,
-                "down_kbs": (iDown * 10).rounded() / 10,
-                "ipv4": addrs[name]?["ipv4"] ?? [],
-                "ipv6": addrs[name]?["ipv6"] ?? [],
-                "netmask": netmask[name] ?? NSNull(),
-            ])
+            // 逐项算好再组字典：原来这里是一个 10 键的大字面量，混着 UInt32 位运算、
+            // Double 运算和 Any? 兜底，Swift 类型检查器会超时（本机 4 分钟仍报
+            // "unable to type-check this expression in reasonable time"，构建直接失败）。
+            let isUp: Bool = (f & UInt32(IFF_UP)) != 0
+            let isRunning: Bool = (f & UInt32(IFF_RUNNING)) != 0
+            let isLoopback: Bool = (f & UInt32(IFF_LOOPBACK)) != 0
+            let upKbs: Double = (iUp * 10).rounded() / 10
+            let downKbs: Double = (iDown * 10).rounded() / 10
+            let ipv4: Any = addrs[name]?["ipv4"] ?? []
+            let ipv6: Any = addrs[name]?["ipv6"] ?? []
+            let mask: Any = netmask[name] ?? NSNull()
+            var entry: [String: Any] = [:]
+            entry["name"] = name
+            entry["up"] = isUp
+            entry["running"] = isRunning
+            entry["loopback"] = isLoopback
+            entry["sent"] = v.1
+            entry["recv"] = v.0
+            entry["up_kbs"] = upKbs
+            entry["down_kbs"] = downKbs
+            entry["ipv4"] = ipv4
+            entry["ipv6"] = ipv6
+            entry["netmask"] = mask
+            ifList.append(entry)
         }
         netPrevPerIf = perName
 

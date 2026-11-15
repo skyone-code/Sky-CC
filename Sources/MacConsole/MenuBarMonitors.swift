@@ -95,11 +95,12 @@ enum MenuBarIconKind: String, CaseIterable, Identifiable {
     }
 
     /// 该种类的菜单栏数值是否可切换指标
-    /// 2.7.5：硬盘也加进来（温度 / 已用寿命），并且可以指定看哪块盘
+    /// 2.7.5：硬盘也加进来（温度 / 已用寿命），并且可以指定看哪块盘。
+    /// 2026-11-14（用户要求）：硬盘去掉「已用寿命」，只显示温度，不再给指标切换。
     var supportsMetric: Bool {
         switch self {
-        case .cpu, .gpu, .disk: return true
-        case .mem, .net: return false
+        case .cpu, .gpu: return true
+        case .mem, .net, .disk: return false
         }
     }
 
@@ -107,8 +108,7 @@ enum MenuBarIconKind: String, CaseIterable, Identifiable {
     var metricOptions: [MenuBarMetric] {
         switch self {
         case .cpu, .gpu: return [.temp, .usage]
-        case .disk: return [.temp, .life]
-        case .mem, .net: return []
+        case .mem, .net, .disk: return []
         }
     }
 
@@ -534,22 +534,17 @@ final class MenuBarMonitors: NSObject {
         return list.first(where: { ($0["ok"] as? Bool) == true }) ?? [:]
     }
 
-    /// 硬盘图标的数值：温度（℃）或已用寿命（%）
+    /// 硬盘图标的数值：只显示温度（2026-11-14 用户要求去掉已用寿命）。
+    /// 历史存档里 metricKey 可能还是 "life"，这里直接无视。
     static func diskText(for overview: [String: Any]) -> String {
         let e = diskEntry(overview)
-        switch MenuBarMetric.current(for: .disk) {
-        case .life:
-            guard let u = BackendService.int(e, "percentage_used") else { return "—" }
-            return "\(u)%"
-        default:
-            if let t = BackendService.double(e, "temperature_c") { return String(format: "%.0f°", t) }
-            // 没有逐盘 SMART 时退回旧的单盘温度接口
-            let d = BackendService.dict(overview, "disk_temp")
-            if (d?["ok"] as? Bool) == true, let t = BackendService.double(d, "temperature_c") {
-                return String(format: "%.0f°", t)
-            }
-            return "—"
+        if let t = BackendService.double(e, "temperature_c") { return String(format: "%.0f°", t) }
+        // 没有逐盘 SMART 时退回旧的单盘温度接口
+        let d = BackendService.dict(overview, "disk_temp")
+        if (d?["ok"] as? Bool) == true, let t = BackendService.double(d, "temperature_c") {
+            return String(format: "%.0f°", t)
         }
+        return "—"
     }
 }
 

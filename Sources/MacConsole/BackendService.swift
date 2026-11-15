@@ -66,7 +66,7 @@ final class BackendService: ObservableObject {
         let others = NSRunningApplication.runningApplications(withBundleIdentifier: bid)
             .filter { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
         if !others.isEmpty {
-            diag("检测到另一个 Mac控制台 实例（pid \(others.map(\.processIdentifier))），本实例退场")
+            diag("检测到另一个 Sky CC 实例（pid \(others.map(\.processIdentifier))），本实例退场")
             InstanceLock.handOff()
             exit(0)
         }
@@ -158,6 +158,35 @@ final class BackendService: ObservableObject {
         HelperClient.shared.reset()
         helperOnline = false
         diag("已断开 helper 连接（helper 继续运行）")
+    }
+
+    /// 「退出控制台」专用：连 helper 一起送走（2026-11-13 用户要求）。
+    ///
+    /// helper 收到请求后自己完成四件事：停风扇曲线 → 交还 `0x751` 档位 →
+    /// 清 `0x741` bit0（原厂「退出清 0」语义）→ `exit(0)`。
+    /// plist 的 `KeepAlive` 已改成 `SuccessfulExit=false`，正常退出不会被
+    /// launchd 拉回来 —— 这才是「真的退出」，否则前脚退、后脚又被拉起，
+    /// 0x741 bit0 也会被重新置成 1。
+    ///
+    /// 兜底：XPC 没送到（helper 已经崩了/不在线）时直接 bootout 掉 launchd job。
+    /// 注意不能用 kill —— 进程死了 KeepAlive 照样拉起，必须摘 job。
+    func shutdownAll() async {
+        // 先掐掉 kext 看门狗：它每 2~20 秒会 ping 一次 helper，万一在退出途中
+        // 抢先把 XPC 又连上去，launchd 就会把刚退出的 helper 重新按需拉起 ——
+        // 那就前功尽弃了。
+        kextWatch?.cancel()
+        kextWatch = nil
+        diag("退出控制台：请求 helper 交还硬件并退出")
+        let r = await HelperClient.shared.post("/api/helper/quit-all", [:], timeout: 4)
+        if r["ok"] as? Bool != true {
+            diag("helper 未确认 quit-all（可能已离线）→ 兜底 bootout")
+            let uid = getuid()
+            _ = NativeProc.runCapture("/bin/launchctl",
+                                      ["bootout", "gui/\(uid)/\(mcHelperServiceName)"])
+        }
+        HelperClient.shared.reset()
+        helperOnline = false
+        diag("helper 已退出，控制台即将关闭")
     }
 
     // MARK: - kext 检测与安装

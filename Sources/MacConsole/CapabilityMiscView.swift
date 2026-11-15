@@ -1,17 +1,15 @@
 import SwiftUI
 import ServiceManagement
 
-/// 系统页：版本 / 外观 / 通用（开机自启）/ 菜单栏监控图标
-/// （2026-10-19 v2.4.2：删除「能力矩阵」整页；「磁盘·df」「HID 设备」两卡删除，
-///  「进程·CPU 占用 Top」移到监控页最下方（2.7.6 起该卡已从监控页删除）。
-///  v2.4.3：新增「外观」卡——浅色/深色/随系统。
-///  v2.4.5：菜单栏卡新增「CPU / GPU 显示指标」切换（温度/占用率，默认温度）。
-///  2.7.6：删除「能力边界」卡；新增「静默启动」。
-///  2.8.15：删除「静默启动」（用户：没用了）——开机自启只剩 mainApp 一条。）
+/// 设置页：外观与通用 / 版本 / 菜单栏监控图标 / 系统调整 / 系统与启动参数
+/// （2026-11-14 用户要求：
+///   ① 删「后台服务」整卡；② 外观与通用挪到原后台服务的位置（左上）；
+///   ③ 外观与通用里的「显卡路由」段迁入「系统调整」卡；
+///   ④ 「系统与启动参数」从概览页迁来本页最下方。）
 struct MiscView: View {
     @EnvironmentObject var backend: BackendService
     @EnvironmentObject var store: MonitorStore
-    // 开机自启（SMAppService，替代旧「Mac控制台开机启动.app」独立 toggle）
+    // 开机自启（SMAppService，替代旧「Sky CC开机启动.app」独立 toggle）
     @State private var launchAtLogin = false
     @State private var launchNote: String?
     // 外观（v2.4.3：浅色 / 深色 / 随系统，UserDefaults 持久化）
@@ -21,18 +19,21 @@ struct MiscView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 header
-                // 2.7.2 重排：左「后台服务 + 菜单栏图标」，右「版本 + 外观与通用」。
-                // 2.7.6：原第三行「能力边界」通栏卡删除。
+                // 2026-11-14（用户要求）：删「后台服务」卡，外观与通用挪到左上；
+                // 菜单栏图标单独一张通栏；系统调整 + 系统与启动参数置底。
                 Grid(horizontalSpacing: 14, verticalSpacing: 14) {
                     GridRow {
-                        helperCard.gridEqual()
+                        generalCard.gridEqual()
                         aboutCard.gridEqual()
                     }
                     GridRow {
-                        menuBarCard.gridEqual()
-                        generalCard.gridEqual()
+                        menuBarCard.gridEqual().gridCellColumns(2)
                     }
                 }
+                // 「系统调整」整卡（显卡路由已并入，见 SystemTweakCard.swift）
+                SystemTweakSection()
+                // 「系统与启动参数」（自概览页迁来，用户要求置底）
+                BootArgsCard()
             }
             .padding(22)
         }
@@ -43,44 +44,8 @@ struct MiscView: View {
         }
     }
 
-    /// 后台 helper 状态（2.6.0 起硬件读写全在它身上，UI 只是客户端）
-    private var helperCard: some View {
-        Card(title: "后台服务") {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 8) {
-                    Circle()
-                        .fill(backend.helperOnline ? Theme.green : Theme.red)
-                        .frame(width: 7, height: 7)
-                    Text(backend.helperOnline ? "运行中" : "未运行")
-                        .font(.system(size: 12.5, weight: .medium))
-                    if let v = backend.helperVersion {
-                        Text("v\(v)").font(.system(size: 11).monospacedDigit())
-                            .foregroundStyle(Theme.dim2)
-                    }
-                    if let pid = backend.helperPid {
-                        Text("pid \(pid)").font(.system(size: 11).monospacedDigit())
-                            .foregroundStyle(Theme.dim2)
-                    }
-                    Spacer()
-                    Button("重启") {
-                        Task { await backend.restartHelper() }
-                    }
-                    .controlSize(.small)
-                }
-                Text("EC / SMC / 键盘灯 / 亮度的唯一读写者。界面关闭或崩溃都不影响它——"
-                     + "风扇曲线由它继续守护，崩溃后 launchd 会自动拉起。")
-                    .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .cardNote()
-                if !backend.helperOnline, let e = backend.lastError {
-                    Text(e).font(.system(size: 10.5)).foregroundStyle(Theme.amber)
-                }
-            }
-        }
-    }
-
     private var header: some View {
-        PageHeader(title: "设置", sub: "后台服务 · 菜单栏图标 · 外观与开机")
+        PageHeader(title: "设置", sub: "外观与通用 · 菜单栏图标 · 系统调整 · 系统与启动参数")
     }
 
     // MARK: - 版本信息（2026-10-19：版本号搬进系统页，方便核对装的是哪一版）
@@ -89,7 +54,7 @@ struct MiscView: View {
         let os = BackendService.dict(store.overview, "os")
         return Card(title: "版本") {
             VStack(spacing: 0) {
-                KVRow(key: "控制台版本", value: "Mac控制台 \(AppVersion.short) (Build \(AppVersion.build))")
+                KVRow(key: "控制台版本", value: "Sky CC \(AppVersion.short) (Build \(AppVersion.build))")
                 KVRow(key: "硬件后端", value: "MacConsole/1.0 · \(AppVersion.backend)")
                 KVRow(key: "运行系统", value: "\(BackendService.string(os, "name") ?? "macOS") \(BackendService.string(os, "version") ?? "—") (\(BackendService.string(os, "build") ?? "—"))")
                 KVRow(key: "机型", value: BackendService.string(store.overview, "model") ?? "—")
@@ -112,6 +77,24 @@ struct MiscView: View {
             }
         }
     }
+
+/// 状态栏主图标风格（2026-11-14 用户要求）：随系统（黑色模板）/ 白色 / 彩色。
+/// 与菜单栏图标（MenuBarLabel）共用同一个 @AppStorage 键，改这里立即生效。
+private struct MenuBarIconStylePicker: View {
+    @AppStorage(UIControlPrefs.K.menubarIcon) private var style = "auto"
+
+    var body: some View {
+        Picker("", selection: $style) {
+            Text("随系统").tag("auto")
+            Text("浅色").tag("white")   // 白色固定切图（用户指定命名「浅色」，键仍为 white）
+            Text("彩色").tag("color")
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .controlSize(.small)
+        .frame(width: 168)
+    }
+}
 
 /// 单个图标一行：图标 + 名称 +（可选）指标分段 +（硬盘）选盘 + 开关
 private struct MenuBarIconToggleRow: View {
@@ -214,20 +197,29 @@ private struct MenuBarDiskPicker: View {
 
     // MARK: - 开机自启（SMAppService）
     //
-    // 2026-10-17：从「Mac控制台开机启动.app」（AppleScript toggle + autostart.sh
+    // 2026-10-17：从「Sky CC开机启动.app」（AppleScript toggle + autostart.sh
     // 的 LaunchAgent）迁移到 app 内设置。SMAppService 注册的登录项与
     // 系统设置 → 通用 → 登录项 是同一份数据，只是管理入口挪到了 app 里。
     private var generalCard: some View {
         Card(title: "外观与通用") {
             VStack(alignment: .leading, spacing: 12) {
-                // 外观（2.7.5 从独立卡并入）
-                Picker("外观", selection: $appearance) {
-                    ForEach(AppAppearance.allCases) { m in
-                        Text(m.label).tag(m)
+                // 外观（2.7.5 从独立卡并入）。2026-11-14（用户要求）：
+                // 顺序改为 随系统/浅色/深色；再改：按钮缩到与「状态栏主图标」
+                // 一致（168 宽 small），右对齐，同行左侧加「外观」文字。
+                // （不用 allCases —— 枚举声明序是 light/dark/system，那是存储顺序不动）
+                HStack(spacing: 8) {
+                    Text("外观").font(.system(size: 12.5, weight: .medium))
+                    Spacer(minLength: 4)
+                    Picker("", selection: $appearance) {
+                        Text("随系统").tag(AppAppearance.system)
+                        Text("浅色").tag(AppAppearance.light)
+                        Text("深色").tag(AppAppearance.dark)
                     }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .controlSize(.small)
+                    .frame(width: 168)
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
                 .onChange(of: appearance) { _, new in
                     new.apply()
                     UserDefaults.standard.set(new.rawValue, forKey: AppAppearance.defaultsKey)
@@ -240,15 +232,19 @@ private struct MenuBarDiskPicker: View {
                 Divider().overlay(Theme.line)
 
                 if #available(macOS 13.0, *) {
-                    Toggle(isOn: $launchAtLogin) {
+                    // 2026-11-14（用户要求）：开关右对齐，不再跟在文字后面
+                    HStack(alignment: .top, spacing: 8) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("开机自动启动").font(.system(size: 12.5, weight: .medium))
-                            Text("登录后自动打开 Mac控制台（菜单栏常驻 + 硬件后台服务）")
+                            Text("登录后自动打开 Sky CC（菜单栏常驻 + 硬件后台服务）")
                                 .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
                                 .cardNote()
                         }
+                        Spacer(minLength: 4)
+                        Toggle("", isOn: $launchAtLogin)
+                            .toggleStyle(.switch)
+                            .labelsHidden()
                     }
-                    .toggleStyle(.switch)
                     .onChange(of: launchAtLogin) { _, _ in
                         applyAutostart()
                     }
@@ -257,7 +253,7 @@ private struct MenuBarDiskPicker: View {
                         Text(note).font(.system(size: 10.5)).foregroundStyle(Theme.amber)
                             .fixedSize(horizontal: false, vertical: true)
                     }
-                    Text("与系统设置 → 通用 → 登录项 中的「Mac控制台」同步。")
+                    Text("与系统设置 → 通用 → 登录项 中的「Sky CC」同步。")
                         .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
                         .fixedSize(horizontal: false, vertical: true)
                         .cardNote()
@@ -265,6 +261,18 @@ private struct MenuBarDiskPicker: View {
                     Text("开机自动启动需要 macOS 13 或更高版本。")
                         .font(.system(size: 11)).foregroundStyle(Theme.dim)
                 }
+
+                // 2026-11-14（用户要求）：状态栏主图标风格，放本卡（外观与通用）。
+                // auto = 黑色模板图随菜单栏深浅色反色；white/color 为固定风格切图。
+                // @AppStorage 直连 UserDefaults，菜单栏图标（MenuBarLabel）立即跟随。
+                HStack(spacing: 8) {
+                    // 2026-11-14（用户要求）：文字颜色与「开机自动启动」一致（主色，不再置灰）
+                    Text("状态栏主图标").font(.system(size: 12.5, weight: .medium))
+                    Spacer(minLength: 4)
+                    MenuBarIconStylePicker()
+                }
+
+                // 2026-11-14（用户要求）：显卡路由段从本卡迁入「系统调整」卡尾部。
             }
         }
     }

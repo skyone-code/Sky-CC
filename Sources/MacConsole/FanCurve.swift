@@ -102,9 +102,9 @@ final class FanCurveController: ObservableObject {
     /// 2.7.6：控制环与「退出曲线模式」之间的竞态闸门。
     ///
     /// 以前 stop() 只是 cancel + 把 loop 置 nil，但 tick() 可能正跑到一半：
-    /// 它算完目标档位后调 fc.setLevel()，这一步会**重新打开 CTRL_1 手动门**并把
+    /// 它算完目标档位后调 fc.setLevel()，这一步会**重新断言接管标志**并把
     /// FAN_CTRL 写回 0x80|档位——如果它恰好落在 setMode("normal") 之后，
-    /// EC 的手动门就被重新打开了，界面表现为「从曲线切不回自动」。
+    /// 0x751 就被写回手动档了，界面表现为「从曲线切不回自动」。
     /// 用户当时靠「先点手动再点自动」绕过去，正是因为第二次 stop() 之后没有
     /// 在途 tick 了。
     ///
@@ -130,17 +130,17 @@ final class FanCurveController: ObservableObject {
         loop = nil
         // 栅栏：等在途 tick 的写事务收尾，之后 running=false 才生效
         writeGate.sync { self.running = false }
-        // 曲线运行期间每一笔 setLevel() 都会打开 CTRL_1 手动门（0x741 bit0）。
-        // 2.8.14（用户要求）：**退出曲线必须把门关上**，否则 benchmarkMode() 恒为真，
-        // 控制页的散热档 / 功耗档会被全部挡掉（表现为「点了没反应」）。
-        // 关门走安全顺序（先放档位 0x751←0x00，再清门），不会触发 FAN_ABNORMAL。
-        let doorHeld = appliedLevel >= 0   // 99 = 高温兜底的 boost，同样算「我们开过门」
+        // 曲线运行期间每一笔 setLevel() 都会断言 0x741 bit0（AP exist / 控制中心接管）。
+        // 2.8.14（用户要求）：**退出曲线必须把 0x751 交还**，否则界面一直显示「自定义档」，
+        // 控制页的散热档 / 功耗档点了没反应。
+        // 交还走安全顺序（先放档位 0x751←0x00，再确认接管标志在位），不触发 FAN_ABNORMAL。
+        let doorHeld = appliedLevel >= 0   // 99 = 高温兜底的 boost，同样算「我们改过档位」
         appliedLevel = -1
         DispatchQueue.main.async { self.active = false }
         if doorHeld {
             let r = FanControl.shared.releaseManualDoor()
             if r?.ok != true {
-                NSLog("[FanCurve] 退出手动门失败 status=%d（不影响曲线已停）", r?.status ?? -99)
+                NSLog("[FanCurve] 交还风扇档位失败 status=%d（不影响曲线已停）", r?.status ?? -99)
             }
         }
     }

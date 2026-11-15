@@ -1,11 +1,11 @@
 #!/bin/zsh
 # ============================================================================
-# build-swift.sh —— 一键构建「Mac控制台」SwiftUI 原生 app + DMG 安装器
+# build-swift.sh —— 一键构建「Sky CC」SwiftUI 原生 app + DMG 安装器
 #
 # 产物（都在本目录）：
-#   Mac控制台-安装器-<版本>-LAPQC71专版.dmg   拖拽式安装器
-#     ├─ Mac控制台.app           原生 SwiftUI 主程序（kext 已内嵌在 bundle 里）
-#     ├─ 卸载Mac控制台.command    彻底卸载器
+#   Sky CC-安装器-<版本>-LAPQC71x.dmg   拖拽式安装器
+#     ├─ Sky CC.app           原生 SwiftUI 主程序（kext 已内嵌在 bundle 里）
+#     ├─ 卸载Sky CC.command    彻底卸载器
 #     ├─ 说明.txt
 #     └─ Applications            拖拽目标别名
 #
@@ -33,7 +33,13 @@ BUILD="$(cd "$(dirname "$0")" && pwd)"
 SWIFT="$BUILD"   # Swift 源码在 $BUILD/Sources/MacConsole/（接手包布局，无 swift/ 子目录）
 # staging 目录可用环境变量改到 /tmp：本机文件策略会拦截「删除/重命名」已存在的
 # app bundle（file-delete / rename source refused），原地重建会一直失败。
-STAGE="${MC_STAGE:-$BUILD/swift-stage}"
+#
+# ⚠️ 2026-11-11：项目位于 /Volumes/TEMP（**exfat**），该卷挂载带 noowners、
+# 权限恒为 700，chmod 在它上面**完全无效**。staging / payload 若留在项目目录，
+# pkgbuild 会把 700 原样打进 payload，装完 app 普通用户读不到 Info.plist，
+# 直接起不来（表现为「双击没反应 / PlistBuddy Does Not Exist」）。
+# 所以默认全部落到 APFS 的 /tmp，产物 DMG/PKG 仍输出到项目目录。
+STAGE="${MC_STAGE:-/tmp/mc-build/stage}"
 # 后端资源（kext / 助手二进制 / 恢复脚本）住在 app-resources/。
 # 本轮清理之前这个目录叫 python后端/ —— 那是 2.0 时代内置 Python 后端的名字，
 # 2.6.0 去 Python 化之后名不副实，已随遗留清理改名。
@@ -44,9 +50,9 @@ PROJ="$BUILD/app-resources"
 [ -d "$PROJ" ] || { echo "错误：找不到资源目录 $PROJ" >&2; exit 1; }
 
 # 版本号（唯一来源：脚本注入 Info.plist 与 helper 的 BuildVersion.swift）
-VERSION="3.0.3.1"
+VERSION="3.0.5"
 # 显示版本（侧边栏/设置页文案）：数字版本 + 专用版标识
-DISPLAY_VERSION="$VERSION LAPQC71专版"
+DISPLAY_VERSION="$VERSION LAPQC71x"
 # nvmetemp（NVMe 硬盘温度，SMART）——有现成二进制就用，
 # 源码更新则现场重编。
 # ⚠️ 2026-10-22：该工具的 C 源码全盘已找不到（原先两个外部路径都已失效），
@@ -96,11 +102,11 @@ nvmesmart_build
 
 # 开机 kext 加载器（2.8.15）：取代守护里直接 exec /usr/bin/kmutil ——
 # 那样 launchd 会把它显示成「系统设置 → 登录项」里一条来路不明的 "kmutil"。
-# 用自己的二进制，显示名就变成「Mac控制台散热扩展」。
+# 用自己的二进制，显示名就变成「Sky CC散热扩展」。
 # 装到 /Library/PrivilegedHelperTools/（root 属主，不随 app 一起被删）。
 mckextload_build() {
   local src="$BUILD/Tools/mckextload.c"
-  local out="$PROJ/bin/Mac控制台散热扩展"
+  local out="$PROJ/bin/Sky CC散热扩展"
   [[ -f "$src" ]] || { echo "警告：缺少 Tools/mckextload.c，开机将无法自动加载 kext" >&2; return; }
   if [[ ! -x "$out" || "$src" -nt "$out" ]]; then
     mkdir -p "$PROJ/bin"
@@ -116,15 +122,20 @@ mckextload_build() {
 }
 mckextload_build
 
-APP="$STAGE/Applications/Mac控制台.app"
+APP="$STAGE/Applications/Sky CC.app"
 RES="$APP/Contents/Resources"
 NATIVE="$RES/native"          # 2.5.0 起：随包原生资源（旧版叫 python/）
-DMGROOT="${MC_DMGROOT:-$BUILD/swift-dmgroot}"
+DMGROOT="${MC_DMGROOT:-/tmp/mc-build/dmgroot}"
+# pkg 的 payload 根：结构与安装后的绝对路径一致（Applications/、Library/…），
+# pkgbuild --install-location / 直接摊到系统根上。
+PKGROOT="${MC_PKGROOT:-/tmp/mc-build/pkgroot}"
+PKGSCRIPTS="${MC_PKGSCRIPTS:-/tmp/mc-build/pkgscripts}"
+PKGOUT="$BUILD/Sky CC-安装器-$VERSION-LAPQC71x.pkg"
 
 echo "==> 1/8 清理并重建 staging"
 # 用 find -delete 而不是 rm -rf：本机安全钩子对 rm 系命令的备份暂存目录
 # 权限异常（root 属主），会误拦构建清理；staging 全是可再生产物，直接清内容即可
-for d in "$STAGE" "$DMGROOT"; do
+for d in "$STAGE" "$DMGROOT" "$PKGROOT" "$PKGSCRIPTS"; do
   if [[ -d "$d" ]]; then
     find "$d" -mindepth 1 -delete 2>/dev/null || true
   fi
@@ -155,8 +166,8 @@ if [[ -n "${MC_MODCACHE:-}" ]]; then
   MODCACHE_ARGS=(-module-cache-path "$MC_MODCACHE")
 fi
 SWIFTC_MAIN=(swiftc -O -parse-as-library -target x86_64-apple-macosx14.0 \
-  "${MODCACHE_ARGS[@]}" \
-  -o "$APP/Contents/MacOS/Mac控制台" \
+  ${MODCACHE_ARGS[@]+"${MODCACHE_ARGS[@]}"} \
+  -o "$APP/Contents/MacOS/Sky CC" \
   "$SWIFT"/Sources/Shared/*.swift \
   "$SWIFT"/Sources/MacConsole/*.swift "$SWIFT"/Sources/MacConsole/Native/*.swift)
 m=0; MAXTRY=3
@@ -179,7 +190,7 @@ done
 echo "==> 3/8 编译 mcutil（硬件命令行助手，复用 Native 层）"
 # 不加 -parse-as-library：main.swift 需要顶层代码（否则
 # "expressions are not allowed at the top level"）。
-swiftc -O -target x86_64-apple-macosx14.0 "${MODCACHE_ARGS[@]}" \
+swiftc -O -target x86_64-apple-macosx14.0 ${MODCACHE_ARGS[@]+"${MODCACHE_ARGS[@]}"} \
   -o "$APP/Contents/MacOS/mcutil" \
   "$SWIFT"/Sources/Shared/*.swift \
   "$SWIFT"/Sources/mcutil/main.swift "$SWIFT"/Sources/MacConsole/Native/*.swift "$SWIFT"/Sources/MacConsole/FanCurve.swift
@@ -187,11 +198,19 @@ swiftc -O -target x86_64-apple-macosx14.0 "${MODCACHE_ARGS[@]}" \
 echo "==> 3.5/8 编译 MacConsoleHelper（唯一持有 EC/SMC/HID 的后台进程）"
 # 与主程序同一套 Native 层源码，但自己带 main.swift：它是 launchd 拉起的
 # LaunchAgent，不是 app 的子进程，所以不能依赖 NSApplication。
-swiftc -O -target x86_64-apple-macosx14.0 "${MODCACHE_ARGS[@]}" \
+swiftc -O -target x86_64-apple-macosx14.0 ${MODCACHE_ARGS[@]+"${MODCACHE_ARGS[@]}"} \
   -o "$APP/Contents/MacOS/MacConsoleHelper" \
   "$SWIFT"/Sources/Shared/*.swift \
   "$SWIFT"/Sources/MacConsoleHelper/main.swift \
   "$SWIFT"/Sources/MacConsole/Native/*.swift "$SWIFT"/Sources/MacConsole/FanCurve.swift
+
+echo "==> 3.6/8 编译 gpu-router.dylib（GPU 路由：把 Metal 默认设备重定向到独显）"
+# 「控制 → 显卡」那个开关就是靠它。缺了它 /api/gpu 会报 dylibPresent=false，
+# 开关点不亮 —— 所以这里失败必须让整个构建失败，不能静默跳过。
+clang -dynamiclib -O2 -fobjc-arc -target x86_64-apple-macosx14.0 \
+  -framework Foundation -framework Metal \
+  -o "$RES/gpu-router.dylib" "$SWIFT"/Sources/GPURouter/gpu-router.m
+codesign --force --sign - "$RES/gpu-router.dylib"
 
 echo "==> 4/8 组装 app bundle（原生资源，无 Python）"
 cp -R "$PROJ/TongfangFan.kext" "$NATIVE/"
@@ -205,15 +224,21 @@ if [[ -x "$PROJ/bin/nvmesmart" ]]; then
 fi
 # 开机 kext 加载器：install-kext.sh 会把它装到 /Library/PrivilegedHelperTools/，
 # 由 LaunchDaemon com.macconsole.TongfangFan 以 root 调用
-if [[ -x "$PROJ/bin/Mac控制台散热扩展" ]]; then
-  cp "$PROJ/bin/Mac控制台散热扩展" "$NATIVE/bin/Mac控制台散热扩展"
-  chmod 755 "$NATIVE/bin/Mac控制台散热扩展"
+if [[ -x "$PROJ/bin/Sky CC散热扩展" ]]; then
+  cp "$PROJ/bin/Sky CC散热扩展" "$NATIVE/bin/Sky CC散热扩展"
+  chmod 755 "$NATIVE/bin/Sky CC散热扩展"
 fi
 cp "$BUILD/templates/install-kext.sh"  "$NATIVE/scripts/install-kext.sh"
 cp "$BUILD/templates/ensure-agents.sh" "$NATIVE/scripts/ensure-agents.sh"
 cp "$PROJ/restore_rgb.sh" "$NATIVE/restore_rgb.sh"
 chmod 755 "$NATIVE/scripts/"*.sh "$NATIVE/restore_rgb.sh"
 cp "$BUILD/icons/AppIcon.icns" "$RES/AppIcon.icns"
+# 菜单栏主图标：app 图标里的 S 飘带（模板图，MenuBarExtra 用）
+cp "$BUILD/icons/MenuSIconTemplate.png" "$RES/MenuSIconTemplate.png"
+cp "$BUILD/icons/MenuSIconWhite.png" "$RES/MenuSIconWhite.png"
+cp "$BUILD/icons/MenuSIconColor.png" "$RES/MenuSIconColor.png"
+# NVIDIA 品牌 logo（用户提供的 24x24 绿眼 SVG，侧栏与 NVIDIA 页用）
+cp "$BUILD/icons/NvidiaLogo.svg" "$RES/NvidiaLogo.svg"
 cp "$BUILD/templates/Info.plist" "$APP/Contents/Info.plist"
 # 版本号统一由脚本顶部 VERSION 注入，避免模板硬编码与脚本不同步（2.3.1 曾因此跑偏）
 # CFBundleVersion 必须保持纯数字：BackendService 用它跟 helper 的 BuildVersion 比对，
@@ -235,7 +260,15 @@ cat > "$APP/Contents/Library/LaunchAgents/com.macconsole.helper.plist" <<'PLIST'
   <key>MachServices</key>
   <dict><key>com.macconsole.helper</key><true/></dict>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <!-- 2026-11-13：从 true 改成 SuccessfulExit=false。
+       true 的语义是「进程一退就无条件拉起」，导致「退出控制台」永远关不掉 helper
+       （前脚 exit(0)，launchd 2 秒后就把新实例拉起来，0x741 bit0 又被置回 1）。
+       改成只看退出码：正常退出（0）不再拉起，崩溃 / 被 kill（非 0）照旧自愈；
+       升级重启走 /api/helper/shutdown 的 exit(75)，仍然会被拉起来。
+       正常退出后 MachServices 仍然占着 com.macconsole.helper 这个名字，
+       下次 app 连 XPC 时 launchd 会按需把 helper 启动回来，不需要重新注册。 -->
+  <key>KeepAlive</key>
+  <dict><key>SuccessfulExit</key><false/></dict>
   <key>ProcessType</key><string>Interactive</string>
   <key>ThrottleInterval</key><integer>2</integer>
 </dict>
@@ -271,29 +304,63 @@ codesign --force --sign - "$APP/Contents/MacOS/MacConsoleHelper"
 codesign --force --deep --sign - "$APP"
 codesign --verify "$APP" && echo "签名校验通过"
 
-echo "==> 7/8 组装 DMG 内容"
+echo "==> 7/8 组装 pkg payload（app + gpu-router.dylib）"
+# 为什么改成 pkg：注入库必须落在 /Library/GPUBundles —— App Sandbox 的白名单里
+# 只有 /Library 下的路径可读；放到 /usr/local/lib 会让 QQ、微信这类沙箱 app
+# 在 dyld 加载阶段被沙箱拒绝（termination: DYLD / file system sandbox blocked open）
+# 直接 SIGABRT 闪退。这个目录 root:wheel 755，普通用户写不进去，
+# 只能靠 Installer 以 root 安装 —— 这就是 pkg 存在的理由。
+mkdir -p "$PKGROOT/Applications" "$PKGROOT/Library/GPUBundles"
+cp -R "$APP" "$PKGROOT/Applications/"
+install -m 644 "$RES/gpu-router.dylib" "$PKGROOT/Library/GPUBundles/gpu-router.dylib"
+
+# ⚠️ 权限归位（必须）：构建环境的 umask 是 077，staging 里所有文件都是 700 root:wheel。
+# pkgbuild 会把这些权限原样打进 payload，装完普通用户读不到 Contents/Info.plist，
+# app 直接起不来（PlistBuddy 报 "Does Not Exist"、LaunchServices 拒开）。
+# a+rX = 所有人可读、目录和已有可执行文件保留 x；go-w = 去掉组/其他人写权限。
+chmod -R a+rX,go-w "$PKGROOT"
+
+mkdir -p "$PKGSCRIPTS"
+install -m 755 "$BUILD/templates/pkg-preinstall"  "$PKGSCRIPTS/preinstall"
+install -m 755 "$BUILD/templates/pkg-postinstall" "$PKGSCRIPTS/postinstall"
+
+rm -f "$PKGOUT"
+pkgbuild --root "$PKGROOT" \
+         --identifier com.macconsole.installer \
+         --version "$VERSION" \
+         --scripts "$PKGSCRIPTS" \
+         --install-location / \
+         --ownership recommended \
+         "$PKGOUT" > /dev/null
+echo "    pkg: $PKGOUT"
+
+echo "==> 8/8 组装 DMG 内容"
 mkdir -p "$DMGROOT"
-cp -R "$APP" "$DMGROOT/"
+cp "$PKGOUT" "$DMGROOT/$(basename "$PKGOUT")"
+# 权限必须显式给：本机 umask 077 会让 pkg 变成 700，别人挂载这个 DMG 时
+# 可能读不到（Installers 直接失败），分发出去就是废的
+chmod 755 "$DMGROOT/$(basename "$PKGOUT")"
 # 2.8.12（用户要求）：kext 与「安装散热控制.command」不再放 DMG 顶层 ——
 # kext 本体已经在 app 的 Contents/Resources/native/ 里，缺 kext 时 app 内
 # 点「立即安装」即可，用户不需要在磁盘映像里找文件。
-cp "$BUILD/templates/卸载.command" "$DMGROOT/卸载Mac控制台.command"
-chmod 755 "$DMGROOT/卸载Mac控制台.command"
+cp "$BUILD/templates/卸载.command" "$DMGROOT/卸载Sky CC.command"
+chmod 755 "$DMGROOT/卸载Sky CC.command"
 cp "$BUILD/templates/说明.txt" "$DMGROOT/说明.txt"
-ln -s /Applications "$DMGROOT/Applications"
+chmod 644 "$DMGROOT/说明.txt"
 
 if [[ "${MC_SKIP_DMG:-0}" == "1" ]]; then
   echo "==> 8/8 跳过 DMG（MC_SKIP_DMG=1）"
   echo
+  echo "完成（仅 pkg）：$PKGOUT"
   echo "完成（仅 app）：$APP"
   exit 0
 fi
 
 echo "==> 8/8 打 DMG"
-hdiutil create -volname "Mac控制台安装器" -srcfolder "$DMGROOT" -ov -format UDZO \
-  "$BUILD/Mac控制台-安装器-$VERSION-LAPQC71专版.dmg" | tail -1
-hdiutil verify "$BUILD/Mac控制台-安装器-$VERSION-LAPQC71专版.dmg" >/dev/null && echo "DMG 校验通过"
+hdiutil create -volname "Sky CC安装器" -srcfolder "$DMGROOT" -ov -format UDZO \
+  "$BUILD/Sky CC-安装器-$VERSION-LAPQC71x.dmg" | tail -1
+hdiutil verify "$BUILD/Sky CC-安装器-$VERSION-LAPQC71x.dmg" >/dev/null && echo "DMG 校验通过"
 
 echo
-echo "完成：$BUILD/Mac控制台-安装器-$VERSION-LAPQC71专版.dmg"
+echo "完成：$BUILD/Sky CC-安装器-$VERSION-LAPQC71x.dmg"
 echo "  app 内已无 Python、无 HTTP：硬件后端在 MacConsoleHelper（XPC），助手为 mcutil + 三个编译型二进制"

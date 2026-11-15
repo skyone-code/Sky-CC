@@ -1,6 +1,6 @@
 #!/bin/zsh
 # ============================================================================
-# install-kext.sh —— Mac控制台.app 内置的内核扩展安装脚本
+# install-kext.sh —— Sky CC.app 内置的内核扩展安装脚本
 #
 # 调用方式：由 launcher 经
 #   osascript -e "do shell script \"bash <本脚本>\" with administrator privileges"
@@ -24,7 +24,7 @@ DAEMON_PLIST="/Library/LaunchDaemons/com.macconsole.TongfangFan.plist"
 # 放 app 自己的支持库：/Library/PrivilegedHelperTools 与 /usr/local/bin 在本机
 # 被 SIP 挡住（root 都 EACCES），只有支持库可写。
 # 注意：本脚本以 root 运行，$HOME 是 /var/root，必须从控制台用户反查真实家目录。
-LOADER_SRC="$HERE/bin/Mac控制台散热扩展"
+LOADER_SRC="$HERE/bin/Sky CC散热扩展"
 CONSOLE_USER="$(stat -f %Su /dev/console 2>/dev/null)"
 USER_HOME=""
 if [[ -n "$CONSOLE_USER" && -d "/Users/$CONSOLE_USER" ]]; then
@@ -32,7 +32,7 @@ if [[ -n "$CONSOLE_USER" && -d "/Users/$CONSOLE_USER" ]]; then
 else
   USER_HOME="${HOME:-/var/root}"
 fi
-LOADER_DST="$USER_HOME/Library/Application Support/MacConsole/bin/Mac控制台散热扩展"
+LOADER_DST="$USER_HOME/Library/Application Support/MacConsole/bin/Sky CC散热扩展"
 LOG="/tmp/macconsole-kext-install.log"
 
 # 既写日志又把输出留给调用方（osascript 只回传 stdout，全导进日志的话
@@ -70,7 +70,7 @@ $SUDO kmutil load -p "$KEXT_DST" 2>&1 | sed 's/^/    /'
 
 echo "→ 3/4 安装开机自动加载（LaunchDaemon + 自有加载器）"
 # 2.8.15：先把自己这一份加载器放到控制台的支持库，再让守护指向它。
-# 这样「登录项」里显示的是「Mac控制台散热扩展」而不是来路不明的 kmutil。
+# 这样「登录项」里显示的是「Sky CC散热扩展」而不是来路不明的 kmutil。
 #
 # 2.8.15 修正：原来这里 mkdir 的是 /Library/PrivilegedHelperTools，而拷贝目标是
 # 用户支持库 —— 新机器上那个目录还不存在，cp 静默失败后 DAEMON_PROG 指向不存在的

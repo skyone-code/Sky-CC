@@ -1,0 +1,39 @@
+#!/bin/sh
+# ---------------------------------------------------------------------------
+# postinstall —— 由 Installer（root）在解开 payload 之后调用
+#
+# payload 已经把这些文件放到对应位置：
+#   /Applications/Mac控制台.app
+#   /Library/GPUBundles/gpu-router.dylib
+#
+# 这里只做两件 payload 表达不了的事：
+#   ① 把 dylib 的属主/权限钉死成 root:wheel 644
+#      —— 644 是关键：App Sandbox 进程要能**读**它；root:wheel 防止被普通用户换掉。
+#   ② 在 /usr/local/lib 建一条软链指过来（兼容旧版 app 写死的旧路径，
+#      也兼容用户手工 launchctl setenv 到老位置的习惯）
+# ---------------------------------------------------------------------------
+set -u
+
+LIBDIR=/Library/GPUBundles
+DYLD=$LIBDIR/gpu-router.dylib
+LEGACY=/usr/local/lib/gpu-router.dylib
+
+/bin/mkdir -p "$LIBDIR"
+/usr/sbin/chown root:wheel "$LIBDIR" "$DYLD" 2>/dev/null || true
+/bin/chmod 755 "$LIBDIR" 2>/dev/null || true
+/bin/chmod 644 "$DYLD" 2>/dev/null || true
+
+/bin/mkdir -p /usr/local/lib
+# -f 会把旧的普通文件解链再建软链；目标不存在时也照样建
+/bin/ln -sfn "$DYLD" "$LEGACY" 2>/dev/null || true
+/usr/sbin/chown -h root:wheel "$LEGACY" 2>/dev/null || true
+
+# 装完把版本和落点写进日志，方便事后排查
+{
+  echo "== Mac控制台 安装 $(/bin/date '+%Y-%m-%d %H:%M:%S') =="
+  /bin/ls -la "$DYLD" 2>&1
+  /bin/ls -la "$LEGACY" 2>&1
+  /usr/bin/shasum -a 256 "$DYLD" 2>&1
+} >> /tmp/macconsole-gpu-router-install.log 2>&1
+
+exit 0

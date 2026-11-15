@@ -1,7 +1,7 @@
 import SwiftUI
 import AppKit
 
-/// 开发用离屏渲染：`Mac控制台 --ui-shots <目录>` → 把各页渲染成 PNG 后退出。
+/// 开发用离屏渲染：`Sky CC --ui-shots <目录>` → 把各页渲染成 PNG 后退出。
 ///
 /// 为什么需要：本机是双 GPU 镜像 + 多 Space 环境，`screencapture` 抓不到
 /// 落在别的 Space 上的窗口；ImageRenderer 直接把 SwiftUI 视图树画进位图，
@@ -48,7 +48,7 @@ enum UIShot {
             ("02-性能", AnyView(page(MonitorView()))),
             ("03-控制", AnyView(page(ControlView()))),
             ("04-灯效", AnyView(page(RGBView()))),
-            ("05-实验性", AnyView(page(ExperimentalView()))),
+            ("05-NVIDIA驱动", AnyView(page(NvidiaView()))),
             ("06-设置", AnyView(page(MiscView()))),
         ]
 

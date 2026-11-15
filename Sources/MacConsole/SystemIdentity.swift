@@ -1,0 +1,453 @@
+//
+//  SystemIdentity.swift
+//  Sky CC —— 设备身份信息（原「概览」页拆出的公共组件）
+//
+//  3.0.3.7 合并（用户要求「概览和性能两页合成一页，去掉概览」）：
+//   · 概览页 6 个 KPI 有 5 个与性能页重复（CPU 使用率/温度、内存、GPU 使用率/温度），
+//     全部随页删除 —— 性能页的对应卡片更详细。
+//   · hero 条精简成 MonitorHeroBar，挪到性能页顶部。
+//   · 设备 / 本机 / 系统与启动参数三张身份卡挪到「设置」页顶部
+//     （全部信息页在侧栏是隐藏的，放那里没人看得见）。
+//
+//  3.0.4.5（2026-11-14 用户要求）：恢复「概览」页 —— 身份卡 + 存储/电池/风扇
+//  集中到 OverviewView；MonitorHeroBar 返回概览页顶部。
+//  同日追加：设备 / 本机两张身份卡留在概览页；「系统与启动参数」抽成独立的
+//  BootArgsCard，迁去「设置」页最下方（用户要求）。
+//
+
+import SwiftUI
+import AppKit
+
+// MARK: - 性能页顶部的 hero 条（原概览页 hero 的精简版）
+
+struct MonitorHeroBar: View {
+    @EnvironmentObject var store: MonitorStore
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 14) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Theme.accentGradient)
+                    .frame(width: 44, height: 44)
+                Image(systemName: "laptopcomputer")
+                    .font(.system(size: 19, weight: .light))
+                    .foregroundStyle(.white)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(machineName)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(Theme.txt)
+                    .lineLimit(1)
+                HStack(spacing: 5) {
+                    Chip(text: macOSFull, color: Theme.blue)
+                    Chip(text: modelID, color: Theme.dim)
+                    Chip(text: store.connected ? "后台服务在线" : "后台服务离线",
+                         color: store.connected ? Theme.green : Theme.red,
+                         filled: !store.connected)
+                }
+            }
+
+            Spacer(minLength: 12)
+
+            HStack(spacing: 0) {
+                heroStat("运行时间", compactUptime(BackendService.double(store.overview, "uptime") ?? 0), "clock")
+                heroDivider
+                heroStat("进程", "\(BackendService.int(store.overview, "process_count") ?? 0)", "list.bullet")
+                heroDivider
+                heroStat("热压", thermalText, "thermometer.medium")
+                heroDivider
+                heroStat("电源", powerModeText, "bolt")
+            }
+        }
+        .padding(12)
+        .background(Theme.panel, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .strokeBorder(Theme.line, lineWidth: 1))
+    }
+
+    private var heroDivider: some View {
+        Rectangle().fill(Theme.line).frame(width: 1, height: 26).padding(.horizontal, 12)
+    }
+
+    private func heroStat(_ label: String, _ value: String, _ icon: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 4) {
+                Image(systemName: icon).font(.system(size: 9))
+                Text(label).font(.system(size: 9.5))
+            }
+            .foregroundStyle(Theme.dim2)
+            Text(value)
+                .font(.system(size: 12.5, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(Theme.txt)
+                .lineLimit(1)
+        }
+    }
+
+    // MARK: 取值（与原概览页同源）
+
+    private var machineName: String {
+        let model = BackendService.string(store.overview, "model") ?? "未知机型"
+        return MacModelInfo.marketingName(model) ?? model
+    }
+
+    private var modelID: String {
+        BackendService.string(store.overview, "model") ?? "—"
+    }
+
+    /// macOS 市场名 + 版本号（"macOS Tahoe 26.7.1"）
+    private var macOSFull: String {
+        let os = BackendService.dict(store.overview, "os")
+        let ver = BackendService.string(os, "version") ?? "—"
+        let major = Int(ver.split(separator: ".").first ?? "") ?? 0
+        let name = macOSNames[major].map { "macOS \($0)" } ?? "macOS"
+        return "\(name) \(ver)"
+    }
+
+    private let macOSNames = [
+        26: "Tahoe", 15: "Sequoia", 14: "Sonoma",
+        13: "Ventura", 12: "Monterey", 11: "Big Sur",
+    ]
+
+    private var thermalText: String {
+        switch BackendService.string(store.overview, "thermal_state") ?? "" {
+        case "nominal": return "正常"
+        case "fair": return "偏高"
+        case "serious": return "严重"
+        case "critical": return "临界"
+        default: return "—"
+        }
+    }
+
+    private var powerModeText: String {
+        BackendService.bool(store.overview, "low_power_mode") == true ? "低电量模式" : "常规"
+    }
+
+    private func compactUptime(_ s: Double) -> String {
+        let d = Int(s) / 86400, h = (Int(s) % 86400) / 3600, m = (Int(s) % 3600) / 60
+        if d > 0 { return "\(d)天\(h)小时" }
+        if h > 0 { return "\(h)小时\(m)分" }
+        return "\(m)分钟"
+    }
+}
+
+// MARK: - 设备身份两卡（概览页顶部）
+
+struct SystemIdentitySection: View {
+    @EnvironmentObject var store: MonitorStore
+
+    /// system_profiler 一次性探测（序列号 / 内存条），nil = 还没读到
+    @State private var serial: String?
+    @State private var dimms: [[String: String]] = []
+
+    var body: some View {
+        Grid(horizontalSpacing: 14, verticalSpacing: 14) {
+            GridRow {
+                deviceCard.gridEqual()
+                machineCard.gridEqual()
+            }
+        }
+        .task { await probe() }
+    }
+
+    private var deviceCard: some View {
+        Card(title: "设备") {
+            VStack(spacing: 0) {
+                dashRow("处理器", cpuBrandClean, coreNote)
+                dashRow("内存", memLine, dimmSub)
+                dashRow("图形", gpuNames, gpuSub)
+                dashRow("启动卷", diskText, diskSub)
+                dashRow("显示器", displayText, displaySub)
+            }
+        }
+    }
+
+    private var machineCard: some View {
+        Card(title: "本机") {
+            VStack(spacing: 0) {
+                dashRow("机型标识符", modelID, nil)
+                dashRow("序列号", serial ?? "读取中…", nil)
+                dashRow("处理器", cpuBrandClean, coreNote)
+                dashRow("内存", memLine, dimmSub)
+                dashRow("系统", macOSFull, nil)
+                dashRow("构建版本", BackendService.string(BackendService.dict(store.overview, "os"), "build") ?? "—", nil)
+                dashRow("启动时间", compactUptime(BackendService.double(store.overview, "uptime") ?? 0), nil)
+            }
+        }
+    }
+
+    // MARK: 行组件
+
+    private func dashRow(_ key: String, _ value: String, _ sub: String?) -> some View {
+        HStack(alignment: .top) {
+            Text(key).font(.system(size: 12.5)).foregroundStyle(Theme.dim)
+            Spacer(minLength: 20)
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(value)
+                    .font(.system(size: 12.5, weight: .medium))
+                    .monospacedDigit()
+                    .foregroundStyle(Theme.txt)
+                    .multilineTextAlignment(.trailing)
+                if let sub, !sub.isEmpty {
+                    Text(sub).font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
+                        .multilineTextAlignment(.trailing)
+                }
+            }
+        }
+        .padding(.vertical, 6)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(Theme.line).frame(height: 0.5)
+        }
+    }
+
+    // MARK: 取值
+
+    private var machineName: String {
+        let model = BackendService.string(store.overview, "model") ?? "未知机型"
+        return MacModelInfo.marketingName(model) ?? model
+    }
+
+    private var modelID: String {
+        BackendService.string(store.overview, "model") ?? "—"
+    }
+
+    private var macOSFull: String {
+        let os = BackendService.dict(store.overview, "os")
+        let ver = BackendService.string(os, "version") ?? "—"
+        let major = Int(ver.split(separator: ".").first ?? "") ?? 0
+        let name = macOSNames[major].map { "macOS \($0)" } ?? "macOS"
+        return "\(name) \(ver)"
+    }
+
+    private let macOSNames = [
+        26: "Tahoe", 15: "Sequoia", 14: "Sonoma",
+        13: "Ventura", 12: "Monterey", 11: "Big Sur",
+    ]
+
+    private var cpuBrandClean: String {
+        let raw = BackendService.string(store.cpu, "brand") ?? "—"
+        return raw
+            .replacingOccurrences(of: "Intel(R) Core(TM)", with: "Intel Core")
+            .replacingOccurrences(of: " CPU", with: "")
+            .replacingOccurrences(of: "@", with: "")
+            .trimmingCharacters(in: .whitespaces)
+    }
+
+    private var coreNote: String {
+        let p = BackendService.int(store.cpu, "physical") ?? 0
+        let l = BackendService.int(store.cpu, "logical") ?? 0
+        return p > 0 ? "\(p) 核 / \(l) 线程" : "—"
+    }
+
+    /// 内存总量（优先内存条实测值，退回 sysctl）
+    private var memLine: String {
+        if !dimms.isEmpty {
+            let totalGB = dimms.reduce(0.0) { acc, d in
+                let n = Double((d["size"] ?? "").replacingOccurrences(of: " GB", with: "")) ?? 0
+                return acc + n
+            }
+            var parts = ["\(fmtCount(totalGB)) GB"]
+            if let sp = Set(dimms.compactMap { $0["speed"] }).first { parts.append(sp) }
+            if let t = Set(dimms.compactMap { $0["type"] }).first { parts.append(t) }
+            return parts.joined(separator: " ")
+        }
+        let total = BackendService.double(store.memory, "total") ?? 0
+        let used = BackendService.double(store.memory, "used") ?? 0
+        guard total > 0 else { return "—" }
+        return "\(fmtCount(used / 1e9)) / \(fmtCount(total / 1e9)) GB"
+    }
+
+    private var dimmSub: String? {
+        guard !dimms.isEmpty else { return nil }
+        let used = BackendService.double(store.memory, "used") ?? 0
+        return "\(dimms.count) 条 · 已用 \(fmtCount(used / 1e9)) GB"
+    }
+
+    private var gpuNames: String {
+        let names = store.gpus.compactMap { BackendService.string($0, "name") }
+        return names.isEmpty ? "—" : names.joined(separator: " + ")
+    }
+
+    private var gpuSub: String? {
+        let vrams = store.gpus.compactMap { g -> String? in
+            guard let detail = BackendService.dict(g, "detail") else { return nil }
+            return detail["VRAM (Total)"] as? String
+        }
+        return vrams.isEmpty ? nil : vrams.joined(separator: " + ")
+    }
+
+    private var rootDisk: [String: Any]? {
+        store.disks.first { (BackendService.string($0, "mount") ?? "") == "/" } ?? store.disks.first
+    }
+
+    private var diskText: String {
+        guard let d = rootDisk else { return "—" }
+        let mount = BackendService.string(d, "mount") ?? "磁盘"
+        return "\(mount) (\(fmtCount((BackendService.double(d, "total") ?? 0) / 1e9)) GB)"
+    }
+
+    private var diskSub: String? {
+        guard let d = rootDisk else { return nil }
+        let used = BackendService.double(d, "used") ?? 0
+        let pct = BackendService.int(d, "percent") ?? 0
+        return "已用 \(fmtCount(used / 1e9)) GB · \(pct)%"
+    }
+
+    private var displayText: String {
+        guard NSScreen.main != nil else { return "—" }
+        let inches = hypot(CGDisplayScreenSize(CGMainDisplayID()).width,
+                           CGDisplayScreenSize(CGMainDisplayID()).height) / 25.4
+        return "内建显示器 (\(fmtInches(inches))\")"
+    }
+
+    private var displaySub: String? {
+        guard let screen = NSScreen.main else { return nil }
+        let scale = screen.backingScaleFactor
+        let w = Int((screen.frame.width * scale).rounded())
+        let h = Int((screen.frame.height * scale).rounded())
+        var s = "\(w)x\(h)"
+        let refresh = CGDisplayCopyDisplayMode(CGMainDisplayID())?.refreshRate ?? 0
+        if refresh > 0 { s += ", \(Int(refresh.rounded()))Hz" }
+        return s
+    }
+
+    // MARK: - 一次性探测（序列号 / 内存条）
+
+    private func probe() async {
+        let info = await Task.detached(priority: .utility) { () -> [String: Any] in
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/sbin/system_profiler")
+            p.arguments = ["SPHardwareDataType", "SPMemoryDataType", "-json"]
+            let pipe = Pipe()
+            p.standardOutput = pipe
+            p.standardError = FileHandle.nullDevice
+            do { try p.run() } catch { return [:] }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        }.value
+
+        if let hw = info["SPHardwareDataType"] as? [[String: Any]], let first = hw.first,
+           let s = first["serial_number"] as? String {
+            serial = s
+        }
+        if let mem = info["SPMemoryDataType"] as? [[String: Any]] {
+            var items: [[String: String]] = []
+            for entry in mem {
+                guard let sub = entry["_items"] as? [[String: Any]] else { continue }
+                for d in sub {
+                    items.append([
+                        "size": (d["dimm_size"] as? String) ?? "",
+                        "speed": (d["dimm_speed"] as? String) ?? "",
+                        "type": (d["dimm_type"] as? String) ?? "",
+                        "slot": (d["_name"] as? String) ?? "",
+                    ])
+                }
+            }
+            dimms = items
+        }
+    }
+
+    // MARK: 小工具
+
+    private func compactUptime(_ s: Double) -> String {
+        let d = Int(s) / 86400, h = (Int(s) % 86400) / 3600, m = (Int(s) % 3600) / 60
+        if d > 0 { return "\(d)天\(h)小时" }
+        if h > 0 { return "\(h)小时\(m)分" }
+        return "\(m)分钟"
+    }
+
+    private func fmtCount(_ v: Double) -> String {
+        v == v.rounded() ? String(Int(v)) : String(format: "%.1f", v)
+    }
+
+    private func fmtInches(_ v: Double) -> String {
+        v == v.rounded() ? String(Int(v)) : String(format: "%.1f", v)
+    }
+}
+
+// MARK: - 系统与启动参数（原身份区第三卡，2026-11-14 用户要求迁去「设置」页底部）
+
+struct BootArgsCard: View {
+    @EnvironmentObject var store: MonitorStore
+
+    var body: some View {
+        Card(title: "系统与启动参数") {
+            let os = BackendService.dict(store.overview, "os")
+            VStack(alignment: .leading, spacing: 12) {
+                FieldGrid(rows: [
+                    ("系统", "\(BackendService.string(os, "name") ?? "macOS") \(BackendService.string(os, "version") ?? "")"),
+                    ("构建版本", BackendService.string(os, "build") ?? "—"),
+                    ("架构", BackendService.string(BackendService.dict(store.overview, "cpu"), "arch") ?? "—"),
+                    ("低电量模式", BackendService.bool(store.overview, "low_power_mode") == true ? "已开启" : "关闭"),
+                ], columns: 2)
+                if !bootArgs.isEmpty {
+                    Divider().overlay(Theme.line)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("BOOT ARGS")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(Theme.dim2)
+                            .tracking(0.9)
+                        Text(bootArgs)
+                            .font(.system(size: 11.5, design: .monospaced))
+                            .foregroundStyle(Theme.dim)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
+    }
+
+    private var bootArgs: String {
+        let s = BackendService.string(BackendService.dict(store.overview, "os"), "boot_args") ?? ""
+        return s.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+/// 机型 → 市场名 / 生产年份（mini 表，覆盖常见 Mac；查不到返回 nil，
+/// 界面回退到 hw.model 原始标识符 / 「—」）。
+/// 黑果机器的 hw.model 是 EFI 里仿冒的 Mac 标识，按它展示即可。
+enum MacModelInfo {
+    static let table: [String: (name: String, year: String)] = [
+        // Apple Silicon 时代
+        "MacBookPro18,1": ("MacBook Pro 16 英寸", "2021"),
+        "MacBookPro18,2": ("MacBook Pro 16 英寸", "2021"),
+        "MacBookPro18,3": ("MacBook Pro 14 英寸", "2021"),
+        "MacBookPro18,4": ("MacBook Pro 14 英寸", "2021"),
+        "MacBookPro17,1": ("MacBook Pro 13 英寸", "2020"),
+        "MacBookAir10,1": ("MacBook Air 13 英寸", "2020"),
+        // Intel 时代
+        "MacBookPro16,4": ("MacBook Pro 16 英寸", "2019"),
+        "MacBookPro16,1": ("MacBook Pro 16 英寸", "2019"),
+        "MacBookPro16,2": ("MacBook Pro 13 英寸", "2020"),
+        "MacBookPro16,3": ("MacBook Pro 13 英寸", "2020"),
+        "MacBookPro15,4": ("MacBook Pro 13 英寸", "2019"),
+        "MacBookPro15,1": ("MacBook Pro 15 英寸", "2018"),
+        "MacBookPro15,2": ("MacBook Pro 15 英寸", "2018"),
+        "MacBookPro15,3": ("MacBook Pro 15 英寸", "2018"),
+        "MacBookPro14,3": ("MacBook Pro 13 英寸", "2017"),
+        "MacBookPro14,2": ("MacBook Pro 13 英寸", "2017"),
+        "MacBookPro14,1": ("MacBook Pro 13 英寸", "2017"),
+        "MacBookPro13,3": ("MacBook Pro 15 英寸", "2016"),
+        "MacBookPro13,2": ("MacBook Pro 15 英寸", "2016"),
+        "MacBookPro13,1": ("MacBook Pro 13 英寸", "2016"),
+        "MacBookAir9,1":  ("MacBook Air 13 英寸", "2020"),
+        "MacBookAir8,2":  ("MacBook Air 13 英寸", "2019"),
+        "MacBookAir8,1":  ("MacBook Air 13 英寸", "2018"),
+        "MacBookAir7,2":  ("MacBook Air 13 英寸", "2015"),
+        "MacBookAir7,1":  ("MacBook Air 11 英寸", "2015"),
+        "iMac20,1":       ("iMac 27 英寸", "2020"),
+        "iMac20,2":       ("iMac 27 英寸", "2020"),
+        "iMac19,1":       ("iMac 27 英寸", "2019"),
+        "iMac19,2":       ("iMac 21.5 英寸", "2019"),
+        "iMac18,3":       ("iMac 27 英寸", "2017"),
+        "iMac18,2":       ("iMac 21.5 英寸", "2017"),
+        "iMac18,1":       ("iMac 27 英寸", "2017"),
+        "iMacPro1,1":     ("iMac Pro", "2017"),
+        "Macmini8,1":     ("Mac mini", "2018"),
+        "Macmini7,1":     ("Mac mini", "2014"),
+    ]
+    static func marketingName(_ model: String) -> String? { table[model]?.name }
+}

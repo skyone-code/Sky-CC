@@ -43,6 +43,22 @@ enum UIControlPrefs {
         // 灯效页
         static let lightbarMode = "pref.rgb.lightbarMode"  // cycle/static/off
         static let lightbarHex = "pref.rgb.lightbarHex"
+        static let lightbarBreathing = "pref.rgb.lightbarBreathing"  // 睡眠展示（0x748 bit3 反逻辑）
+        // 2026-11-14（首帧记忆）：灯效草稿的镜像缓存 —— helper 的 profile 存档要
+        // 等异步快照才能读到，首帧不能等；UI 每次从后端采用存档后把草稿抄一份在
+        // UserDefaults，下次进页 init() 同步读出来，首帧即上次选择。
+        static let rgbEffect = "pref.rgb.effect"            // 灯效名
+        static let rgbSpeed = "pref.rgb.effectSpeed"        // 1…10
+        static let rgbBright = "pref.rgb.effectBright"      // 0…100
+        static let rgbDirection = "pref.rgb.effectDirection" // 1…4
+        static let rgbPalette = "pref.rgb.effectPalette"    // 7 色 × 6 位 hex = 42 字符
+        static let rgbKeymap = "pref.rgb.effectKeymap"      // 6×21 键 × 6 位 hex = 756 字符
+        static let rgbKbOn = "pref.rgb.kbOn"                // 键盘灯总开关镜像
+        static let apbeat = "pref.rgb.apbeat"               // AP 心跳镜像
+        // 设置页 · 显卡路由（GpuRouteSection 的开关镜像，真值在 helper）
+        static let gpuRoute = "pref.settings.gpuRoute"
+        // 2026-11-14（用户要求）：状态栏主图标风格 —— auto=黑色模板随系统 / white / color
+        static let menubarIcon = "pref.menubar.iconStyle"
     }
 
     // MARK: - 读
@@ -131,6 +147,11 @@ enum UIControlPrefs {
         if d.string(forKey: K.lightbarHex) == nil,
            let hex = BackendService.string(lightbar, "hex") {
             d.set(hex, forKey: K.lightbarHex)
+        }
+        // 睡眠展示（bit3）：EC 真值首次播种，之后以记忆为准
+        if d.object(forKey: K.lightbarBreathing) == nil,
+           let b = lightbar["breathing"] as? Bool {
+            d.set(b, forKey: K.lightbarBreathing)
         }
     }
 

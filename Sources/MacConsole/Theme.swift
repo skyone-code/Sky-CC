@@ -11,7 +11,7 @@ import AppKit
 //
 // 用户要求：除「实验性」页以外，所有页面的**卡片标题后缀、分组说明、开关副标题、
 // 底部小字注释**一律隐藏（代码保留，不删）。
-// 默认 true = 隐藏；ExperimentalView 里 `.environment(\.hideCardSubs, false)` 单独放行。
+// 默认 true = 隐藏；实验性页已删除（2026-11-14），需要显示副标题的页面自行覆写。
 private struct HideCardSubsKey: EnvironmentKey {
     static let defaultValue = true
 }
@@ -147,6 +147,10 @@ func styledLabel(_ t: String) -> String {
 /// 圆角卡片容器
 struct Card<Content: View>: View {
     var title: String? = nil
+    /// 标题文字**紧跟其后**的一个小徽标（2026-11-08 新增，给 GPU 卡的降频提示用）。
+    /// 与 `trailing` 的区别：badge 贴着标题排、跟着标题走；trailing 靠右对齐。
+    /// 默认 nil，所有既有 Card 调用不受影响。
+    var badge: (() -> AnyView)? = nil
     var trailing: (() -> AnyView)? = nil
     @ViewBuilder var content: Content
 
@@ -169,11 +173,12 @@ struct Card<Content: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             if let t = displayTitle {
-                HStack {
+                HStack(spacing: 6) {
                     Text(styledLabel(t))
                         .font(.system(size: 10.5, weight: .semibold))
                         .foregroundStyle(Theme.dim2)
                         .tracking(1.1)
+                    if let badge { badge() }
                     Spacer()
                     if let trailing { trailing() }
                 }
@@ -183,12 +188,21 @@ struct Card<Content: View>: View {
             // （Spacer(minLength: 0) 在没有额外空间时不占一点高度）
             Spacer(minLength: 0)
         }
+        // 四边统一 16。注意尾部那个 `Spacer` 前面还有本 VStack 的 12pt 段间距，
+        // 所以内容最后一行到卡片下沿的实际观感是 28pt（2026-11-08 实测）。
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Theme.panel, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 13, style: .continuous)
             .strokeBorder(Theme.line, lineWidth: 1))
-        .shadow(color: .black.opacity(0.05), radius: 6, y: 2)
+        // 2026-11-08（性能）：去掉卡片投影。
+        // 卡片底色本来就比页面底亮一档，深色下这层 5% 黑影肉眼几乎看不出，
+        // 但每张卡每秒都要重新做一次离屏阴影合成（一页 6~8 张），
+        // 拖动窗口时尤其拖后腿。用一条 1px 描边代替分隔感，成本降到零。
+        .overlay(
+            RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .strokeBorder(Theme.line.opacity(0.55), lineWidth: 0.8)
+        )
     }
 }
 
@@ -230,7 +244,10 @@ struct SegmentedPicker<T: Equatable>: View {
                         .lineLimit(1)
                         .minimumScaleFactor(0.75)
                         .frame(maxWidth: .infinity)
-                        .padding(.vertical, 7)
+                        // 2026-11-07：高度钉成 30（原来是 padding(.vertical, 7) 撑出来的
+                        // ≈29pt）。控制页「系统功耗设置」那三个按钮也用 30，
+                        // 两组按钮才能严格等高。
+                        .frame(height: 30)
                         .background(
                             RoundedRectangle(cornerRadius: 8, style: .continuous)
                                 .fill(selected ? Theme.blue : Color.clear)

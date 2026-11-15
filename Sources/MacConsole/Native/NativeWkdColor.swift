@@ -1,6 +1,6 @@
 //
 //  NativeWkdColor.swift
-//  Mac控制台 —— 原厂 LED 颜色补偿（WKDColor / cheatRGB_*）原生移植
+//  Sky CC —— 原厂 LED 颜色补偿（WKDColor / cheatRGB_*）原生移植
 //
 //  来源：Windows 原厂 DefaultRGBKB.exe 反编译
 //        LightingModel.WKDColor.cheatRGB_2ndME / cheatRGB_2p1ndME / cheatRGB_4Zone
@@ -62,6 +62,31 @@ enum WkdColor {
         else if v & 0x08 != 0 { vendor = .everlight }
         else { vendor = .unknown }
         return vendor
+    }
+
+    /// 键盘世代（原厂 `Is2p1nd`）：握手 VerHigh == 19 即 2.1 代，要换成 2p1nd 曲线。
+    ///
+    /// 移植文档 §3.5 / §16.1：「Is2p1nd = 握手 VerHigh==19」。
+    /// 本机握手回 `80 13 07 00 …`（VerHigh = 0x13 = 19）→ 走 `cheatRGB_2p1ndME`。
+    /// 以前这里是常量 `.meZone2nd`、从不按握手切换，等于一直在用 2.0 代曲线。
+    ///
+    /// 想临时回退到旧曲线：`defaults write com.macconsole.helper mcWkdForce2nd -bool YES`
+    @discardableResult
+    static func detectVariant(fwMajor: Int) -> KeyboardVariant {
+        if UserDefaults.standard.bool(forKey: "mcWkdForce2nd") {
+            variant = .meZone2nd
+        } else {
+            variant = (fwMajor == 19) ? .meZone2p1nd : .meZone2nd
+        }
+        return variant
+    }
+
+    static var variantLabel: String {
+        switch variant {
+        case .meZone2nd:   return "MEZone_2nd"
+        case .meZone2p1nd: return "MEZone_2.1nd"
+        case .fourZone:    return "4Zone"
+        }
     }
 
     /// 把用户选的颜色换算成实际下发给 LED 的值。

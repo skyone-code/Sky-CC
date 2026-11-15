@@ -1,6 +1,6 @@
 //
 //  NativeAPI.swift
-//  Mac控制台 —— 本地后端 API 层（原生移植）
+//  Sky CC —— 本地后端 API 层（原生移植）
 //
 //  对应 Python 版 app-resources/server.py 的全部接口逻辑。JSON 输出形状与
 //  Python 版逐字段一致（前端 web UI 与 SwiftUI 都按原形状解析）。
@@ -124,6 +124,12 @@ enum NativeAPI {
         case "/api/hid":        return NativeSystem.hidDevices()
         case "/api/rgb":        return rgbState()
         case "/api/fan":        return fanState()
+        // 「AP 心跳」开关（灯效页，2026-11-13）：0x741 bit0 的真实状态。
+        // 单独开一个端点而不是塞进 /api/fan —— 后者一次要读 17 个寄存器（≈1.1s），
+        // 为了一位开关去加第 18 读不划算；这里只有一次读（~65ms）。
+        case "/api/apbeat":
+            let s = FanControl.shared.appPresentState()
+            return ["ok": true, "ap_present": s.on, "ctrl1": Int(s.raw)]
         // 有页面正在看实时转速：续租（采样器这才开始转），返回缓存值。
         // 首次（缓存还没有转速）直接读一把，避免头一两秒显示 0。
         case "/api/fan/live":
@@ -137,6 +143,8 @@ enum NativeAPI {
         case "/api/capability": return capability()
         case "/api/all":        return allPayload(slim: false)
         case "/api/snapshot":   return allPayload(slim: true)
+        // GPU 路由开关状态（是否注入 gpu-router.dylib + 例外名单 + dylib 就位情况）
+        case "/api/gpu":        return NativeGPU.state()
         // 独显利用率的「有没有人在看」信号 —— 2026-10-28 起**已废弃**，保留空壳。
         //
         // 旧实现在这里开 RM 通道、一次拷 55,888 字节回来，所以必须有「有人看才 1 秒一次、
@@ -201,6 +209,13 @@ enum NativeAPI {
             && (action == "volume_get")
         if !readOnlyAction { invalidateFanCache() }
         switch path {
+        // GPU 路由：mode = "dgpu" 开 / "off" 关；exclude 增删 per-app 例外。
+        // 只改 launchd 环境变量与策略文件，不碰 kext，也不需要 root。
+        case "/api/gpu/mode":             return NativeGPU.setMode(params["mode"] as? String ?? "")
+        case "/api/gpu/exclude":
+            let on = (params["on"] as? NSNumber)?.boolValue
+                ?? (params["on"] as? Bool) ?? false
+            return NativeGPU.setExclude(params["bundle"] as? String ?? "", on: on)
         case "/api/control":              return doControl(params["action"] as? String ?? "", params)
         case "/api/fan":                  return doFan(params)
         case "/api/lightbar":             return doLightbar(params)
@@ -473,24 +488,33 @@ enum NativeAPI {
                          c.count > 2 ? (c[2] as? Int ?? 0) : 0]
                     }
                 }
-                let kr = try kb.setStyle(name: params["style"] as? String ?? "rainbow",
-                                         brightness: params["brightness"] as? Int ?? 75,
-                                         speed: params["speed"] as? Int ?? 5,
-                                         save: params["save"] as? Int ?? 1,
-                                         rgb: effRGB,
-                                         slot: params["slot"] as? Int ?? 1,
-                                         palette: palette,
-                                         // 2.7.10：方向字节只对波浪/跑马灯/极光有意义，
-                                         // setStyle 内部会按 supportsDirection 过滤；缺省取原厂「右」
-                                         direction: params["direction"] as? Int ?? 1)
-                // hex 回显：只在真的下发了 RGB 时才有意义。显式给 Any ——
-                // 三元里混 String / NSNull 会被隐式提升成 Any? 再塞进字典（编译警告）。
-                let hexOut: Any = (effRGB != nil ? (params["hex"] as? String) : nil) ?? NSNull()
-                result = ["ok": kr == 0, "kr": kr, "mode": "effect",
-                          "style": params["style"] as? String ?? "rainbow",
-                          "slots": palette?.count ?? 0,
-                          "effect_code": KeyboardCatalog.effect(forName: params["style"] as? String ?? "")?.rawValue ?? 0,
-                          "hex": hexOut]
+                let styleName = params["style"] as? String ?? "rainbow"
+                if let e = KeyboardCatalog.effect(forName: styleName), e.isSoftwareAnimation {
+                    // AP 软件动画（霓虹/堆叠/冲击）没有固件效果号，下发只会把芯片推进
+                    // 未定义态。真正画面由界面侧 `APEffectEngine` 逐帧走 matrix 通道。
+                    result = ["ok": true, "mode": "effect", "ap": true,
+                              "style": KeyboardCatalog.key(for: e),
+                              "slots": palette?.count ?? 0, "effect_code": 0]
+                } else {
+                    let kr = try kb.setStyle(name: styleName,
+                                             brightness: params["brightness"] as? Int ?? 75,
+                                             speed: params["speed"] as? Int ?? 5,
+                                             save: params["save"] as? Int ?? 1,
+                                             rgb: effRGB,
+                                             slot: params["slot"] as? Int ?? 1,
+                                             palette: palette,
+                                             // 2.7.10：方向字节只对波浪/跑马灯/极光有意义，
+                                             // setStyle 内部会按 supportsDirection 过滤；缺省取原厂「右」
+                                             direction: params["direction"] as? Int ?? 1)
+                    // hex 回显：只在真的下发了 RGB 时才有意义。显式给 Any ——
+                    // 三元里混 String / NSNull 会被隐式提升成 Any? 再塞进字典（编译警告）。
+                    let hexOut: Any = (effRGB != nil ? (params["hex"] as? String) : nil) ?? NSNull()
+                    result = ["ok": kr == 0, "kr": kr, "mode": "effect",
+                              "style": styleName,
+                              "slots": palette?.count ?? 0,
+                              "effect_code": KeyboardCatalog.effect(forName: styleName)?.rawValue ?? 0,
+                              "hex": hexOut]
+                }
             case "color":
                 let hx = (params["hex"] as? String ?? "#00a0ff").replacingOccurrences(of: "#", with: "")
                 let rgb = hx.count == 6 ? RGBUtil.hexToRgb(hx) : [0, 160, 255]
@@ -534,6 +558,9 @@ enum NativeAPI {
                 // 与 keymap 的差别只有一点：**不每帧重进逐键模式** —— 每帧发一次 0x08
                 // 会打断正在刷的行数据，画面会闪；断流超过 1.5s 才补一次。
                 let rows = RGBProfile.normalizeKeymap(params["rows"])
+                // 2026-11-11：AP 软件动画（霓虹/堆叠/冲击）每帧都带亮度，
+                // 不然切到这两个效果时亮度会沿音乐律动上次留下的值。
+                if let b = params["brightness"] as? Int { RGBActivity.zoneBrightness = b }
                 let gap = Date().timeIntervalSince(RGBActivity.lastZones)
                 if gap > 1.5 {
                     _ = kb.userMode(save: 0, brightness: RGBActivity.zoneBrightness)
@@ -706,14 +733,27 @@ enum NativeAPI {
         if !force, let v = fanCache.get("mode", 120.0) as? [String: Any] { return v }
         if modeFlight.tryClaim() {
             let v = FanControl.shared.modeStatus()
-            fanCache.put("mode", v)
+            // 【2026-11-11】读失败（EC 限速/争用）的结果**绝不入缓存**：老代码会把
+            // 「4 读全失败 → 0x751=0」这份假数据钉死一整天，界面就一直显示
+            // 「基准未开」而风扇其实在 0x40 全速。失败时回退旧缓存，没有就返回本次结果
+            // （下次轮询会重读）。
+            if (v["_read_ok"] as? Bool) == true {
+                fanCache.put("mode", v)
+            } else if let old = fanCache.get("mode", 86_400) as? [String: Any] {
+                modeFlight.finish()
+                return old
+            }
             modeFlight.finish()
             return v
         }
         modeFlight.wait()
         if let v = fanCache.get("mode", 120.0) as? [String: Any] { return v }
         let v = FanControl.shared.modeStatus()
-        fanCache.put("mode", v)
+        if (v["_read_ok"] as? Bool) == true {
+            fanCache.put("mode", v)
+        } else if let old = fanCache.get("mode", 86_400) as? [String: Any] {
+            return old
+        }
         return v
     }
 
@@ -733,6 +773,7 @@ enum NativeAPI {
         var v = (fanCache.get("live", 86_400) as? [String: Any]) ?? [:]
         v["temp_cpu"] = TempSources.cpuCelsius()
         v["temp_gpu"] = TempSources.gpuCelsius()
+        v["temp_gpu_edge"] = TempSources.gpuEdgeCelsius()
         if v["rpm_cpu"] == nil { v["rpm_cpu"] = 0 }
         if v["rpm_gpu"] == nil { v["rpm_gpu"] = 0 }
         return v
@@ -780,8 +821,28 @@ enum NativeAPI {
         return v
     }
 
-    /// 写操作后清空，保证紧接着的 GET 能看到新值
-    static func invalidateFanCache() { fanCache.clear() }
+    /// 写操作后清空，保证紧接着的 GET 能看到新值。
+    ///
+    /// 【2026-11-11】光清缓存不够：写事务本身要 ~0.5–1s（多次 EC 写）。
+    /// 界面 1 秒轮询的 GET 很可能在「缓存已清、写还没完」的窗口插进来，
+    /// 读到 `0x751` 的中间态（例如刚被放成 0x00），随后被 24 小时 TTL 钉死 ——
+    /// 表现就是「基准模式全速 5800 RPM，界面却显示未开启」。
+    /// 所以这里再开一个 3 秒「强制重读」窗口，让写后的 GET 全部绕过缓存。
+    private static let fanFreshLock = NSLock()
+    private static var fanFreshUntil = Date.distantPast
+
+    static func invalidateFanCache() {
+        fanCache.clear()
+        fanFreshLock.lock()
+        fanFreshUntil = Date().addingTimeInterval(3)
+        fanFreshLock.unlock()
+    }
+
+    private static var fanFreshWindowActive: Bool {
+        fanFreshLock.lock()
+        defer { fanFreshLock.unlock() }
+        return Date() < fanFreshUntil
+    }
 
     // MARK: 后台 EC 采样器
     //
@@ -849,7 +910,10 @@ enum NativeAPI {
             if fresh && renewLease { touchLiveLease() }
             var merged: [String: Any]
             let mode: [String: Any]
-            if fresh {
+            // 写操作后 3 秒内一律强制重读：宁可多几笔 EC 读，也不能把写事务的
+            // 中间态缓存成一天（见 invalidateFanCache 的注释）。
+            let mustFresh = fresh || fanFreshWindowActive
+            if mustFresh {
                 merged = cachedLive(force: true)
                 mode = cachedMode(force: true)
             } else {
@@ -860,6 +924,7 @@ enum NativeAPI {
                 mode = (fanCache.get("mode", 86_400) as? [String: Any]) ?? cachedMode()
                 merged["temp_cpu"] = TempSources.cpuCelsius()
                 merged["temp_gpu"] = TempSources.gpuCelsius()
+                merged["temp_gpu_edge"] = TempSources.gpuEdgeCelsius()
             }
             merged.merge(mode) { _, b in b }
             out["live"] = merged
@@ -877,7 +942,7 @@ enum NativeAPI {
             let savedMode = st["mode"] as? String ?? "normal"
             let savedLevel = st["level"] as? Int ?? 0
             out["synced"] = (actual == savedMode && (actual != "custom" || actualLevel == savedLevel))
-            if fresh {
+            if mustFresh {
                 if let charge = cachedCharge(force: true) { out["charge"] = charge }
                 out["misc"] = cachedMisc(force: true)
             } else {
@@ -896,6 +961,7 @@ enum NativeAPI {
                 "rpm_gpu": 0,
                 "temp_cpu": TempSources.cpuCelsius(),
                 "temp_gpu": TempSources.gpuCelsius(),
+                "temp_gpu_edge": TempSources.gpuEdgeCelsius(),
             ]
             out["hint"] = ("TongfangFan.kext 未加载 —— 到「控制」或「实验性」页点「立即安装」"
                 + "（kext 已内嵌在 app 里，只需输入一次管理员密码）")
@@ -926,9 +992,9 @@ enum NativeAPI {
                 return ["ok": false, "error": "modeindex 必须是 0x11(高性能)/0x22(平衡)/0x33(节能)"]
             }
             // 方案 A（2026-10-21 修复）：性能模式是「EC 接管」语义。若当前跑着曲线模式，
-            // FanCurveController 正攥着 FAN_CTRL 手动权（0x0741 手动门开着），此时只写
-            // 0x07AB 会出现「toast 报成功、风扇纹丝不动」——EC 在手动门关闭时才认模式索引。
-            // 必须先交还控制权：停曲线控制环 → setMode("normal") 关手动门 + 补写 0x751=0xA0。
+            // FanCurveController 正攥着 FAN_CTRL 手动权（0x0751 停在 0x8n），此时只写
+            // 0x07AB 会出现「toast 报成功、风扇纹丝不动」——EC 在 0x751 交还后才认模式索引。
+            // 必须先交还控制权：停曲线控制环 → setMode("normal") 放档位 + 补写 0x751=0xA0。
             //
             // 2.7.10：真正干活改成 applyPowerPreset —— 包内实测原厂点「系统功耗设置」
             // 是「功耗 + 散热两组一起写」（PL1/PL2 → 0x78B → 0x7A6 → 0x751 → 0x7A5 →
@@ -993,7 +1059,7 @@ enum NativeAPI {
             return out
         }
 
-        // 基准模式（顶层覆盖态：0x741 手动门 + 0x751=0x40）
+        // 基准模式（文档 §3.3 顶层覆盖态，EC 侧投影 = 0x751=0x40）
         if let on = params["benchmark"] as? Bool {
             FanCurveController.shared.stop()
             let r = fc.setBenchmarkMode(on)
@@ -1032,6 +1098,15 @@ enum NativeAPI {
                     "keyboard_backlight": v,
                     "led": led,
                     "note": v ? "已重新下发灯效（单改亮度点不亮）" : "已发 CTRL_OFF 熄灯"]
+        }
+        // 灯效页「AP 心跳」：0x741 bit0（AP exist / 控制中心在线标志）双向写。
+        // 和 0x767 那套不一样 —— 这是**持久状态位**，读-改-写，没有 toggle 语义，
+        // 也不会连带抛电源键事件。关掉后键盘背光回到固件的 10 分 40 秒空闲熄灯。
+        if let v = params["ap_present"] as? Bool {
+            guard let r = fc.setAPPresent(v) else { return ["ok": false, "error": "写入失败"] }
+            let now = fc.appPresentState()
+            return ["ok": r.ok, "reply": r.dict,
+                    "ap_present": now.on, "ctrl1": Int(now.raw)]
         }
         if let v = params["win_lock"] as? Bool {
             guard let r = fc.setWinKeyLock(v) else { return ["ok": false, "error": "写入失败"] }
@@ -1200,22 +1275,28 @@ enum NativeAPI {
         }
 
         let c = params["ctrl"] ?? params["mode"] ?? "cycle"
-        var ctrl: UInt8
+        var mode: String
         if let s = c as? String {
             switch s {
-            case "cycle":  ctrl = EC.lightbarCycle
-            case "static": ctrl = EC.lightbarStatic
-            case "off":    ctrl = EC.lightbarOff
+            case "cycle", "static", "off": mode = s
             default:
                 return ["ok": false, "error": "ctrl 取值无效"]
             }
         } else if let n = c as? Int, (0...255).contains(n) {
-            ctrl = UInt8(n)
+            // 兼容旧调用（数字控制字）：只用来推断三态，实际写入仍走读改写，
+            // 免得把 bit0 AP exist / bit3 睡眠展示一起覆盖掉。
+            let b = UInt8(n)
+            mode = (b & EC.lightbarS0Off) != 0 ? "off"
+                 : ((b & EC.lightbarRainbow) != 0 ? "cycle" : "static")
         } else {
             return ["ok": false, "error": "ctrl 取值无效"]
         }
 
-        guard let st = FanControl.shared.lightbarSet(rgb, ctrl: ctrl) else {
+        // 睡眠展示（0x748 bit3）：只有「开灯」时才允许改；关灯时文档要求无条件置 1。
+        var breathing: Bool? = nil
+        if let b = params["breathing"] as? Bool { breathing = b }
+
+        guard let st = FanControl.shared.lightbarSet(rgb, mode: mode, breathing: breathing) else {
             return ["ok": false, "error": "写入后回读失败"]
         }
         var out = st
@@ -1253,12 +1334,13 @@ enum NativeAPI {
                 + "四个寄存器一起写才对 —— 0x7AB 是 EC 的「整组设置应用完毕」收尾信号，"
                 + "只写 0x751 会在秒级内被 EC 覆盖回去"])
             usable.append(["name": "基准模式（增压 5000+ RPM）",
-                           "detail": "入口是手动门 0x0741 bit0：先断言门（写事件，不是状态位），"
-                + "再 0x751←0x40，EC 自己把 0x768 置成 0x04，实测 2642→5615 RPM。"
-                + "关闭必须反序：先 0x751←0x00 再清门，EC 随即把 0x751 自己改回 0xA0。"
-                + "顺序反了会触发 FAN_ABNORMAL（0x741 变 0xA3），整片风扇寄存器拒写，只能重启恢复"])
+                           "detail": "按移植文档 §3.3 完整链：快照 → Gaming PL(0x730/731→0x783/784) → "
+                + "dstate=1 → 0x7A5 bit7+bit4+LED=01（0x91）→ 0x7A6 DynamicTemp 开 → "
+                + "0x7AB=0x11 → 0x751=0x40。前提是 0x741 bit0（AP exist / 控制中心接管）在位。"
+                + "关闭：0x751←0x00 → 快照整字节恢复 → 重放 SetPowerMode+SetFanMode 全链。"
+                + "0x7A5 写不进时不再写 0x751，直接回滚（顺序反了会触发 FAN_ABNORMAL，整片拒写）"])
             usable.append(["name": "风扇转速与温度读数",
-                           "detail": "转速绕开 SMC，直接读 EC 0x046C(CPU) / 0x0464(GPU)（大端，实测 "
+                           "detail": "转速绕开 SMC，直接读 EC 0x0464(CPU) / 0x046C(GPU)（大端，实测 "
                 + ecLiveRPMText() + "）。温度一律不走 EC（2.8.15 起）："
                 + "CPU 取 SMC 封装温度 TC0P/TC0D/TC0E/TC0F/TC0H，"
                 + "与「监测」页传感器表同源。"
@@ -1266,9 +1348,12 @@ enum NativeAPI {
                 + "（驱动侧 TSENS → PerformanceStatistics[\"Temperature(C)\"]，PR #323），"
                 + "不再轮询 EC 0x044F。"
                 + "实测两路 PWM 数值始终相同（12 进程满载全程 80→177 一致），"
-                + "EC 给两颗风扇的是同一个占空比；转速差约 12% 来自风扇个体/型号差异，"
-                + "不是接反。两颗风扇的归属由用户实物确认：他亲手换过 CPU 风扇，"
-                + "转速较高的 0x046C 才是 CPU 风扇（2026-10-16 修正，之前标反）。"
+                + "EC 给两颗风扇的是同一个占空比；转速差来自风扇个体/型号差异，不是接反。"
+                + "归属按原厂口径 + 用户实物确认：0x0464 是 **CPU 主风扇**"
+                + "（原厂 ADDR_EC_MAIN_FAN_RPM_BYTE1/2，监测页只读这一路），"
+                + "0x046C 是 GPU 第二颗（qc71 驱动的 FAN_RPM_2，前程序才加的扩展项）。"
+                + "2026-10-16 曾按「转速高的那路」反推成 0x46C=CPU，2026-11-11 已纠正 —— "
+                + "同一占空下 GPU 那颗本来就转得快一点，不能拿来判归属。"
                 + "换掉 0x044F 的依据：同期 0x043E 从 64℃ 升到 89℃ 而 0x044F 仅 60→62℃，"
                 + "说明它是 GPU 附近的板级环境温度，不是核心温度"])
             let prob = FanControl.shared.ecProbe()
@@ -1428,6 +1513,11 @@ enum NativeAPI {
         // 3.0.2.1：这一步只供界面「读一眼」用 —— UIControlPrefs.adoptHardwareIfNeeded
         // 拿它把 EC 真值抄进软件记忆，**不再往 EC 写任何东西**。只读这一次，之后不轮询。
         primeCache()
+        // 海岸灯 AP exist（移植文档 §3.4「启动初始化」第一步）：0x748 bit0 置 1。
+        // 已在位就零写入，不碰灯带其它位。
+        if FanControl.kextLoaded() {
+            _ = FanControl.shared.lightbarAssertAPPresent()
+        }
         // 启动时恢复上次保存的键盘灯效（含白平衡增益）。
         //
         // 【2.8.12】以前这里恢复一次，另外还有一条 com.macconsole.rgbrestore 登录项

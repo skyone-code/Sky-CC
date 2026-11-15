@@ -1,6 +1,6 @@
 //
 //  NativeRGB.swift
-//  Mac控制台 —— ITE 8291 键盘灯控制器 · 按 Windows 原厂复刻版重写
+//  Sky CC —— ITE 8291 键盘灯控制器 · 按 Windows 原厂复刻版重写
 //
 //  权威来源：GamingCenter.Replica（Windows 原厂逆向复刻）
 //    Core/Lighting/Ite8291.cs      —— 协议、固件码表、ColorIndex、行缓冲布局
@@ -167,6 +167,20 @@ enum KeyboardEffect: UInt8, CaseIterable {
         case .rippleO: return "扩散涟漪"
         case .music: return "音乐律动"
         case .userMode: return "逐键自定义"
+        }
+    }
+
+    /// 本机固件的 `0x08` 通道**没有**这三个效果号（文档 §2.1 坑表 / §6 效果号表：
+    /// 「0x08 通道没有 1/12/13/15 号，发进去 = 固件未定义态」）。
+    ///
+    /// 原厂它们是 **AP 软件动画**：`Set_ITE_Effect_Type_ApMode` 起一个 `AP_Effect_Task`
+    /// 线程，上位机逐帧算 126 个灯位的颜色再走逐键通道灌下去。所以这三个下固件码
+    /// 一定是无效的（用户实测：三个效果看起来一模一样）——要由 `APEffectEngine`
+    /// 在界面侧逐帧驱动。
+    var isSoftwareAnimation: Bool {
+        switch self {
+        case .neon, .stack, .impact: return true
+        default: return false
         }
     }
 }
@@ -349,6 +363,7 @@ final class KeyboardRGB {
             "feature_report_size": d.maxFeatureReportSize ?? NSNull(),
             "output_report_size": d.maxOutputReportSize ?? NSNull(),
             "led_vendor": WkdColor.vendor.label,
+            "led_variant": WkdColor.variantLabel,
             "support_byte5": WkdColor.rawSupportByte5.map { String(format: "%#04x", $0) } ?? NSNull(),
         ]
     }
@@ -392,6 +407,8 @@ final class KeyboardRGB {
         usleep(200_000)
         guard let d = readFeature(8) else { return ["raw": NSNull(), "version_bytes": NSNull()] }
         if d[0] == 0x80 {
+            // 顺手定键盘世代：VerHigh==19 → 2.1 代补偿曲线（原厂 Is2p1nd）
+            WkdColor.detectVariant(fwMajor: Int(d[1]))
             return ["raw": hexOf(d), "version_bytes": Array(d[1..<5])]
         }
         return ["raw": hexOf(d), "version_bytes": NSNull()]
@@ -437,6 +454,7 @@ final class KeyboardRGB {
         st["brightness_level"] = max(1, min(4, ((pct ?? 75) + 12) / 25))
         st["off"] = (d[0] == 0x08 && d[1] == 0x01)
         st["led_vendor"] = WkdColor.vendor.label
+        st["led_variant"] = WkdColor.variantLabel
         return st
     }
 
@@ -857,6 +875,16 @@ enum RGBProfile {
             case "brightness":
                 kr = try kb.setBrightness(normalizePct(prof["brightness"] as? Int ?? 75))
             case "effect":
+                // 【2026-11-11】AP 软件动画（霓虹/堆叠/冲击）：本机固件 `0x08` 通道
+                // 没有 12/13/15 号效果，照旧下发等于把芯片推进未定义态（用户实测：
+                // 三个效果「点了都一样」）。配置照存（重启/唤醒后 UI 会按它重放），
+                // 画面由 `APEffectEngine` 逐帧算、走 matrix 通道灌下去。
+                if let e = KeyboardCatalog.effect(forName: prof["style"] as? String ?? ""),
+                   e.isSoftwareAnimation {
+                    return ["ok": true, "mode": "effect", "ap": true,
+                            "style": KeyboardCatalog.key(for: e),
+                            "note": "AP 软件动画：固件无此效果号，由界面逐帧驱动"]
+                }
                 var effRGB: [Int]? = prof["rgb"] as? [Int]
                 if effRGB == nil, let hex = prof["hex"] as? String {
                     effRGB = RGBUtil.hexToRgb(hex)
@@ -919,6 +947,7 @@ enum RGBProfile {
             "ok": kr == 0, "kr": kr, "mode": mode, "profile": prof,
             "gains": [gains.0, gains.1, gains.2],
             "led_vendor": WkdColor.vendor.label,
+            "led_variant": WkdColor.variantLabel,
         ]
         if let appliedRGB = appliedRGB { out["applied_rgb"] = appliedRGB }
         return out
@@ -1054,6 +1083,37 @@ enum RGBKeepAlive {
             h.seekToEndOfFile(); h.write(data); try? h.close()
         } else {
             try? data.write(to: logURL)
+        }
+    }
+}
+
+// MARK: - AP exist 常驻（控制中心接管 / 键盘灯 10 分钟熄灯，2026-11-11）
+
+/// 让 EC `0x741` bit0 一直是 1 —— 这一位就是文档 §4.2 的 **AP exist：控制软件在线标志**。
+///
+/// 原厂语义：控制台一打开就下发（`StartTimer_APExistToEC`），60s 续期，退出清 0。
+/// 它宣告「有控制中心在管这台机器」；置 1 时 ITE 8291 固件的「十分钟没人管就关灯」
+/// 策略被关掉，清 0 就恢复。项目早期把它误叫「手动风扇门」，实测已更正。
+/// 详见 `FanControl.assertAPPresent()` 的注释。
+///
+/// 只在 helper（唯一持有 EC 的进程）里跑；**启动下发一次，之后每 60 秒读一次、
+/// 被清掉才补写**，稳态下零写流量。风扇事务结束时也会保留这一位
+/// （`FanControl.doorIdleValue`），这里兜底开机 EC 复位、休眠唤醒后状态丢失。
+enum ECAPPresentKeeper {
+    private static var started = false
+    private static let queue = DispatchQueue(label: "com.macconsole.appresent", qos: .utility)
+    /// 固件计时器是 10 分钟量级，60 秒的守夜足够早。
+    private static let interval: TimeInterval = 60
+
+    static func start() {
+        guard !started else { return }
+        started = true
+        _ = FanControl.shared.assertAPPresent()
+        queue.async {
+            while true {
+                Thread.sleep(forTimeInterval: interval)
+                autoreleasepool { _ = FanControl.shared.assertAPPresent() }
+            }
         }
     }
 }

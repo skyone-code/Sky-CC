@@ -1,6 +1,6 @@
 //
 //  NativeSMC.swift
-//  Mac控制台 —— macOS SMC (System Management Controller) 读取（原生移植）
+//  Sky CC —— macOS SMC (System Management Controller) 读取（原生移植）
 //
 //  对应 Python 版 app-resources/smc.py：纯 IOKit AppleSMC 用户客户端，无第三方依赖。
 //  本机（OpenCore + VirtualSMC）实测可用。提供 CPU 各核心温度、封装温度、
@@ -274,6 +274,23 @@ enum SMCKeys {
 }
 
 enum SMCSnapshot {
+    // MARK: - 功率键的「沿用上一拍」缓存
+    //
+    // PCPT / PCPC / PCPR / PCTR / PC0C / PC0R 这几个功率/电流键在 VirtualSMC
+    // （SMCProcessor 1.3.8）里不是直读寄存器，而是「两次采样的能量差 ÷ 时间」算出来的：
+    //   间隔 0ms → 命中 0%    50ms → 22%   200ms → 35%
+    //   500ms → 78%   1000ms → 65%   2000ms → 75%
+    // 也就是说 value==0 的语义是「这一拍没算出增量」，不是「键不存在」也不是协议失败
+    // （实测 keyInfo/readBytes 两次 kern_return 全为 0，dtype=sp96）。
+    // 以前 `v != 0` 直接丢弃，界面上整组功率键就集体消失、显示 — ，每秒闪一次。
+    //
+    // 处理：读到 0 就取本进程缓存里 10 秒内的上一拍真值，并打 stale=true / age_ms，
+    // 让 UI 能把「这是 1~2 秒前的采样」表达出来，而不是假装是当前值。
+    // 超过窗口还拿不到就照旧不发布 —— 保留「拿不到就不发布」的底线。
+    private static let powerLock = NSLock()
+    private static var powerCache: [String: (v: Double, t: Date)] = [:]
+    private static let powerStaleWindow: TimeInterval = 10
+
     /// 返回一份完整的传感器快照；SMC 不可用时 available=false。
     /// 输出形状与 Python smc.snapshot() 一致。
     static func snapshot() -> [String: Any] {
@@ -314,10 +331,30 @@ enum SMCSnapshot {
                     rawTemps[key] = rounded
                 }
             }
+            let now = Date()
             for (key, name, unit) in SMCKeys.power {
-                if let v = smc.readValue(key), v != 0 {
+                var value = smc.readValue(key)
+                var stale = false
+                var ageMs = 0
+                powerLock.lock()
+                if let v = value, v != 0 {
+                    powerCache[key] = (v, now)
+                } else if let c = powerCache[key] {
+                    let age = now.timeIntervalSince(c.t)
+                    if age <= powerStaleWindow {
+                        value = c.v
+                        stale = true
+                        ageMs = Int((age * 1000).rounded())
+                    } else {
+                        value = nil
+                        powerCache[key] = nil
+                    }
+                }
+                powerLock.unlock()
+                if let v = value {
                     powers.append(["key": key, "name": name, "unit": unit,
-                                   "value": (v * 1000).rounded() / 1000])
+                                   "value": (v * 1000).rounded() / 1000,
+                                   "stale": stale, "age_ms": ageMs])
                 }
             }
 

@@ -6,7 +6,7 @@ import SwiftUI
 // 每张指标卡自带 90 秒迷你曲线 —— 视觉密度接近 Stats，但信息量按本机
 // 实际能采到的字段铺满（不再只有几个指标）。
 
-/// 胶囊标签
+/// 胶囊标签（照 Vela-X Pill：填充 12% + 描边 40% 的双层胶囊）
 struct Chip: View {
     var text: String
     var color: Color = Theme.blue

@@ -1,6 +1,6 @@
 //
 //  NativeHID.swift
-//  Mac控制台 —— IOKit HID 用户态封装（原生移植）
+//  Sky CC —— IOKit HID 用户态封装（原生移植）
 //
 //  对应 Python 版 app-resources/hid.py。
 //

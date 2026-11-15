@@ -8,7 +8,7 @@
 //   （项目来自身份不明的开发者），看起来像测试残留。
 //
 //   本程序是同一件事的自有执行体：launchd 以 root 跑它，它再去调
-//   /usr/bin/kmutil load -p <kext>。显示名变成「Mac控制台散热扩展」，
+//   /usr/bin/kmutil load -p <kext>。显示名变成「Sky CC散热扩展」，
 //   既不影响开机加载，也不会再出现 kmutil 字样。
 //
 // 为什么必须 root：实测非 root 调 kmutil load 会直接报
