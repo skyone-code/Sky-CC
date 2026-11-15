@@ -39,16 +39,68 @@ extension View {
     func cardNote() -> some View { modifier(CardNoteModifier()) }
 }
 
+// MARK: - 页面背景（2026-11-15 皮肤功能）
+//
+// 各页原来的 `.background(Theme.bg)` 统一换成 `.pageBackground()`：
+//   · 无自定义图片 → 铺 SkinCenter 当前预设底色（动态浅/深）；
+//   · 有自定义图片 → 整页铺图（scaledToFill + 裁边）再压一层底色蒙层
+//     （不透明度 0.72，卡片文字可读性优先），卡片本身依旧是不透明 panel。
+// 订阅 SkinCenter：设置页换皮肤 / 换图后，所有挂了本修饰器的页面立即重绘。
+struct PageBackgroundModifier: ViewModifier {
+    @EnvironmentObject private var skin: SkinCenter
+
+    func body(content: Content) -> some View {
+        ZStack {
+            if let img = skin.customImage {
+                GeometryReader { geo in
+                    Image(nsImage: img)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: geo.size.width, height: geo.size.height)
+                        .clipped()
+                        .ignoresSafeArea()
+                }
+                .ignoresSafeArea()
+                skin.bgColor.opacity(0.72).ignoresSafeArea()
+            } else {
+                skin.bgColor.ignoresSafeArea()
+            }
+            content
+        }
+    }
+}
+
+extension View {
+    /// 页面背景：预设纯色或自定义图片 + 蒙层（皮肤功能入口，见 PageBackgroundModifier）
+    func pageBackground() -> some View { modifier(PageBackgroundModifier()) }
+}
+
 enum Theme {
     // 底色系（浅色 / 深色）
     // 2.8.11（用户要求）：深色下页面底太黑，按系统设置（macOS 深色）的观感整体提亮：
     //   页面底 ≈ 系统 windowBackground，卡片比底色略亮一档，控件再亮一档。
     //   原来是 0x17191d / 0x22252a / 0x2c3037，确实压得太死。
     static let bg = Theme.dyn(light: 0xf6f7f9, dark: 0x1e1f21)        // 页面底
-    static let panel = Theme.dyn(light: 0xffffff, dark: 0x2a2b2e)     // 卡片
-    static let panel2 = Theme.dyn(light: 0xeef0f4, dark: 0x34353a)    // 控件底 / 磁贴内
+
+    // 表面色（卡片 / 控件 / 进度条底）—— 皮肤感知（2026-11-15 用户反馈：
+    // 皮肤应用后卡片、标识等全是实色，背景看不到）。
+    // 默认皮肤（ink 且无图片）= 原值实色，观感与历史版本完全一致；
+    // 非默认预设配色 / 自定义图片时按透明度返色，背景从卡片下面透出来。
+    // 透明度基准 = hero 条的 panel 0.72（2026-11-15 用户定：「都做成 hero 那种」）。
+    // panel2 / barBg 是**叠在卡片内**的二级表面：卡片已经 0.72，二级表面必须
+    // 更透（0.38 / 0.45）才不会把卡片那层又盖成实色。
+    // 用 computed var：所有 fill/background(Theme.panel*) 调用点一次性生效。
+    static var panel: Color { surface(dyn(light: 0xffffff, dark: 0x2a2b2e), alpha: 0.72) } // 卡片
+    static var panel2: Color { surface(dyn(light: 0xeef0f4, dark: 0x34353a), alpha: 0.38) } // 卡片内磁贴 / 控件底
+    static var barBg: Color { surface(dyn(light: 0xe6e9ee, dark: 0x3a3b40), alpha: 0.45) }  // 进度条底
     static let line = Theme.dyn(light: 0xe0e3e9, dark: 0x3e3f44)      // 描边
-    static let barBg = Theme.dyn(light: 0xe6e9ee, dark: 0x3a3b40)     // 进度条底
+
+    /// 表面色的皮肤开关：非默认皮肤返 alpha 透明版
+    private static func surface(_ base: Color, alpha: Double) -> Color {
+        let skin = SkinCenter.shared
+        if skin.preset == .ink && !skin.isCustomImage { return base }
+        return base.opacity(alpha)
+    }
 
     // 文字系（灰阶；深色下整体提亮，不用纯白）
     static let txt = Theme.dyn(light: 0x2a2f37, dark: 0xe8eaef)       // 主文字
@@ -170,6 +222,14 @@ struct Card<Content: View>: View {
     /// 转成全大写就成了 DGPU，读起来像缩写而不是「d + GPU」。
     /// 规则见文件级 `styledLabel`。
 
+    /// 卡片底色随皮肤（2026-11-15 用户反馈：皮肤应用后卡片仍是不透明实色，背景看不到）：
+    ///   · 全部用 Theme.panel 半透明填充（0.72，与 hero 条同款）——2026-11-15 用户定案：
+    ///     **不要磨砂**，图片模式下 ultraThinMaterial 的毛玻璃模糊不要，只要普通半透明；
+    ///   · 默认皮肤 → panel 原值实色（观感与历史版本完全一致）。
+    /// 直接引用 SkinCenter.shared（不走 environmentObject）：Card 用在菜单栏弹窗等
+    /// 没注入皮肤环境的地方也不会崩，Published 变更照样触发重绘。
+    @ObservedObject private var skin = SkinCenter.shared
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             if let t = displayTitle {
@@ -192,7 +252,12 @@ struct Card<Content: View>: View {
         // 所以内容最后一行到卡片下沿的实际观感是 28pt（2026-11-08 实测）。
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.panel, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .background {
+            // 皮肤感知 computed var：默认皮肤 = 实色，非默认/图片模式 = 0.72 半透明
+            // （与 hero 条同款普通半透明，不带毛玻璃模糊 —— 2026-11-15 用户定案不要磨砂）
+            RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .fill(Theme.panel)
+        }
         .overlay(RoundedRectangle(cornerRadius: 13, style: .continuous)
             .strokeBorder(Theme.line, lineWidth: 1))
         // 2026-11-08（性能）：去掉卡片投影。
@@ -211,6 +276,8 @@ struct KVRow: View {
     var key: String
     var value: String
     var valueColor: Color = Theme.txt
+    /// 行尾附加视图（2026-11-15：设置页版本行加「检查更新」按钮用；nil = 不加，所有旧调用不变）
+    var trailing: AnyView? = nil
     var body: some View {
         HStack {
             Text(key).font(.system(size: 12.5)).foregroundStyle(Theme.dim)
@@ -218,6 +285,7 @@ struct KVRow: View {
             Text(value).font(.system(size: 12.5, weight: .medium))
                 .monospacedDigit()
                 .foregroundStyle(valueColor)
+            if let t = trailing { t.padding(.leading, 8) }
         }
         .padding(.vertical, 5)
         .overlay(alignment: .bottom) {
