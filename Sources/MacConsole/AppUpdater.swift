@@ -44,6 +44,8 @@ final class AppUpdater: ObservableObject {
     private init() {}
 
     @Published var checkingUpdate = false
+    /// 转圈 sheet 只跟**手动**检查走（2026-11-16 用户反馈：启动静默检查不该弹窗）
+    @Published private(set) var spinnerVisible = false
     @Published var updatePhase: AppUpdatePhase = .idle
     @Published var downloadProgress: Double = 0
     @Published var updateInfo: AppUpdateInfo?
@@ -53,9 +55,10 @@ final class AppUpdater: ObservableObject {
     private var pollTimer: Timer?
     private var launchChecked = false
 
-    /// sheet 是否该显示（检查中 / 下载中 / 安装中）
+    /// sheet 是否该显示（手动检查的转圈 / 下载中 / 安装中）。
+    /// 注意用 spinnerVisible 而不是 checkingUpdate —— 后者静默检查也会置位。
     var sheetVisible: Bool {
-        checkingUpdate || updatePhase == .downloading || updatePhase == .installing
+        spinnerVisible || updatePhase == .downloading || updatePhase == .installing
     }
 
     /// sheet 被手动关掉时：只在非检查期才复位下载状态
@@ -82,6 +85,7 @@ final class AppUpdater: ObservableObject {
     func check(silent: Bool) {
         guard !checkingUpdate, updatePhase == .idle else { return }
         checkingUpdate = true
+        spinnerVisible = !silent
         ReleaseFallback.fetchLatest(
             githubAPI: "https://api.github.com/repos/skyone213/Sky-CC/releases/latest",
             giteeRepo: "Sky-CC",
@@ -89,6 +93,7 @@ final class AppUpdater: ObservableObject {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.checkingUpdate = false
+                self.spinnerVisible = false
                 guard let dict,
                       let tag = dict["tag_name"] as? String else {
                     if !silent {

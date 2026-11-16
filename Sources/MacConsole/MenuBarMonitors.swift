@@ -1,167 +1,200 @@
+// ============================================================================
+// 菜单栏监控（2026-11-16 重构·第二轮：S 飘带独立 + 监控项全量指标化）
+//
+// 用户定案：
+//   1. **S 飘带（程序主图标）独立成一个状态项** —— 就是 MenuBarExtra，
+//      面板 / openWindow / 双击唤窗逻辑全在里面，不拼接任何监控数字；
+//   2. **其余监控信息拼接成另一个独立状态项**，原版 Stats Mini 双行风格
+//      （7pt light 标签 + 12pt 数值，段距 4pt），点它打开主窗口；
+//   3. 监控项全量指标化（「状态栏显示」页逐项开关）：
+//        CPU：温度 / 频率 / 占用率 / 功耗 / 风扇转速 / 核显占用率 / 核显显存占用
+//        GPU：温度 / 频率 / 占用率 / 功耗 / 风扇转速 / GR 占用率 / 显存占用
+//        内存：占用率；硬盘：温度（每块盘独立开关）；网速：仅上行 / 仅下行 / 上下行
+//
+// 数据节奏：MonitorStore 的 /api/snapshot（窗口可见 3s / 隐藏 5s / 性能页 1s），
+// 经 MetricsHub 喂给拼接条；状态项宽度随内容显式同步（syncContentWidth）。
+//
+// 本文件只负责：段定义（MenuBarSegment / SegmentRef）、数值计算助手、
+// 监控状态项的创建与显隐。S 飘带在 MacConsoleApp.swift 的 MenuBarLabel。
+// ============================================================================
+
 import Cocoa
 import SwiftUI
 
-// ============================================================================
-// 菜单栏监控图标（2026-10-19：按 exelban/Stats 同款几何重写，两轮用户反馈：
-// 第一轮 ① NET 只有下行没有上行 ② 图标间缝隙偏大 ③ 整体样式与 Stats 不一致；
-// 第二轮 ④ Mini 标签与数值叠层（SSD 快贴上 40°）⑤ NET→SSD 间距比 Stats 宽。
-// ④的根因：本机菜单栏实测 22pt（视图 H=18），Stats 的标签 rect 是硬编码
-// y=12，我写成 H-8 就低了 2pt；⑤的根因：Stats 速率文字默认右对齐贴项右缘，
-// 我写成左对齐，项尾空了 ~21pt。均已按 Stats v3.0.22 源码常量修正。）
-//
-// 为什么不用 SwiftUI 的 MenuBarExtra 做这一排图标：
-//   1) MenuBarExtra(isInserted:) 一旦使用，主窗口就不再自动创建（2.3.6 实测坑，
-//      后端都不会启动），而且它也不支持运行时插拔单个图标；
-//   2) 每个图标独立开关 + 各自的传感器面板，用 AppKit 状态项最直接。
-//
-// 样式基准（全部实测自 Stats v3.0.22 源码 Kit/Widgets/Mini.swift + Speed.swift，
-// 注意：不是目测，用户机器菜单栏实测只有 22pt，视图 H=18）：
-//   · Mini（CPU/RAM/GPU/SSD）：固定宽 31pt；标签 rect 硬编码 (0,12,31,7) 7pt light、
-//     数值 rect 硬编码 (0,1,31,13) 12pt regular——两者都是 Stats 源码里的常量，
-//     不要随 H 相对缩放（2.4.0 踩坑：H-8 在本机 22pt 菜单栏下标签低 2pt 叠层）。
-//   · Speed（NET）：固定宽 55pt；文字 rect (7,·,48,·) 且**右对齐**
-//     （Stats valueAlignment 默认 "right"），上行=上传（output，红点 y=10.5）、
-//     下行=下载（input，蓝点）；速率 9pt light；格式十进制（"33 KB/s"，无流量也显示
-//     "0 KB/s"）；圆点对应方向 ≥1KB/s 时用系统红/蓝，否则退化为文字色。
-//     右对齐是 NET→下一项间距与 Stats 一致的关键；左对齐会在项尾空 ~21pt。
-//   · 状态项：length = 内容精确宽度 + button.image = NSImage()（空图清掉默认
-//     排版）——这是缝隙与 Stats 一样小的关键，固定宽/留白都会显缝隙。
-//
-// 数据源：MetricsHub 每 1 秒拉一次 /api/overview + /api/fan，状态项标题和
-// 弹出面板共用这一份快照。开关状态存 UserDefaults（menubar.icon.<kind>），
-// 「系统」页的开关改动通过 MenuBarMonitors.iconsChanged 通知触发重建。
-// ============================================================================
+// MARK: - 段定义
 
-/// 图标种类（每个种类 = 菜单栏一个状态项 + 一个传感器面板）
-enum MenuBarIconKind: String, CaseIterable, Identifiable {
-    case cpu, mem, gpu, disk, net
+/// 菜单栏监控段（静态段）。硬盘是动态段（一块盘一段，见 SegmentRef.disk）。
+/// 声明顺序 = 菜单栏拼接顺序（硬盘动态段插在网速前）。
+enum MenuBarSegment: String, CaseIterable, Identifiable {
+    // CPU 组
+    case cpuTemp, cpuFreq, cpuUsage, cpuPower, cpuFan
+    case igpuUsage, igpuVram
+    // GPU 组
+    case gpuTemp, gpuFreq, gpuUsage, gpuPower, gpuFan
+    case grUsage, gpuVram
+    // 内存
+    case memUsage
+    // 网速（网速组在菜单栏里排在动态硬盘段之后，见 currentSegments）
+    case netDown, netUp, netBoth
+
     var id: String { rawValue }
-    var defaultsKey: String { "menubar.icon.\(rawValue)" }
 
+    /// 开关的 UserDefaults 键（「状态栏显示」页逐项勾选）
+    var defaultsKey: String { "menubar.seg.\(rawValue)" }
+
+    /// 静态段默认只开：CPU 温度 / 内存占用率 / 网速上下行（与旧版默认观感一致）
+    var defaultEnabled: Bool {
+        switch self {
+        case .cpuTemp, .memUsage, .netBoth: return true
+        default: return false
+        }
+    }
+
+    /// 「状态栏显示」页的分组（CPU / GPU / 内存 / 网速；硬盘是动态组）
+    var group: SegmentGroup {
+        switch self {
+        case .cpuTemp, .cpuFreq, .cpuUsage, .cpuPower, .cpuFan, .igpuUsage, .igpuVram:
+            return .cpu
+        case .gpuTemp, .gpuFreq, .gpuUsage, .gpuPower, .gpuFan, .grUsage, .gpuVram:
+            return .gpu
+        case .memUsage: return .mem
+        case .netDown, .netUp, .netBoth: return .net
+        }
+    }
+
+    /// 设置页显示名
+    var title: String {
+        switch self {
+        case .cpuTemp: return "温度"
+        case .cpuFreq: return "频率"
+        case .cpuUsage: return "占用率"
+        case .cpuPower: return "功耗"
+        case .cpuFan: return "风扇转速"
+        case .igpuUsage: return "核显占用率"
+        case .igpuVram: return "核显显存占用"
+        case .gpuTemp: return "温度"
+        case .gpuFreq: return "频率"
+        case .gpuUsage: return "占用率"
+        case .gpuPower: return "功耗"
+        case .gpuFan: return "风扇转速"
+        case .grUsage: return "GR 占用率"
+        case .gpuVram: return "显存占用"
+        case .memUsage: return "占用率"
+        case .netDown: return "仅下行"
+        case .netUp: return "仅上行"
+        case .netBoth: return "上下行"
+        }
+    }
+
+    /// 设置页 / 明细行的 SF Symbol。
+    /// ⚠ 网速三段原来的符号名是空的 —— Image(systemName:) 拿不到图会渲染成「？」
+    /// （2026-11-16 用户反馈），换成与语义一致的有效符号名。
+    /// 菜单栏拼接条本身按原版 Stats 风格**不放图标**（见 MenuBarMonitorBar），
+    /// 这里的符号只出现在「状态栏显示」页与面板明细行。
+    var symbol: String {
+        switch self {
+        case .cpuTemp: return "thermometer.medium"
+        case .cpuFreq: return "gauge"
+        case .cpuUsage, .igpuUsage: return "cpu"
+        case .cpuPower, .gpuPower: return "bolt.fill"
+        case .cpuFan, .gpuFan: return "fanblades.fill"
+        case .igpuVram, .gpuVram: return "memorychip"
+        case .gpuTemp: return "thermometer.medium"
+        case .gpuFreq: return "gauge"
+        case .gpuUsage, .grUsage: return "bolt.horizontal.fill"
+        case .memUsage: return "memorychip"
+        case .netDown: return "arrow.down"
+        case .netUp: return "arrow.up"
+        case .netBoth: return "arrow.up.arrow.down"
+        }
+    }
+
+    /// 菜单栏拼接条里的 Mini 标签。2026-11-16 用户定案：**只用大家认识的设备名**
+    /// （CPU / iGPU / dGPU / RAM / SSD / NET），指标靠数值格式自己表达
+    /// （62° / 1.6G / 42% / 12.3W / 2400）—— FREQ/LOAD/PWR 这类自造缩写没人认识。
+    /// 独显用 dGPU（2026-11-16 用户要求，与 iGPU 对称更好认）；
+    /// 网速上下行两段标签 NET，箭头数值表意；上下行一起的走 Speed 双行小件（无标签）。
+    var menuLabel: String {
+        switch self {
+        case .cpuTemp, .cpuFreq, .cpuUsage, .cpuPower, .cpuFan:
+            return "CPU"
+        case .igpuUsage, .igpuVram:
+            return "iGPU"
+        case .gpuTemp, .gpuFreq, .gpuUsage, .grUsage, .gpuPower, .gpuFan, .gpuVram:
+            return "dGPU"
+        case .memUsage: return "RAM"
+        case .netDown, .netUp: return "NET"
+        case .netBoth:  return ""
+        }
+    }
+}
+
+/// 「状态栏显示」页分组
+enum SegmentGroup: String, CaseIterable {
+    case cpu, gpu, mem, disk, net
     var title: String {
         switch self {
         case .cpu: return "CPU"
-        case .mem: return "内存"
         case .gpu: return "GPU"
+        case .mem: return "内存"
         case .disk: return "硬盘"
-        case .net: return "网络"
+        case .net: return "网速"
+        }
+    }
+}
+
+/// 菜单栏里实际拼接的一段（静态段或动态硬盘段）
+enum SegmentRef: Identifiable, Equatable {
+    case seg(MenuBarSegment)
+    case disk(bsd: String, model: String)
+
+    var id: String {
+        switch self {
+        case .seg(let s): return s.rawValue
+        case .disk(let bsd, _): return "disk.\(bsd)"
         }
     }
 
-    /// SF Symbols（「系统」页开关行用；菜单栏里按 Stats 风格不放图标）
-    ///
-    /// ⚠ 2.8.8 修 bug：原来网络用的是 `arrow.down.arrow.up`，这个符号名在
-    /// SF Symbols 里**不存在**（正确的是 `arrow.up.arrow.down`），
-    /// `Image(systemName:)` 拿不到图就直接留白 —— 用户看到的就是
-    /// 「网络前面没有图标」。改名字前先用 NSImage(systemSymbolName:) 验一遍。
+    var group: SegmentGroup {
+        switch self {
+        case .seg(let s): return s.group
+        case .disk: return .disk
+        }
+    }
+
+    /// 设置页 / 明细行的显示名（硬盘带盘标识）
+    var title: String {
+        switch self {
+        case .seg(let s): return s.title
+        case .disk(_, let model):
+            return model.isEmpty ? "硬盘温度" : "温度 · \(model)"
+        }
+    }
+
     var symbol: String {
         switch self {
-        case .cpu: return "cpu"
-        case .mem: return "memorychip"
-        case .gpu: return "bolt.horizontal.fill"
+        case .seg(let s): return s.symbol
         case .disk: return "internaldrive"
-        case .net: return "arrow.up.arrow.down"
         }
     }
 
-    var defaultEnabled: Bool {
-        switch self {
-        case .cpu, .mem, .net: return true
-        case .gpu, .disk: return false
-        }
-    }
-
-    /// Mini 视图里的标签（对齐 Stats：三字母大写）
+    /// 菜单栏拼接条的 Mini 标签（硬盘沿用原版 Stats 的「SSD」）
     var menuLabel: String {
         switch self {
-        case .cpu: return "CPU"
-        case .mem: return "RAM"
-        case .gpu: return "GPU"
+        case .seg(let s): return s.menuLabel
         case .disk: return "SSD"
-        case .net: return "NET"
-        }
-    }
-
-    /// 状态项宽度：与 Stats 逐一致——Mini 固定 31pt、Speed 两行 55pt
-    /// GPU 例外：指标为「占用率」时并排显示核显/独显两列，Mini 的 31pt 装不下，走双列视图
-    var itemWidth: CGFloat {
-        switch self {
-        case .net: return NetStatusItemView.width
-        case .gpu: return MenuBarMetric.current(for: .gpu) == .usage
-                        ? GpuStatusItemView.width
-                        : MiniStatusItemView.width
-        default: return MiniStatusItemView.width
-        }
-    }
-
-    /// 该种类的菜单栏数值是否可切换指标
-    /// 2.7.5：硬盘也加进来（温度 / 已用寿命），并且可以指定看哪块盘。
-    /// 2026-11-14（用户要求）：硬盘去掉「已用寿命」，只显示温度，不再给指标切换。
-    var supportsMetric: Bool {
-        switch self {
-        case .cpu, .gpu: return true
-        case .mem, .net, .disk: return false
-        }
-    }
-
-    /// 可选的显示指标（决定设置页那一行放哪些分段）
-    var metricOptions: [MenuBarMetric] {
-        switch self {
-        case .cpu, .gpu: return [.temp, .usage]
-        case .mem, .net, .disk: return []
-        }
-    }
-
-    /// 显示指标的 UserDefaults 键（v2.4.5 新增）
-    var metricKey: String { "menubar.metric.\(rawValue)" }
-
-    /// 硬盘图标看哪块盘（存 bsd 名，空 = 第一块能读的盘）
-    static let diskTargetKey = "menubar.disk.bsd"
-
-    var defaultMetric: MenuBarMetric {
-        switch self {
-        case .cpu, .gpu, .disk: return .temp   // v2.4.5：用户要求默认显示温度
-        case .mem, .net: return .usage
         }
     }
 }
 
-/// 菜单栏图标显示的指标（CPU/GPU/硬盘可切，在「设置」页选择）
-enum MenuBarMetric: String, CaseIterable, Identifiable {
-    case usage = "usage"
-    case temp = "temp"
-    case life = "life"
-    var id: String { rawValue }
+// MARK: - 快照中枢（不变：1 秒一拍，来自 MonitorStore 的 /api/snapshot）
 
-    var label: String {
-        switch self {
-        case .usage: return "占用率"
-        case .temp: return "温度"
-        case .life: return "已用寿命"
-        }
-    }
-
-    /// 当前生效的指标（读 UserDefaults，带默认值回落）
-    static func current(for kind: MenuBarIconKind) -> MenuBarMetric {
-        guard kind.supportsMetric,
-              let raw = UserDefaults.standard.string(forKey: kind.metricKey),
-              let m = MenuBarMetric(rawValue: raw) else { return kind.defaultMetric }
-        return m
-    }
-}
-
-/// 后端快照中枢：菜单栏标题与弹出面板共用的唯一数据源
-///
-/// 2.7.0：不再自己轮询。旧实现每 2 秒额外打 /api/overview + /api/fan，
-/// 而 MonitorStore 同期也在打快照——等于让 helper 重复组两份包、EC 采样器被
-/// 两处同时触发（实测 /api/fan 延迟因此在 0.2–3.2s 之间乱跳）。
-/// 现在数据统一由 MonitorStore 的 /api/snapshot（1 秒一次）推过来。
 @MainActor
 final class MetricsHub: ObservableObject {
     static let shared = MetricsHub()
     @Published var overview: [String: Any] = [:]
     @Published var live: [String: Any] = [:]
-    /// SMC 传感器表（系统温度来源，和风扇 / EC 无关）
+    /// SMC 传感器表（系统温度 / 功耗来源，和风扇 / EC 无关）
     @Published var sensors: [String: Any] = [:]
     private var started = false
 
@@ -181,14 +214,9 @@ final class MetricsHub: ObservableObject {
         overview = o
         live = l
         sensors = s
-        MenuBarMonitors.shared.refreshTitles()
     }
 
-    /// 菜单栏 CPU 温度：**直接取 SMC 快照**（系统传感器表），不经过风扇 / EC 那条链。
-    ///
-    /// `live["temp_cpu"]` 在后端虽然也是 SMC 取的，但它挂在 fan payload 下面，
-    /// 读代码时很容易被当成「风扇 / EC 数据」。菜单栏只要一个温度数字，
-    /// 从 `sensors.raw_temps` 取最直接，也保证 kext 没加载时照样有值。
+    /// 菜单栏 CPU 温度：直接取 SMC 快照（raw_temps 的 TC0P 等），不经 EC。
     static func cpuTempC(_ sensors: [String: Any], _ live: [String: Any]) -> Double? {
         if let raw = sensors["raw_temps"] as? [String: Any] {
             for key in ["TC0P", "TC0D", "TC0E", "TC0F", "TC0H"] {
@@ -198,304 +226,227 @@ final class MetricsHub: ObservableObject {
         return BackendService.double(live, "temp_cpu")
     }
 
-    /// 菜单栏 GPU 温度：NVAccel 上报的核心温度（本来就不经过 EC）。
+    /// 菜单栏 GPU 温度：NVAccel 上报的核心温度
     static func gpuTempC(_ sensors: [String: Any], _ live: [String: Any]) -> Double? {
         BackendService.double(live, "temp_gpu")
     }
 }
+
+// MARK: - 监控状态项 + 数值助手
 
 @MainActor
 final class MenuBarMonitors: NSObject {
     static let shared = MenuBarMonitors()
     static let iconsChanged = Notification.Name("MenuBarIconsChanged")
 
-    private var items: [MenuBarIconKind: NSStatusItem] = [:]
-    private var itemViews: [MenuBarIconKind: NSView] = [:]
-    private var buttonKinds: [ObjectIdentifier: MenuBarIconKind] = [:]
-    private var currentKind: MenuBarIconKind?
-    private var popover: NSPopover?
-    /// 同一次点击去重：子视图 mouseDown 与按钮 action 可能同时触发（不同 macOS
-    /// 版本行为不一致），0.35s 内同图标的第二次调用直接忽略，避免「开了又关」。
-    private var lastClick: (kind: MenuBarIconKind, at: Date)?
-
-    /// 诊断日志：排查菜单栏点击不走/双走时用（/tmp/macconsole-menubar.log）
-    private func diag(_ s: String) {
-        let line = "[\(Date())] \(s)\n"
-        guard let data = line.data(using: .utf8) else { return }
-        let url = URL(fileURLWithPath: "/tmp/macconsole-menubar.log")
-        if let h = try? FileHandle(forWritingTo: url) {
-            _ = try? h.seekToEnd()
-            h.write(data); try? h.close()
-        } else {
-            try? data.write(to: url)
-        }
-    }
+    /// 监控段拼接状态项（与 S 飘带的 MenuBarExtra 各自独立）
+    private var monitorItem: NSStatusItem?
+    /// 状态项里的 SwiftUI 宿主视图（宽度同步要用它的 fittingSize）
+    private var monitorHost: NSHostingView<MenuBarMonitorBar>?
 
     func start() {
         UserDefaults.standard.register(defaults: [
-            MenuBarIconKind.cpu.defaultsKey: true,
-            MenuBarIconKind.mem.defaultsKey: true,
-            MenuBarIconKind.gpu.defaultsKey: false,
-            MenuBarIconKind.disk.defaultsKey: false,
-            MenuBarIconKind.net.defaultsKey: true,
-            // v2.4.5：菜单栏 CPU 默认显示温度（占用率可在「系统」页切回）
-            MenuBarIconKind.cpu.metricKey: MenuBarMetric.temp.rawValue,
-            // GPU 例外：2026-10-26 用户要求 GPU 图标并排显示核显与独显两项，默认给占用率。
-            // 想看温度在「系统」页切回「温度」即可，切回去就是原来的单列 31pt 图标。
-            MenuBarIconKind.gpu.metricKey: MenuBarMetric.usage.rawValue,
+            MenuBarSegment.cpuTemp.defaultsKey: MenuBarSegment.cpuTemp.defaultEnabled,
+            MenuBarSegment.cpuFreq.defaultsKey: MenuBarSegment.cpuFreq.defaultEnabled,
+            MenuBarSegment.cpuUsage.defaultsKey: MenuBarSegment.cpuUsage.defaultEnabled,
+            MenuBarSegment.cpuPower.defaultsKey: MenuBarSegment.cpuPower.defaultEnabled,
+            MenuBarSegment.cpuFan.defaultsKey: MenuBarSegment.cpuFan.defaultEnabled,
+            MenuBarSegment.igpuUsage.defaultsKey: MenuBarSegment.igpuUsage.defaultEnabled,
+            MenuBarSegment.igpuVram.defaultsKey: MenuBarSegment.igpuVram.defaultEnabled,
+            MenuBarSegment.gpuTemp.defaultsKey: MenuBarSegment.gpuTemp.defaultEnabled,
+            MenuBarSegment.gpuFreq.defaultsKey: MenuBarSegment.gpuFreq.defaultEnabled,
+            MenuBarSegment.gpuUsage.defaultsKey: MenuBarSegment.gpuUsage.defaultEnabled,
+            MenuBarSegment.gpuPower.defaultsKey: MenuBarSegment.gpuPower.defaultEnabled,
+            MenuBarSegment.gpuFan.defaultsKey: MenuBarSegment.gpuFan.defaultEnabled,
+            MenuBarSegment.grUsage.defaultsKey: MenuBarSegment.grUsage.defaultEnabled,
+            MenuBarSegment.gpuVram.defaultsKey: MenuBarSegment.gpuVram.defaultEnabled,
+            MenuBarSegment.memUsage.defaultsKey: MenuBarSegment.memUsage.defaultEnabled,
+            MenuBarSegment.netDown.defaultsKey: MenuBarSegment.netDown.defaultEnabled,
+            MenuBarSegment.netUp.defaultsKey: MenuBarSegment.netUp.defaultEnabled,
+            MenuBarSegment.netBoth.defaultsKey: MenuBarSegment.netBoth.defaultEnabled,
         ])
-        rebuild()
-        NotificationCenter.default.addObserver(
-            forName: Self.iconsChanged, object: nil, queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in self?.rebuild() }
-        }
-        NotificationCenter.default.addObserver(
-            forName: UserDefaults.didChangeNotification, object: nil, queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in self?.rebuild() }
-        }
         MetricsHub.shared.start()
+        ensureMonitorItem()
     }
 
-    /// 按开关状态重建所有状态项（「系统」页开关变化时调用）
-    func rebuild() {
-        for kind in MenuBarIconKind.allCases {
-            let want = UserDefaults.standard.bool(forKey: kind.defaultsKey)
-            let has = items[kind] != nil
-            if want && !has { createItem(kind) }
-            if !want && has { removeItem(kind) }
+    /// 兼容保留：历史调用点（面板 / 设置页）不用改。
+    func refreshTitles() {}
+
+    /// 创建 / 更新监控状态项（S 飘带之外的那个）。没有勾任何监控段时隐藏。
+    private func ensureMonitorItem() {
+        if monitorItem == nil {
+            let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+            // item.view 已 deprecated，但只有它能按内容自适应宽度（button 方案要自己算 frame）
+            let host = NSHostingView(rootView: MenuBarMonitorBar())
+            item.view = host
+            monitorItem = item
+            monitorHost = host
         }
-        // 指标可能也一起变了（GPU 温度↔占用率是两种视图、两种宽度），交给它按需重建
-        refreshTitles()
+        syncVisibility()
     }
 
-    private func createItem(_ kind: MenuBarIconKind) {
-        let item = NSStatusBar.system.statusItem(withLength: kind.itemWidth)
-        guard let button = item.button else {
-            NSStatusBar.system.removeStatusItem(item)
-            return
-        }
-        // Stats 同款紧凑三件套：
-        //  ① 空 image——清掉按钮默认的 image/title 排版，自定义视图才不会有多余内边距
-        //  ② length = 内容精确宽度——固定宽/留白都会显出缝隙（2.3.9 用户反馈的根因）
-        //  ③ 自定义视图贴 (0, 2) 放入按钮，高度 = 菜单栏厚度 - 4（上下各 2pt）
-        button.image = NSImage()
-        button.title = ""
-        let view = makeView(kind)
-        view.frame = NSRect(x: 0, y: 2, width: kind.itemWidth,
-                            height: max(0, NSStatusBar.system.thickness - 4))
-        view.identifier = NSUserInterfaceItemIdentifier(kind.rawValue)
-        view.onClick = { [weak self] in self?.handleClick(kind, via: "view-mouseDown") }
-        button.subviews = [view]
-        item.length = kind.itemWidth
-        item.autosaveName = "MacConsole_\(kind.rawValue)"
-        // 点击双通道（2026-10-20 修复 macOS 15 菜单栏图标点不动）：
-        //   通道① 按钮自身 target/action —— 某些系统版本上菜单栏窗口不会把鼠标事件
-        //          送进按钮子视图，只有按钮自己能收到（原方案只挂子视图手势识别器，
-        //          在 macOS 15 上实测完全不触发，macOS 26 正常）；
-        //   通道② 子视图重写 mouseDown/rightMouseDown（见 MiniStatusItemView.onClick）。
-        // 两条路都进 handleClick，内部按时间戳去重，绝不会一次点击开+关弹两遍。
-        button.target = self
-        button.action = #selector(statusButtonClicked(_:))
-        button.sendAction(on: [.leftMouseUp, .rightMouseUp])
-        buttonKinds[ObjectIdentifier(button)] = kind
-        items[kind] = item
-        itemViews[kind] = view
-        updateView(kind)   // 立即填一次值，避免首帧空白
-    }
-
-    @objc private func statusButtonClicked(_ sender: NSStatusBarButton) {
-        guard let kind = buttonKinds[ObjectIdentifier(sender)] else { return }
-        handleClick(kind, via: "button-action")
-    }
-
-    /// 点击统一入口（两条通道汇合处）。0.35s 内同图标的重复调用视为同一次点击。
-    private func handleClick(_ kind: MenuBarIconKind, via: String) {
-        let now = Date()
-        if let last = lastClick, last.kind == kind, now.timeIntervalSince(last.at) < 0.35 {
-            diag("click \(kind.rawValue) via \(via) —— 0.35s 内重复，去重忽略")
-            return
-        }
-        lastClick = (kind, now)
-        diag("click \(kind.rawValue) via \(via)")
-        clicked(kind)
-    }
-
-    private func makeView(_ kind: MenuBarIconKind) -> NSView & StatusItemClickableView {
-        switch kind {
-        case .net: return NetStatusItemView()
-        case .gpu where MenuBarMetric.current(for: .gpu) == .usage: return GpuStatusItemView()
-        default: return MiniStatusItemView(label: kind.menuLabel)
-        }
-    }
-
-    private func removeItem(_ kind: MenuBarIconKind) {
-        if let it = items[kind] {
-            if let b = it.button { buttonKinds.removeValue(forKey: ObjectIdentifier(b)) }
-            NSStatusBar.system.removeStatusItem(it)
-        }
-        items[kind] = nil
-        itemViews[kind] = nil
-    }
-
-    /// 点窗口外关闭弹窗的全局监听（2.7.1 修 bug）
+    /// ★ 宽度同步（2026-11-16 用户实测修 bug）：
+    /// NSHostingView 挂上状态项后，SwiftUI 内容再变宽，**状态项长度不会自动跟随**
+    /// —— 内容被塞在旧宽度的框里互相叠压（实测「15.3W」直接叠上风扇「2232」、
+    /// 网速三段叠成一团），段一多总宽超限还会被系统往左推到屏幕外。
+    /// 每次内容变化（hub 每拍 / 开关切换）后按 fittingSize 显式回写 length。
     ///
-    /// NSPopover 的 `.transient` 依赖「本应用是活动应用」才在外部点击时自动收，
-    /// 而状态栏图标弹出的窗口不会把 app 变成 active —— 于是用户看到的现象就是
-    /// 「点桌面不消失，只有再点一次图标才关」。这里补一个全局鼠标监听兜底：
-    /// 鼠标事件不需要辅助功能授权（只有键盘事件才要）。
-    private var outsideMonitor: Any?
+    /// 实现细节：hub 一拍发 3 个 @Published，objectWillChange 会连响 3 次 ——
+    /// 用 pending 标记把同一轮 runloop 的多次调用合并成一次测量；
+    /// 双跳 async 保证跑到 SwiftUI 对 hosting view 的重排**之后**再量。
+    private var widthSyncPending = false
 
-    private func clicked(_ kind: MenuBarIconKind) {
-        guard let item = items[kind], let button = item.button else { return }
-        if let p = popover, p.isShown, currentKind == kind {
-            closePopover()
-            return
-        }
-        closePopover()
-        let p = NSPopover()
-        p.behavior = .transient
-        p.contentSize = NSSize(width: panelWidth(kind), height: 96)
-        p.contentViewController = NSHostingController(
-            rootView: SensorPanelView(kind: kind).environmentObject(MetricsHub.shared))
-        popover = p
-        currentKind = kind
-        // 先激活自己：.transient 与内部控件的键盘焦点都依赖 app 处于 active
-        NSApp.activate(ignoringOtherApps: true)
-        p.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        installOutsideMonitor()
-    }
-
-    /// 点任何别处（桌面 / 其它 app / 其它窗口）都收起弹窗
-    private func installOutsideMonitor() {
-        guard outsideMonitor == nil else { return }
-        outsideMonitor = NSEvent.addGlobalMonitorForEvents(
-            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
-        ) { [weak self] _ in
-            Task { @MainActor in self?.closePopover() }
-        }
-    }
-
-    private func closePopover() {
-        popover?.close()
-        popover = nil
-        currentKind = nil
-        if let m = outsideMonitor {
-            NSEvent.removeMonitor(m)
-            outsideMonitor = nil
-        }
-    }
-
-    private func panelWidth(_ kind: MenuBarIconKind) -> CGFloat {
-        switch kind {
-        case .mem, .net: return 268   // 三格
-        // 2026-10-26：GPU 面板拆成 核显占用 / 独显占用 / 独显温度 三格，跟内存一样宽
-        case .gpu: return 268
-        // 2026-10-25：CPU 面板去掉风扇转速，只剩温度 + 占用两格
-        case .cpu, .disk: return 196
-        }
-    }
-
-    /// 由 hub 数据刷新图标。视图是 AppKit 自绘，这里只推数值 + needsDisplay；
-    /// 顺手做存在性校验（视图被系统异常摘掉时重建）。
-    ///
-    /// 2026-10-26：还要校验**宽度**。GPU 的「占用率」是双列 64pt、「温度」是单列 31pt，
-    /// 设置页切指标只调到这里（不重建状态项），宽度对不上就会沿用旧值 ——
-    /// 64pt 的视图塞进 31pt 的项、或者 31pt 的视图占着 64pt 的位置，两种都难看。
-    func refreshTitles() {
-        let broken = items.filter { ($0.value.button?.subviews.isEmpty ?? true) }.map { $0.key }
-        // 重建后 createItem 会把 length 设成 kind.itemWidth，所以这一条会自愈、不会每秒重来。
-        // 留 0.5pt 容差：万一系统对 length 做了取整，也不至于每帧都判成「变了」而反复重建（会闪）。
-        let resized = items.filter { abs($0.value.length - $0.key.itemWidth) > 0.5 }.map { $0.key }
-        for kind in Set(broken + resized) {
-            removeItem(kind)
-            createItem(kind)
-        }
-        for kind in items.keys { updateView(kind) }
-    }
-
-    private func updateView(_ kind: MenuBarIconKind) {
-        let overview = MetricsHub.shared.overview
-        switch kind {
-        case .cpu:
-            // v2.4.5：CPU 按「系统」页设置的指标显示（默认温度）
-            (itemViews[kind] as? MiniStatusItemView)?.value =
-                Self.metricText(for: kind, overview: overview,
-                                live: MetricsHub.shared.live,
-                                sensors: MetricsHub.shared.sensors)
-        case .gpu:
-            // 双列视图（占用率模式）：核显 / 独显并排，各带标签
-            if let v = itemViews[kind] as? GpuStatusItemView {
-                v.igpu = Self.pctText(Self.igpuUsage(overview))
-                v.dgpu = Self.pctText(Self.dgpuUsage(overview))
-            } else {
-                // 温度模式：还是原来的单列 Mini 图标
-                (itemViews[kind] as? MiniStatusItemView)?.value =
-                    Self.metricText(for: kind, overview: overview,
-                                    live: MetricsHub.shared.live,
-                                    sensors: MetricsHub.shared.sensors)
+    func syncContentWidth() {
+        guard !widthSyncPending else { return }
+        widthSyncPending = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.widthSyncPending = false
+                guard let item = self.monitorItem, let host = self.monitorHost else { return }
+                let w = host.fittingSize.width
+                // variableLength 初始为 -2，跳过无意义值；0.5pt 抖动不回写（防每拍微动）
+                guard w > 1, abs(item.length - w) > 0.5 else { return }
+                item.length = w
             }
-        case .mem:
-            let m = BackendService.dict(overview, "memory")
-            (itemViews[kind] as? MiniStatusItemView)?.value =
-                String(format: "%.0f%%", BackendService.double(m, "percent") ?? 0)
-        case .disk:
-            // 2.7.5：温度 / 已用寿命，数据来自 nvmesmart 的逐盘 SMART（overview.smart）
-            (itemViews[kind] as? MiniStatusItemView)?.value =
-                Self.diskText(for: overview)
-        case .net:
-            guard let v = itemViews[kind] as? NetStatusItemView else { return }
-            let n = BackendService.dict(overview, "net") ?? [:]
-            // 后端给的是 KiB/s（字节差 ÷1024）；Stats 按十进制（÷1000）格式化，
-            // 先还原成 B/s 再走 Stats 同款阈值
-            let up = (BackendService.double(n, "up_kbs") ?? 0) * 1024
-            let down = (BackendService.double(n, "down_kbs") ?? 0) * 1024
-            v.upload = Self.speedText(up)
-            v.download = Self.speedText(down)
-            v.uploadActive = up >= 1024
-            v.downloadActive = down >= 1024
         }
     }
 
-    /// Stats Units.getReadableSpeed 同款：十进制阈值，无流量显示 "0 KB/s"（不是 "0K"）
-    static func speedText(_ bytesPerSecond: Double) -> String {
-        switch bytesPerSecond {
-        case ..<1_000:
-            return "0 KB/s"
-        case 1_000..<1_000_000:
-            return String(format: "%.0f KB/s", bytesPerSecond / 1_000)
-        case 1_000_000..<100_000_000:
-            return String(format: "%.1f MB/s", bytesPerSecond / 1_000_000)
-        case 100_000_000..<1_000_000_000:
-            return String(format: "%.0f MB/s", bytesPerSecond / 1_000_000)
-        case 1_000_000_000..<1_000_000_000_000:
-            return String(format: "%.1f GB/s", bytesPerSecond / 1_000_000_000)
-        default:
-            return String(format: "%.1f TB/s", bytesPerSecond / 1_000_000_000_000)
+    /// 有勾段才显示状态项；盘列表变化时也会被调到
+    func syncVisibility() {
+        guard let item = monitorItem else { return }
+        item.isVisible = !Self.currentSegments(overview: MetricsHub.shared.overview).isEmpty
+    }
+
+    /// 带快照的版本（MenuBarMonitorBar 每秒随 hub 调，避免读旧快照）
+    func syncVisibility(with overview: [String: Any]) {
+        guard let item = monitorItem else { return }
+        item.isVisible = !Self.currentSegments(overview: overview).isEmpty
+    }
+
+    // MARK: 段清单
+
+    /// 当前拼进菜单栏的段（静态段按声明顺序；动态硬盘段插在网速前）
+    static func currentSegments(overview: [String: Any]) -> [SegmentRef] {
+        var out: [SegmentRef] = []
+        var nets: [SegmentRef] = []
+        for seg in MenuBarSegment.allCases {
+            guard UserDefaults.standard.bool(forKey: seg.defaultsKey) else { continue }
+            let ref = SegmentRef.seg(seg)
+            if seg.group == .net { nets.append(ref) } else { out.append(ref) }
+        }
+        // 硬盘：overview.smart 里的每块盘独立开关（一块盘一段温度）
+        let disks = (BackendService.array(overview, "smart") as? [[String: Any]]) ?? []
+        for d in disks {
+            let bsd = BackendService.string(d, "bsd") ?? ""
+            guard !bsd.isEmpty else { continue }
+            if UserDefaults.standard.bool(forKey: diskKey(bsd)) {
+                out.append(.disk(bsd: bsd, model: BackendService.string(d, "model") ?? ""))
+            }
+        }
+        out.append(contentsOf: nets)
+        return out
+    }
+
+    /// 某块盘的开关键（按 bsd 名，盘拔掉键自然失效）
+    static func diskKey(_ bsd: String) -> String { "menubar.disk.\(bsd)" }
+
+    /// 某组在设置页要列的静态段
+    static func segments(in group: SegmentGroup) -> [MenuBarSegment] {
+        MenuBarSegment.allCases.filter { $0.group == group }
+    }
+
+    // MARK: 数值文本
+
+    /// 某段的数值文本。不可用时显示「—」，绝不显示假数字。
+    static func valueText(_ ref: SegmentRef,
+                          overview: [String: Any],
+                          live: [String: Any],
+                          sensors: [String: Any]) -> String {
+        switch ref {
+        case .disk(_, let bsd): return diskText(overview: overview, bsd: bsd)
+        case .seg(let s): return valueText(s, overview: overview, live: live, sensors: sensors)
         }
     }
 
-    /// v2.4.5：CPU/GPU 菜单栏数值——按「系统」页设置的指标取温度或占用率。
-    /// 温度源是 MetricsHub.live 的 `temp_cpu`/`temp_gpu` —— 那是 SMC 封装温度
-    /// 与 NVAccel 核心温度，**两者都不经过 EC**；占用源是 overview。
-    static func metricText(for kind: MenuBarIconKind,
-                           overview: [String: Any],
-                           live: [String: Any],
-                           sensors: [String: Any] = [:]) -> String {
-        switch MenuBarMetric.current(for: kind) {
-        case .usage:
-            let key = kind == .cpu ? "cpu_usage" : "gpu_usage"
-            return String(format: "%.0f%%", BackendService.double(overview, key) ?? 0)
-        case .temp:
-            // 系统温度：CPU 直接读 SMC（TC0P 等），GPU 读 NVAccel。都不经过 EC。
-            let t = kind == .cpu ? MetricsHub.cpuTempC(sensors, live)
-                                 : MetricsHub.gpuTempC(sensors, live)
-            guard let t else { return "—" }
+    static func valueText(_ seg: MenuBarSegment,
+                          overview: [String: Any],
+                          live: [String: Any],
+                          sensors: [String: Any]) -> String {
+        switch seg {
+        // ---- CPU 组 ----
+        case .cpuTemp:
+            guard let t = MetricsHub.cpuTempC(sensors, live) else { return "—" }
             return String(format: "%.0f°", t)
-        case .life:
-            return "—"
+        case .cpuFreq:
+            let c = BackendService.dict(overview, "cpu") ?? [:]
+            guard let mhz = BackendService.double(c, "freq_cur_mhz"), mhz > 0 else { return "—" }
+            return compactMHz(mhz)
+        case .cpuUsage:
+            return String(format: "%.0f%%", BackendService.double(overview, "cpu_usage") ?? 0)
+        case .cpuPower:
+            guard let w = powerW(sensors, "PCPT") else { return "—" }
+            return String(format: "%.1fW", w)
+        case .cpuFan:
+            let rpm = BackendService.int(live, "rpm_cpu") ?? 0
+            return rpm > 0 ? "\(rpm)" : "—"
+        case .igpuUsage:
+            guard let u = igpuUsage(overview) else { return "—" }
+            return String(format: "%.0f%%", u)
+        case .igpuVram:
+            guard let used = igpuVramBytes(overview) else { return "—" }
+            return compactBytes(used)
+        // ---- GPU 组 ----
+        case .gpuTemp:
+            guard let t = MetricsHub.gpuTempC(sensors, live), t > 0 else { return "—" }
+            return String(format: "%.0f°", t)
+        case .gpuFreq:
+            guard let mhz = dgpuSensors(overview)["core_mhz"] as? Double, mhz > 0 else { return "—" }
+            return compactMHz(mhz)
+        case .gpuUsage:
+            guard let u = dgpuUsageAvg(overview) else { return "—" }
+            return String(format: "%.0f%%", u)
+        case .grUsage:
+            guard let u = dgpuUsageInstant(overview) else { return "—" }
+            return String(format: "%.0f%%", u)
+        case .gpuPower:
+            guard let w = dgpuSensors(overview)["power_avg_w"] as? Double, w > 0 else { return "—" }
+            return String(format: "%.1fW", w)
+        case .gpuFan:
+            let rpm = BackendService.int(live, "rpm_gpu") ?? 0
+            return rpm > 0 ? "\(rpm)" : "—"
+        case .gpuVram:
+            guard let used = dgpuVramBytes(overview) else { return "—" }
+            return compactBytes(used)
+        // ---- 内存 ----
+        case .memUsage:
+            let m = BackendService.dict(overview, "memory") ?? [:]
+            return String(format: "%.0f%%", BackendService.double(m, "percent") ?? 0)
+        // ---- 网速（↑↓ 字形即图标）----
+        case .netDown:
+            let n = BackendService.dict(overview, "net") ?? [:]
+            let down = (BackendService.double(n, "down_kbs") ?? 0) * 1024
+            return "↓\(compactSpeed(down))"
+        case .netUp:
+            let n = BackendService.dict(overview, "net") ?? [:]
+            let up = (BackendService.double(n, "up_kbs") ?? 0) * 1024
+            return "↑\(compactSpeed(up))"
+        case .netBoth:
+            let n = BackendService.dict(overview, "net") ?? [:]
+            let down = (BackendService.double(n, "down_kbs") ?? 0) * 1024
+            let up = (BackendService.double(n, "up_kbs") ?? 0) * 1024
+            return "↓\(compactSpeed(down)) ↑\(compactSpeed(up))"
         }
+    }
+
+    /// SMC 功率键读数（sensors.power 数组里按 key 找）
+    private static func powerW(_ sensors: [String: Any], _ key: String) -> Double? {
+        let list = (BackendService.array(sensors, "power") as? [[String: Any]]) ?? []
+        for p in list where (BackendService.string(p, "key") ?? "") == key {
+            return BackendService.double(p, "value")
+        }
+        return nil
     }
 
     /// 核显占用率：IOAccelerator 的 "Device Utilization %"（overview.gpu_usage）
@@ -503,337 +454,251 @@ final class MenuBarMonitors: NSObject {
         BackendService.double(overview, "gpu_usage")
     }
 
-    /// 独显占用率：NVAccel 发布的 PerformanceStatistics（驱动 2.6.3 起），
-    /// 取 GR 引擎的 **5 秒均值**。
-    ///
-    /// 为什么用均值：驱动按整秒发布，瞬时值是一秒一跳的台阶（实测 0% → 99% 一步到位），
-    /// 菜单栏只有一行字，跳起来比进度条更刺眼。均值是本机按拍记的本地滑动平均。
-    ///
-    /// 驱动这一拍没发布时返回 nil → 界面显示「—」而不是 0%。这条很重要：
-    /// 驱动遇到查询失败 / 样本超过 5 秒没更新时会**删键**（不是写 0），
-    /// 显示成 0% 会让人以为「独显真的闲着」。
-    static func dgpuUsage(_ overview: [String: Any]) -> Double? {
+    /// 核显显存占用：overview.gpu_stats 里 IntelAccelerator 条目的
+    /// "In use system memory"（iGPU 没有独立显存，这是动态上限下的当前占用）
+    static func igpuVramBytes(_ overview: [String: Any]) -> Double? {
+        let stats = (BackendService.array(overview, "gpu_stats") as? [[String: Any]]) ?? []
+        let entry = stats.first {
+            (BackendService.string($0, "io_class") ?? "").localizedCaseInsensitiveContains("Intel")
+        } ?? stats.first
+        guard let entry else { return nil }
+        return BackendService.double(entry, "In use system memory")
+            ?? BackendService.double(entry, "vramUsedBytes")
+            ?? BackendService.double(entry, "gartUsedBytes")
+    }
+
+    private static func dgpuSensors(_ overview: [String: Any]) -> [String: Any] {
         let d = BackendService.dict(overview, "dgpu") ?? [:]
+        return BackendService.dict(d, "sensors") ?? [:]
+    }
+
+    private static func dgpuDict(_ overview: [String: Any]) -> [String: Any] {
+        BackendService.dict(overview, "dgpu") ?? [:]
+    }
+
+    /// GPU 占用率（5 秒均值，耐看）。驱动没上报时 nil → 显示「—」。
+    static func dgpuUsageAvg(_ overview: [String: Any]) -> Double? {
+        let d = dgpuDict(overview)
         guard (BackendService.bool(d, "reported") ?? false) else { return nil }
-        // 回退到瞬时值：装的是新 app、helper 还没重启时 payload 里没有均值字段，
-        // 这时宁可显示会跳台阶的瞬时值，也不要显示「—」让人以为功能坏了。
         return BackendService.double(d, "gr_avg5_pct") ?? BackendService.double(d, "gr_pct")
     }
 
-    /// 菜单栏用的百分比文本（无值时给「—」）
-    static func pctText(_ v: Double?) -> String {
-        v.map { String(format: "%.0f%%", $0) } ?? "—"
+    /// GR 占用率（瞬时值）。同上，缺键显示「—」。
+    static func dgpuUsageInstant(_ overview: [String: Any]) -> Double? {
+        let d = dgpuDict(overview)
+        guard (BackendService.bool(d, "reported") ?? false) else { return nil }
+        return BackendService.double(d, "gr_pct")
     }
 
-    /// 2.7.5：硬盘图标选中的那块盘的 SMART 条目
-    static func diskEntry(_ overview: [String: Any]) -> [String: Any] {
+    /// 独显显存占用（GART 口径：vram_used_bytes，驱动 2.6.3+ 发布）
+    static func dgpuVramBytes(_ overview: [String: Any]) -> Double? {
+        guard (BackendService.bool(dgpuDict(overview), "reported") ?? false) else { return nil }
+        guard let used = dgpuSensors(overview)["vram_used_bytes"] as? Double, used > 0 else { return nil }
+        return used
+    }
+
+    /// 指定 bsd 的硬盘温度（SMART；15 秒缓存由后端做）
+    static func diskText(overview: [String: Any], bsd: String) -> String {
         let list = (BackendService.array(overview, "smart") as? [[String: Any]]) ?? []
-        let want = UserDefaults.standard.string(forKey: MenuBarIconKind.diskTargetKey) ?? ""
-        if !want.isEmpty,
-           let e = list.first(where: { ($0["bsd"] as? String) == want }) { return e }
-        return list.first(where: { ($0["ok"] as? Bool) == true }) ?? [:]
-    }
-
-    /// 硬盘图标的数值：只显示温度（2026-11-14 用户要求去掉已用寿命）。
-    /// 历史存档里 metricKey 可能还是 "life"，这里直接无视。
-    static func diskText(for overview: [String: Any]) -> String {
-        let e = diskEntry(overview)
+        let e = list.first { (BackendService.string($0, "bsd") ?? "") == bsd }
+            ?? list.first { ($0["ok"] as? Bool) == true }
+        guard let e else { return "—" }
         if let t = BackendService.double(e, "temperature_c") { return String(format: "%.0f°", t) }
-        // 没有逐盘 SMART 时退回旧的单盘温度接口
-        let d = BackendService.dict(overview, "disk_temp")
-        if (d?["ok"] as? Bool) == true, let t = BackendService.double(d, "temperature_c") {
-            return String(format: "%.0f°", t)
-        }
         return "—"
     }
+
+    // MARK: 紧凑格式
+
+    /// 频率：完整单位 GHz / MHz（2026-11-16 用户要求 —— 只写 G/M 会和显存占用的
+    /// M（MB）混淆）。段宽已自适应，长一点不遮邻段。
+    static func compactMHz(_ mhz: Double) -> String {
+        if mhz >= 1_000 { return String(format: "%.2fGHz", mhz / 1_000) }
+        return String(format: "%.0fMHz", mhz)
+    }
+
+    /// 字节：完整单位 GB / MB（2026-11-16 用户要求，与频率 GHz/MHz 同口径，
+    /// 裸 M/G 与频率歧义）。段宽自适应，长一点不遮邻段。
+    static func compactBytes(_ bytes: Double) -> String {
+        switch bytes {
+        case 1_000_000_000...: return String(format: "%.1fGB", bytes / 1_000_000_000)
+        case 1_000_000...:     return String(format: "%.0fMB", bytes / 1_000_000)
+        case 1_000...:         return String(format: "%.0fKB", bytes / 1_000)
+        default:               return String(format: "%.0fB", bytes)
+        }
+    }
+
+    /// 网速：十进制阈值，K/M/G 后缀（不带 /s，↓ 字形已表意）
+    static func compactSpeed(_ bytesPerSecond: Double) -> String {
+        switch bytesPerSecond {
+        case ..<1_000:                  return "0"
+        case 1_000..<1_000_000:         return String(format: "%.1fK", bytesPerSecond / 1_000)
+        case 1_000_000..<1_000_000_000: return String(format: "%.1fM", bytesPerSecond / 1_000_000)
+        default:                        return String(format: "%.1fG", bytesPerSecond / 1_000_000_000)
+        }
+    }
+
+    /// 网速：Stats Units.getReadableSpeed 同款（带 /s），Speed 双行小件专用
+    static func netSpeedText(_ bytesPerSecond: Double) -> String {
+        switch bytesPerSecond {
+        case ..<1_000:                          return "0 KB/s"
+        case 1_000..<1_000_000:                 return String(format: "%.0f KB/s", bytesPerSecond / 1_000)
+        case 1_000_000..<100_000_000:           return String(format: "%.1f MB/s", bytesPerSecond / 1_000_000)
+        case 100_000_000..<1_000_000_000:       return String(format: "%.0f MB/s", bytesPerSecond / 1_000_000)
+        case 1_000_000_000..<1_000_000_000_000: return String(format: "%.1f GB/s", bytesPerSecond / 1_000_000_000)
+        default:                                return String(format: "%.1f TB/s", bytesPerSecond / 1_000_000_000_000)
+        }
+    }
 }
 
-// MARK: - 点击弹出的传感器面板（样式对齐截图：小字类型在上，大字数值在下）
+// MARK: - 监控拼接条（挂进独立 NSStatusItem 的 SwiftUI 视图）
+//
+// 2026-11-16（用户要求）恢复原版 Stats 风格：上一版做的「SF 图标 + 数值」一行式
+// 已废弃（图标 9pt 被嫌太小、网速段符号名是空渲染成「？」）。现在与原版
+// MiniStatusItemView / NetStatusItemView 一致：
+//   · Mini 段：固定宽 31pt，上行 7pt light 三字母标签（CPU/RAM/…），下行 12pt 数值；
+//   · 网速上下行：Stats Speed 同款 55pt 双行（上=上传红点、下=下载蓝点，
+//     ≥1KB/s 点亮系统红/蓝，速率 9pt light 右对齐，带 /s）；
+//   · 菜单栏里**不放任何 SF 图标** —— 图标只出现在「状态栏显示」页和面板明细行。
+// 段间距 4pt（比原版独立状态项的系统间隙 ~8pt 紧凑，用户要求的拼接形式）。
 
-struct SensorPanelView: View {
-    @EnvironmentObject var hub: MetricsHub
-    let kind: MenuBarIconKind
+struct MenuBarMonitorBar: View {
+    @ObservedObject private var hub = MetricsHub.shared
+    /// 开关变化 → revision +1 强制本帧重算段清单（hub 每秒也会刷，但开关要立即生效）
+    @State private var revision = 0
 
     var body: some View {
-        HStack(spacing: 10) {
-            ForEach(Array(tiles.enumerated()), id: \.offset) { t in
-                tile(t.element.0, t.element.1, t.element.2)
+        let _ = revision
+        let refs = MenuBarMonitors.currentSegments(overview: hub.overview)
+        HStack(spacing: 4) {
+            ForEach(refs) { ref in
+                MonitorSegmentView(ref: ref,
+                                   overview: hub.overview,
+                                   live: hub.live,
+                                   sensors: hub.sensors)
             }
         }
-        .padding(12)
-        .background(.regularMaterial)
-    }
-
-    /// (标签, 数值, 单位)
-    private var tiles: [(String, String, String)] {
-        switch kind {
-        case .cpu:
-            // 2026-10-25 用户要求：只留温度 + 占用，风扇转速从这一格里删掉
-            let temp = MetricsHub.cpuTempC(hub.sensors, hub.live)
-            let usage = BackendService.double(hub.overview, "cpu_usage")
-            return [("CPU 温度", temp.map { String(format: "%.0f", $0) } ?? "—", "℃"),
-                    ("CPU 占用", usage.map { String(format: "%.0f", $0) } ?? "—", "%")]
-        case .mem:
-            let m = BackendService.dict(hub.overview, "memory")
-            let pct = BackendService.double(m, "percent")
-            let used = BackendService.double(m, "used")
-            let total = BackendService.double(m, "total")
-            return [("内存占用", pct.map { String(format: "%.0f", $0) } ?? "—", "%"),
-                    ("已用", used.map { String(format: "%.1f", $0 / 1e9) } ?? "—", "GB"),
-                    ("总量", total.map { String(format: "%.0f", $0 / 1e9) } ?? "—", "GB")]
-        case .gpu:
-            // 2026-10-26：核显与独显分开两格，标签写清楚是哪一颗。
-            // 温度那一格是 NVAccel 上报的 GPU 核心温度（TSENS，PR #323）—— 那是独显的，所以标「独显温度」。
-            let temp = MetricsHub.gpuTempC(hub.sensors, hub.live)
-            let igpu = MenuBarMonitors.igpuUsage(hub.overview)
-            let dgpu = MenuBarMonitors.dgpuUsage(hub.overview)
-            return [("iGPU 占用", igpu.map { String(format: "%.0f", $0) } ?? "—", "%"),
-                    ("dGPU 占用", dgpu.map { String(format: "%.0f", $0) } ?? "—", "%"),
-                    ("dGPU 温度", temp.map { String(format: "%.0f", $0) } ?? "—", "℃")]
-        case .disk:
-            // 2.7.5：面板跟着「选中的那块盘」走
-            let e = MenuBarMonitors.diskEntry(hub.overview)
-            let t = BackendService.double(e, "temperature_c")
-            let used = BackendService.int(e, "percentage_used")
-            let spare = BackendService.int(e, "available_spare")
-            return [("硬盘温度", t.map { String(format: "%.0f", $0) } ?? "—", "℃"),
-                    ("已用寿命", used.map { "\($0)" } ?? "—", "%"),
-                    ("可用备件", spare.map { "\($0)" } ?? "—", "%")]
-        case .net:
-            let n = BackendService.dict(hub.overview, "net") ?? [:]
-            let down = BackendService.double(n, "down_kbs") ?? 0
-            let up = BackendService.double(n, "up_kbs") ?? 0
-            func f(_ v: Double) -> String { v >= 1024 ? String(format: "%.1f", v / 1024) : String(format: "%.0f", v) }
-            let unit: String = (down >= 1024 || up >= 1024) ? "MB/s" : "KB/s"
-            return [("下行", f(down), unit), ("上行", f(up), unit)]
+        .padding(.horizontal, 4)
+        .contentShape(Rectangle())
+        // 点监控条 → 打开主窗口（复用 S 飘带上那条 .macConsoleShowMain 链路）
+        .onTapGesture {
+            NotificationCenter.default.post(name: .macConsoleShowMain, object: nil)
         }
-    }
-
-    private func tile(_ label: String, _ value: String, _ unit: String) -> some View {
-        VStack(spacing: 2) {
-            Text(label)
-                .font(.system(size: 9, weight: .medium))
-                .foregroundStyle(.secondary)
-                .tracking(0.6)
-            HStack(alignment: .firstTextBaseline, spacing: 2) {
-                Text(value)
-                    .font(.system(size: 19, weight: .semibold, design: .rounded))
-                    .monospacedDigit()
-                    .foregroundStyle(.primary)
-                    .lineLimit(1).minimumScaleFactor(0.7)
-                Text(unit)
-                    .font(.system(size: 9.5))
-                    .foregroundStyle(.secondary)
-            }
+        // 内容宽一变就把状态项长度跟上去（hub 每拍都会动数值）
+        .onAppear { MenuBarMonitors.shared.syncContentWidth() }
+        .onReceive(hub.objectWillChange) { _ in
+            MenuBarMonitors.shared.syncContentWidth()
         }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 8)
-        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 9))
+        .onReceive(NotificationCenter.default.publisher(for: MenuBarMonitors.iconsChanged)) { _ in
+            revision &+= 1
+            MenuBarMonitors.shared.syncVisibility()
+            MenuBarMonitors.shared.syncContentWidth()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
+            revision &+= 1
+            MenuBarMonitors.shared.syncContentWidth()
+        }
+        // 盘列表 / 段清单随快照变化时同步显隐（一眼空就藏）
+        .onReceive(hub.$overview) { o in
+            MenuBarMonitors.shared.syncVisibility(with: o)
+        }
     }
 }
 
+/// 段渲染（状态项与「状态栏显示」页预览共用同一套，保证所见即所得）。
+/// 2026-11-16（用户要求）：风扇转速段在数值前加风扇小图标 —— 两段裸数字
+/// （CPU 2232 / GPU 2639）看不出哪个是哪个。
+struct MonitorSegmentView: View {
+    let ref: SegmentRef
+    let overview: [String: Any]
+    let live: [String: Any]
+    let sensors: [String: Any]
 
-// MARK: - 菜单栏图标本体（AppKit 自绘，逐指标复刻 Stats 几何）
+    var body: some View {
+        if case .seg(.netBoth) = ref {
+            NetSpeedWidget(overview: overview)
+        } else {
+            MiniSegment(label: ref.menuLabel,
+                        value: MenuBarMonitors.valueText(ref,
+                                                         overview: overview,
+                                                         live: live,
+                                                         sensors: sensors),
+                        valueIcon: Self.fanIcon(ref))
+        }
+    }
 
-/// 菜单栏图标视图的点击出口。两条点击通道（子视图 mouseDown / 按钮 action）都经它
-/// 汇入 MenuBarMonitors.handleClick。
-protocol StatusItemClickableView: NSView {
-    var onClick: (() -> Void)? { get set }
+    /// 只有风扇转速段带图标
+    static func fanIcon(_ ref: SegmentRef) -> String? {
+        guard case .seg(let s) = ref, s == .cpuFan || s == .gpuFan else { return nil }
+        return "fanblades"
+    }
 }
 
-/// Stats「Mini」widget 同款（CPU/RAM/GPU/SSD）：
-/// 固定宽 31pt；标签 rect (0,12,31,7) 7pt light、数值 rect (0,1,31,13) 12pt regular
-/// ——硬编码对齐 Stats 源码，本机菜单栏 22pt（视图 18pt 高）下不缩放。
-final class MiniStatusItemView: NSView, StatusItemClickableView {
-    static let width: CGFloat = 31
-
+/// 原版 Stats Mini 风格段（MiniStatusItemView 同款）：上行 7pt light 标签、
+/// 下行 12pt regular 数值，均左对齐，无图标。
+/// 2026-11-16 用户要求：宽度**自适应**——31pt 只是下限（短值保持原版列宽，
+/// 数字跳动不会牵动邻段）；"12.3W" / "100%" / "1.6G" 这类长值按内容撑开，
+/// 不会压缩字号也不会蹭到下一段。右缘 3pt 内边距 + 段距 4pt = 长值后也有 7pt 空隙。
+/// 2026-11-16 二改：
+///   · 标签与数值的行距 1pt → 0（用户嫌中间隔太开）；
+///   · 可选 valueIcon —— 风扇转速段数值前挂风扇小图（fanblades），不然
+///     CPU 2232 / GPU 2639 两段裸数字分不清哪个是哪个。
+struct MiniSegment: View {
     let label: String
-    var value: String = "—" {
-        didSet { if oldValue != value { needsDisplay = true } }
-    }
+    let value: String
+    var valueIcon: String? = nil
 
-    /// 点击回调（MenuBarMonitors 注入）。菜单栏窗口在部分 macOS 版本上不会把鼠标
-    /// 事件送进按钮子视图（2026-10-20 实测：macOS 15 上「子视图 + 手势识别器」
-    /// 完全不触发，macOS 26 正常），所以子视图自己也接一份，与按钮的 target/action
-    /// 双保险；两条路径都汇入 MenuBarMonitors.handleClick，靠时间去重，不会双弹。
-    var onClick: (() -> Void)?
-
-    init(label: String) {
-        self.label = label
-        super.init(frame: NSRect(x: 0, y: 2, width: Self.width,
-                                 height: max(0, NSStatusBar.system.thickness - 4)))
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override func mouseDown(with event: NSEvent?) { onClick?() }
-    override func rightMouseDown(with event: NSEvent?) { onClick?() }
-
-    override func draw(_ dirtyRect: NSRect) {
-        let textColor = NSColor.labelColor
-        // 标签：Stats Mini.swift 硬编码 rect (x:0, y:12, w:31, h:7)，7pt light。
-        // ⚠️ 不要改成 H-8 之类的相对定位：本机菜单栏实测 22pt（视图 H=18），
-        // 相对定位会把标签压低 2pt 与数值叠层（2.4.0 用户反馈的 bug）。
-        let labelAttributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 7, weight: .light),
-            .foregroundColor: textColor,
-        ]
-        NSAttributedString(string: label, attributes: labelAttributes)
-            .draw(in: NSRect(x: 0, y: 12, width: Self.width, height: 7))
-        // 数值：Stats 硬编码 rect (x:0, y:1, w:31, h:13)，12pt regular
-        let valueAttributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 12, weight: .regular),
-            .foregroundColor: textColor,
-        ]
-        NSAttributedString(string: value, attributes: valueAttributes)
-            .draw(in: NSRect(x: 0, y: 1, width: Self.width, height: 13))
-    }
-}
-
-/// GPU 双列图标：iGPU / dGPU 并排，各带一行标签。
-///
-/// 为什么要单独做一个视图：Mini 是 31pt 单列，塞不下两个「带标注」的百分比。
-///
-/// 宽度是按实测字宽定的，别随手改小：
-///   11pt regular 下 "100%" = 29.40pt、"99%" = 24.38pt、"12%" = 22.11pt、"—" = 9.68pt
-///   7pt  light   下 "iGPU" = 17.13pt、"dGPU" = 19.77pt
-/// 所以列宽必须 ≥ 30pt（由 "100%" 决定），取 31pt 留 1.6pt 余量
-/// （"100%" 是真会出现的：满载实测 99.01%）。标签比列宽窄，不会挤。
-/// 总宽 31 + 2 + 31 = 64pt，比 NET 的 55pt 略宽，是菜单栏里最宽的一项，但已经是
-/// 「两个带标签的百分比」的合理下限。
-///
-/// 行高与字号沿用 MiniStatusItemView 的硬编码几何（标签 y=12 h=7、数值 y=1 h=13），
-/// 理由见那边的注释：相对定位在 22pt 菜单栏（视图 18pt 高）下会把两行叠在一起。
-final class GpuStatusItemView: NSView, StatusItemClickableView {
-    static let width: CGFloat = 64
-    private static let colW: CGFloat = 31
-    private static let gap: CGFloat = 2
-
-    /// 左列 = iGPU，右列 = dGPU。无值时为「—」（驱动未上报 ≠ 0%）
-    var igpu: String = "—" {
-        didSet { if oldValue != igpu { needsDisplay = true } }
-    }
-    var dgpu: String = "—" {
-        didSet { if oldValue != dgpu { needsDisplay = true } }
-    }
-
-    /// 点击回调（双通道 + 去重，见 MiniStatusItemView.onClick 注释）
-    var onClick: (() -> Void)?
-
-    override init(frame: NSRect) {
-        super.init(frame: frame)
-    }
-
-    convenience init() {
-        self.init(frame: NSRect(x: 0, y: 2, width: Self.width,
-                                height: max(0, NSStatusBar.system.thickness - 4)))
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override func mouseDown(with event: NSEvent?) { onClick?() }
-    override func rightMouseDown(with event: NSEvent?) { onClick?() }
-
-    override func draw(_ dirtyRect: NSRect) {
-        let textColor = NSColor.labelColor
-        let labelAttributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 7, weight: .light),
-            .foregroundColor: textColor,
-        ]
-        let valueAttributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 11, weight: .regular),
-            .foregroundColor: textColor,
-        ]
-        for (i, pair) in [("iGPU", igpu), ("dGPU", dgpu)].enumerated() {
-            let x = CGFloat(i) * (Self.colW + Self.gap)
-            NSAttributedString(string: pair.0, attributes: labelAttributes)
-                .draw(in: NSRect(x: x, y: 12, width: Self.colW, height: 7))
-            NSAttributedString(string: pair.1, attributes: valueAttributes)
-                .draw(in: NSRect(x: x, y: 1, width: Self.colW, height: 13))
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(label)
+                .font(.system(size: 7, weight: .light))
+                .lineLimit(1)
+                .fixedSize()
+            HStack(spacing: 2) {
+                if let valueIcon {
+                    // 2026-11-16（用户反馈）：不指定颜色，跟数值一样用默认前景色
+                    // （跟随菜单栏深浅色，不搞特殊色）
+                    Image(systemName: valueIcon)
+                        .font(.system(size: 9, weight: .light))
+                }
+                Text(value)
+                    .font(.system(size: 12, weight: .regular).monospacedDigit())
+                    .lineLimit(1)
+            }
+            .fixedSize()
         }
+        .frame(minWidth: 31, alignment: .leading)
+        .padding(.trailing, 3)
     }
 }
 
-/// Stats「Speed」(twoRows) widget 同款（NET）：
-/// 固定宽 55pt；速率文字右对齐贴项右缘（Stats valueAlignment 默认 "right"），
-/// 上行=上传（红点，Stats output y=10.5）、下行=下载（蓝点）；速率 9pt light；
-/// 无流量也显示 "0 KB/s"（Stats 同款，不是裸 "0K"）；
-/// 圆点颜色：对应方向速率 ≥1KB/s 时系统红/蓝，否则退化为文字色。
-final class NetStatusItemView: NSView, StatusItemClickableView {
-    static let width: CGFloat = 55
+/// Stats Speed 双行网速小件（原版 NetStatusItemView 同款）：
+/// 上排 = 上传（红点）、下排 = 下载（蓝点）；速率 9pt light；
+/// ≥1KB/s 点亮系统红/蓝，否则圆点退化为文字色；无流量显示 "0 KB/s"（不是裸 "0"）。
+/// 宽度自适应（原版固定 55pt 会截断 "12.3 MB/s" 这种长速率）：圆点 + 内容宽，
+/// 右缘 3pt 内边距，与邻段保持呼吸空间。
+struct NetSpeedWidget: View {
+    let overview: [String: Any]
 
-    var upload: String = "0 KB/s" {
-        didSet { if oldValue != upload { needsDisplay = true } }
-    }
-    var download: String = "0 KB/s" {
-        didSet { if oldValue != download { needsDisplay = true } }
-    }
-    var uploadActive = false {
-        didSet { if oldValue != uploadActive { needsDisplay = true } }
-    }
-    var downloadActive = false {
-        didSet { if oldValue != downloadActive { needsDisplay = true } }
+    var body: some View {
+        let n = BackendService.dict(overview, "net") ?? [:]
+        let up = (BackendService.double(n, "up_kbs") ?? 0) * 1024
+        let down = (BackendService.double(n, "down_kbs") ?? 0) * 1024
+        VStack(alignment: .leading, spacing: 1) {
+            speedRow(MenuBarMonitors.netSpeedText(up), active: up >= 1024, dotColor: .systemRed)
+            speedRow(MenuBarMonitors.netSpeedText(down), active: down >= 1024, dotColor: .systemBlue)
+        }
+        .padding(.trailing, 3)
     }
 
-    /// 点击回调（见 MiniStatusItemView.onClick 注释：双通道 + 去重）
-    var onClick: (() -> Void)?
-
-    override init(frame: NSRect) {
-        super.init(frame: frame)
-    }
-
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override func mouseDown(with event: NSEvent?) { onClick?() }
-    override func rightMouseDown(with event: NSEvent?) { onClick?() }
-
-    convenience init() {
-        self.init(frame: NSRect(x: 0, y: 2, width: Self.width,
-                                height: max(0, NSStatusBar.system.thickness - 4)))
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        let H = bounds.height
-        let rowH = H / 2
-        let textColor = NSColor.labelColor
-        // Stats Speed.swift 默认 valueAlignment = "right"：速率文字右对齐贴在
-        // 55pt 项右缘（rect x=7 宽 48）——这是 NET→下一项距离与 Stats 一样窄的关键，
-        // 左对齐会在项尾部空出 ~21pt（2.4.0 用户反馈“网络到 SSD 距离宽”的根因）。
-        let style = NSMutableParagraphStyle()
-        style.alignment = .right
-        let valueAttributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 9, weight: .light),
-            .foregroundColor: textColor,
-            .paragraphStyle: style,
-        ]
-        // 上行（上传）：红点 + 速率，贴上排（Stats displayValueState="oi"：output 在上）
-        NSAttributedString(string: upload, attributes: valueAttributes)
-            .draw(in: NSRect(x: 7, y: rowH + 1, width: 48, height: rowH))
-        // Stats drawDots（"oi"）：output（上传）圆点硬编码 y=10.5；
-        // input（下载）圆点 y=(rowH-6)/2-0.2；本机 rowH=9 时 10.5 正好居中于上排
-        dot(at: NSPoint(x: 0, y: 10.5),
-            color: uploadActive ? .systemRed : textColor)
-        // 下行（下载）：蓝点 + 速率，贴下排
-        NSAttributedString(string: download, attributes: valueAttributes)
-            .draw(in: NSRect(x: 7, y: 1, width: 48, height: rowH))
-        dot(at: NSPoint(x: 0, y: (rowH - 6) / 2 - 0.2),
-            color: downloadActive ? .systemBlue : textColor)
-    }
-
-    private func dot(at origin: NSPoint, color: NSColor) {
-        color.set()
-        NSBezierPath(ovalIn: NSRect(origin: origin, size: NSSize(width: 6, height: 6))).fill()
+    private func speedRow(_ text: String, active: Bool, dotColor: NSColor) -> some View {
+        HStack(spacing: 3) {
+            Circle()
+                .fill(active ? Color(nsColor: dotColor) : Color.primary.opacity(0.85))
+                .frame(width: 6, height: 6)
+            Text(text)
+                .font(.system(size: 9, weight: .light).monospacedDigit())
+                .lineLimit(1)
+                .fixedSize()
+        }
     }
 }

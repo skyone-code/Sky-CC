@@ -59,16 +59,44 @@ enum AppPolicy {
         NSApp.activate()
     }
 
-    /// 主窗口判定：可见、不是面板、宽度够大（菜单栏面板只有 300 左右）
+    /// 主窗口判定：有标题栏（弹窗面板/悬浮件都没有）、可见、宽度够大。
+    /// 2026-11-16 修「点打开控制台连窗口都不出现」：旧判定只看「非 NSPanel + 宽 >400」
+    /// —— 但 MenuBarExtra .window 风格的弹窗也是普通窗口，弹窗开着时点按钮，
+    /// 弹窗自己就被误判成「主窗口已在」，openWindow 被跳过。加 .titled 过滤
+    /// （主窗口有标题栏，弹窗没有）杜绝误判。
+    static func isMainWindow(_ w: NSWindow) -> Bool {
+        !(w is NSPanel) && w.styleMask.contains(.titled) && w.isVisible && w.frame.width > 400
+    }
     static var noMainWindow: Bool {
-        !NSApp.windows.contains { w in
-            w.isVisible && !(w is NSPanel) && w.frame.width > 400
+        !NSApp.windows.contains(where: isMainWindow)
+    }
+
+    /// 把主窗口叫到最前端（2026-11-16 用户反馈：菜单栏弹窗点「打开控制台」没反应）。
+    /// 根因：按钮跑在 MenuBarExtra 的 .window 弹窗里，点击时 app 是 accessory 且
+    /// **未激活**；紧接着弹窗关闭、焦点转移，`NSApp.activate()`（macOS 14+ 协作式
+    /// 激活）在这种时机拿不到前台 —— 窗口建出来也压在别的 app 后面。
+    /// 修法：异步等弹窗关完再行动；窗口没建出来（openWindow 是异步的）就多等几拍；
+    /// 置顶用 `orderFrontRegardless()`——**app 不活跃也能把窗口放到最上层**，
+    /// 不依赖 activate 成功。
+    static func raiseMainWindow(attempt: Int = 0) {
+        guard attempt < 8 else { return }          // ~1s 还没见窗口就放弃，别死循环
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            if noMainWindow {
+                raiseMainWindow(attempt: attempt + 1)   // openWindow 还没建完，再等一拍
+                return
+            }
+            toRegular()
+            NSApp.activate()
+            for w in NSApp.windows where isMainWindow(w) {
+                w.makeKeyAndOrderFront(nil)
+                w.orderFrontRegardless()
+            }
         }
     }
 
     /// 关掉启动时 SwiftUI 自动建出来的主窗口（macOS 14 兜底，见 AppDelegate）
     static func closeMainWindows() {
-        for w in NSApp.windows where !(w is NSPanel) && w.frame.width > 400 {
+        for w in NSApp.windows where !(w is NSPanel) && w.styleMask.contains(.titled) && w.frame.width > 400 {
             w.orderOut(nil)
             w.close()
         }
@@ -399,6 +427,10 @@ struct MacConsoleApp: App {
 ///   彩色（品牌彩色切图，带阴影）。
 /// 选择存 UserDefaults（@AppStorage 直连），设置页一改这里立即跟着换。
 /// helper 离线时统一降为半透明作区分。
+///
+/// 2026-11-16 重构·第二轮（用户定案）：S 飘带是**程序主图标，独立一个状态项**
+/// —— 监控数字全部搬到 MenuBarMonitors 自建的独立 NSStatusItem 里拼接显示
+/// （见 MenuBarMonitors.swift），本视图只渲染 S 飘带本身 + 弹窗/唤窗链路。
 struct MenuBarLabel: View {
     @EnvironmentObject var store: MonitorStore
     @Environment(\.openWindow) private var openWindow
@@ -430,7 +462,7 @@ struct MenuBarLabel: View {
 
     var body: some View {
         // 主图标：S 飘带，风格由设置页「状态栏主图标」选择（随系统 / 白 / 彩色）；
-        // 后台服务离线时降为半透明作区分。
+        // 后台服务离线时降为半透明作区分。监控数字在右侧独立状态项（MenuBarMonitorBar）。
         Image(nsImage: menuIcon)
             .opacity(store.connected ? 1 : 0.45)
             .accessibilityLabel(store.connected ? "Sky CC · 已连接" : "Sky CC · 连接中断")
@@ -440,16 +472,14 @@ struct MenuBarLabel: View {
                 // 主窗口已经在（双击启动时 SwiftUI 自己建过一个）就只把它叫到前面，
                 // 不要再 openWindow —— 那是第二个窗口的老来源
                 if AppPolicy.noMainWindow { openWindow(id: "main") }
-                AppPolicy.toRegular()
-                AppPolicy.activateApp()
+                AppPolicy.raiseMainWindow()
             }
             // 2.8.4：第二个实例（比如两条登录项各拉起一个）抢锁失败时，
             // 会在这里发一条跨进程通知，把已有实例的窗口叫出来 ——
             // 用户看到的就是「点一下，窗口出来了」，而不是「双开」或「点了没反应」。
             .onReceive(DistributedNotificationCenter.default().publisher(for: .mcShowMainFromOther)) { _ in
                 if AppPolicy.noMainWindow { openWindow(id: "main") }
-                AppPolicy.toRegular()
-                AppPolicy.activateApp()
+                AppPolicy.raiseMainWindow()
             }
     }
 }
@@ -520,9 +550,13 @@ struct MenuBarView: View {
                     .font(.system(size: 13, weight: .semibold))
                 Spacer()
                 Button("打开控制台") {
-                    if AppPolicy.noMainWindow { openWindow(id: "main") }
-                    AppPolicy.toRegular()
-                    AppPolicy.activateApp()
+                    // 2026-11-16：不再用 noMainWindow 拦 —— Window 场景是单例，
+                    // 已存在时 openWindow 只把它叫到前面，永远安全；靠判定拦反而
+                    // 会因弹窗误判而把 openWindow 跳过（连窗口都不出现的根因）。
+                    openWindow(id: "main")
+                    // 弹窗面板关闭会吞掉激活时机，延后到面板关完再置顶
+                    // （含窗口还没建出来的重试）。
+                    AppPolicy.raiseMainWindow()
                 }
                 .controlSize(.small)
             }
@@ -751,15 +785,16 @@ struct VisualEffectBackground: NSViewRepresentable {
 // 顶部，设备/本机/系统三张身份卡挪到设置页（见 SystemIdentity.swift）。
 struct RootView: View {
     enum Page: String, CaseIterable, Identifiable {
-        case overview, performance, control, lighting, nvidia, network, alldata, settings
+        case overview, performance, menubar, control, lighting, nvidia, network, alldata, settings
         var id: String { rawValue }
 
         var title: String {
             switch self {
-            case .overview: return "概览"
-            case .performance: return "性能"
-            case .control: return "控制"
-            case .lighting: return "灯效"
+            case .overview: return "设备概览"
+            case .performance: return "设备监测"
+            case .menubar: return "状态栏显示"
+            case .control: return "设备控制"
+            case .lighting: return "灯光矩阵"
             case .nvidia: return "NVIDIA 驱动"
             case .network: return "网卡驱动"
             case .alldata: return "全部信息"
@@ -770,6 +805,7 @@ struct RootView: View {
             switch self {
             case .overview: return "设备 · 风扇 · 电池 · 存储"
             case .performance: return "CPU · GPU · 内存 · 网络"
+            case .menubar: return "监控项逐项开关 · 按盘显示"
             case .control: return "散热 / 功耗 / 风扇手动 / 充电"
             case .lighting: return "键盘 RGB / 逐键投影 / 海岸灯"
             case .nvidia: return "版本对照 / 组件 / 一键安装"
@@ -782,6 +818,7 @@ struct RootView: View {
             switch self {
             case .overview: return "gauge"
             case .performance: return "waveform.path.ecg"
+            case .menubar: return "menubar.dock.rectangle"
             case .control: return "slider.horizontal.3"
             case .lighting: return "keyboard"
             case .nvidia: return "chip"
@@ -794,6 +831,7 @@ struct RootView: View {
             switch self {
             case .overview: return Theme.blue
             case .performance: return Theme.cyan
+            case .menubar: return Theme.blue
             case .control: return Theme.amber
             case .lighting: return Theme.purple
             case .nvidia: return Theme.green
@@ -805,7 +843,7 @@ struct RootView: View {
         /// 侧边栏分组标题
         var group: String {
             switch self {
-            case .overview, .performance: return "监测"
+            case .overview, .performance, .menubar: return "监测"
             case .control, .lighting: return "硬件"
             case .nvidia, .network: return "驱动"
             case .alldata, .settings: return "系统"
@@ -1020,6 +1058,7 @@ struct RootView: View {
         switch page {
         case .overview: OverviewView()
         case .performance: MonitorView()
+        case .menubar: MenuBarStatusView()
         case .control: ControlView()
         case .lighting: RGBView()
         case .nvidia: NvidiaView()

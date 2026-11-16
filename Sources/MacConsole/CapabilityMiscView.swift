@@ -1,7 +1,10 @@
 import SwiftUI
 import ServiceManagement
 
-/// 设置页：外观与通用 / 版本 / 菜单栏监控图标 / 系统调整 / 系统与启动参数
+/// 设置页：外观与通用 / 版本 / 皮肤 / 系统调整 / 系统与启动参数
+/// （2026-11-16 用户要求：卡片顺序调整为 外观+版本 → 皮肤 → 系统调整 → 系统与启动参数；
+///   「菜单栏监控图标」整卡迁出本页 → 新侧边栏页「状态栏显示」（监测组，性能下面，
+///   见 MenuBarStatusView.swift）。）
 /// （2026-11-14 用户要求：
 ///   ① 删「后台服务」整卡；② 外观与通用挪到原后台服务的位置（左上）；
 ///   ③ 外观与通用里的「显卡路由」段迁入「系统调整」卡；
@@ -24,18 +27,15 @@ struct MiscView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 header
-                // 2026-11-14（用户要求）：删「后台服务」卡，外观与通用挪到左上；
-                // 菜单栏图标单独一张通栏；系统调整 + 系统与启动参数置底。
+                // 2026-11-16（用户要求）：卡片顺序 外观+版本 → 皮肤 →（卡外）系统调整 → 系统与启动参数；
+                // 菜单栏监控图标卡已迁出到侧边栏「状态栏显示」页（MenuBarStatusView.swift）
                 Grid(horizontalSpacing: 14, verticalSpacing: 14) {
                     GridRow {
                         generalCard.gridEqual()
                         aboutCard.gridEqual()
                     }
-                    GridRow {
-                        menuBarCard.gridEqual().gridCellColumns(2)
-                    }
                     // 皮肤（2026-11-15）：独立通栏卡 —— 不塞进外观卡（会多两行、
-                    // 和旁边版本卡留白失衡），单独全宽一行放菜单栏卡下面
+                    // 和旁边版本卡留白失衡），单独全宽一行
                     GridRow {
                         skinCard.gridEqual().gridCellColumns(2)
                     }
@@ -89,7 +89,7 @@ struct MiscView: View {
     }
 
     private var header: some View {
-        PageHeader(title: "设置", sub: "外观与通用 · 菜单栏图标 · 系统调整 · 系统与启动参数")
+        PageHeader(title: "设置", sub: "外观与通用 · 皮肤 · 系统调整 · 系统与启动参数")
     }
 
     // MARK: - 版本信息（2026-10-19：版本号搬进系统页，方便核对装的是哪一版）
@@ -115,21 +115,7 @@ struct MiscView: View {
         }
     }
 
-    // MARK: - 菜单栏监控图标（每行：图标 + 名称 + 指标分段 + 开关，2.7.5 合并成一行）
-    private var menuBarCard: some View {
-        Card(title: "菜单栏监控图标") {
-            VStack(alignment: .leading, spacing: 8) {
-                ForEach(Array(MenuBarIconKind.allCases.enumerated()), id: \.offset) { i, kind in
-                    if i > 0 { Divider().overlay(Theme.line.opacity(0.6)) }
-                    MenuBarIconToggleRow(kind: kind)
-                }
-                Text("开关实时生效。点开图标弹出该传感器的详细读数（温度 / 占用 / 转速 / 寿命等）。")
-                    .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
-                    .padding(.top, 2)
-                    .cardNote()
-            }
-        }
-    }
+    // MARK: - 菜单栏监控图标卡已于 2026-11-16 迁出到 MenuBarStatusView.swift
 
 /// 状态栏主图标风格（2026-11-14 用户要求）：随系统（黑色模板）/ 白色 / 彩色。
 /// 与菜单栏图标（MenuBarLabel）共用同一个 @AppStorage 键，改这里立即生效。
@@ -146,151 +132,6 @@ private struct MenuBarIconStylePicker: View {
         .labelsHidden()
         .controlSize(.small)
         .frame(width: 168)
-    }
-}
-
-/// 单个图标一行：图标 + 名称 +（可选）指标分段 +（硬盘）选盘 + 开关
-private struct MenuBarIconToggleRow: View {
-    let kind: MenuBarIconKind
-    @AppStorage private var on: Bool
-
-    init(kind: MenuBarIconKind) {
-        self.kind = kind
-        _on = AppStorage(wrappedValue: kind.defaultEnabled, kind.defaultsKey)
-    }
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: kind.symbol)
-                .font(.system(size: 12))
-                .frame(width: 18)
-                .foregroundStyle(Theme.blue)
-            Text(kind.title)
-                .font(.system(size: 12.5, weight: .medium))
-                .foregroundStyle(Theme.txt)
-                .frame(width: 40, alignment: .leading)
-            if kind.supportsMetric {
-                MenuBarMetricPicker(kind: kind)
-            }
-            // 2026-11-15：选盘下拉原来挂在 supportsMetric 下面 —— 11-14 硬盘去掉
-            // 指标切换（supportsMetric=false）时把选盘也一起藏掉了。拆出来独立显示。
-            if kind == .disk {
-                MenuBarDiskPicker()
-            }
-            Spacer(minLength: 6)
-            Toggle("", isOn: $on)
-                .toggleStyle(.switch)
-                .labelsHidden()
-                .controlSize(.small)
-                .onChange(of: on) { _, _ in
-                    NotificationCenter.default.post(name: MenuBarMonitors.iconsChanged, object: nil)
-                }
-        }
-        .padding(.vertical, 2)
-    }
-}
-
-/// 菜单栏指标切换（分段控件，@AppStorage 直写 UserDefaults）
-private struct MenuBarMetricPicker: View {
-    let kind: MenuBarIconKind
-    @AppStorage private var metric: String
-
-    init(kind: MenuBarIconKind) {
-        self.kind = kind
-        _metric = AppStorage(wrappedValue: kind.defaultMetric.rawValue, kind.metricKey)
-    }
-
-    var body: some View {
-        Picker("", selection: $metric) {
-            ForEach(kind.metricOptions) { m in
-                Text(m.label).tag(m.rawValue)
-            }
-        }
-        .pickerStyle(.segmented)
-        .labelsHidden()
-        .controlSize(.small)
-        .frame(width: 128)
-        .onChange(of: metric) { _, _ in
-            // 立即刷新菜单栏数值（不等下一轮 1 秒轮询）
-            MenuBarMonitors.shared.refreshTitles()
-        }
-    }
-}
-
-/// 硬盘图标看哪块盘（2.7.5）：菜单里列出 overview.smart 里的所有 NVMe。
-/// 2026-11-15（用户反馈「只剩一块盘」）：本机明明两块 NVMe，菜单却只列一块 ——
-/// 根因是这个 struct 没观察 MonitorStore，overview 是后台逐秒轮询来的，
-/// 打开设置页那一刻如果还没到位（或只有一拍旧数据），菜单就定格在那一瞬间，
-/// 之后数据更新了视图也不会重画。加 @ObservedObject 让它跟着 overview 走；
-/// 菜单项加当前选中勾选，label 显示选中的盘名（含型号），没选时仍显示「默认盘」。
-private struct MenuBarDiskPicker: View {
-    @ObservedObject private var store = MonitorStore.shared
-    @AppStorage(MenuBarIconKind.diskTargetKey) private var target: String = ""
-
-    private var disks: [[String: Any]] {
-        (BackendService.array(store.overview, "smart") as? [[String: Any]]) ?? []
-    }
-
-    /// 当前选中的盘的 SMART 条目（label 显示它；没选或选中的盘不在了回第一条）
-    private var selected: [String: Any]? {
-        let list = disks
-        return list.first { ($0["bsd"] as? String) == target } ?? list.first
-    }
-
-    var body: some View {
-        Menu {
-            if disks.isEmpty {
-                Text("正在读取磁盘…")
-            } else {
-                // 「默认盘」= 不指定，跟 SMART 首块可用盘（与 diskEntry 行为一致）
-                Button {
-                    target = ""
-                    MenuBarMonitors.shared.refreshTitles()
-                } label: {
-                    if target.isEmpty {
-                        Label("默认盘", systemImage: "checkmark")
-                    } else {
-                        Text("默认盘")
-                    }
-                }
-                ForEach(Array(disks.enumerated()), id: \.offset) { _, d in
-                    let bsd = d["bsd"] as? String ?? ""
-                    let model = d["model"] as? String ?? ""
-                    Button {
-                        target = bsd
-                        MenuBarMonitors.shared.refreshTitles()
-                    } label: {
-                        if target == bsd {
-                            Label(model.isEmpty ? bsd : "\(bsd) · \(model)", systemImage: "checkmark")
-                        } else {
-                            Text(model.isEmpty ? bsd : "\(bsd) · \(model)")
-                        }
-                    }
-                }
-            }
-        } label: {
-            HStack(spacing: 3) {
-                Text(diskLabel)
-                Image(systemName: "chevron.down").font(.system(size: 7.5))
-            }
-            .font(.system(size: 11))
-            .foregroundStyle(Theme.dim)
-            .lineLimit(1)
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .frame(width: 110)
-        .fixedSize(horizontal: false, vertical: true)
-    }
-
-    private var diskLabel: String {
-        if target.isEmpty { return "默认盘" }
-        if let s = selected {
-            let bsd = s["bsd"] as? String ?? target
-            let model = s["model"] as? String ?? ""
-            return model.isEmpty ? bsd : bsd
-        }
-        return target
     }
 }
 

@@ -50,7 +50,7 @@ PROJ="$BUILD/app-resources"
 [ -d "$PROJ" ] || { echo "错误：找不到资源目录 $PROJ" >&2; exit 1; }
 
 # 版本号（唯一来源：脚本注入 Info.plist 与 helper 的 BuildVersion.swift）
-VERSION="3.0.6"
+VERSION="3.0.7"
 # 显示版本（侧边栏/设置页文案）：数字版本 + 专用版标识
 DISPLAY_VERSION="$VERSION LAPQC71x"
 # nvmetemp（NVMe 硬盘温度，SMART）——有现成二进制就用，
@@ -345,8 +345,14 @@ chmod 755 "$DMGROOT/$(basename "$PKGOUT")"
 # 点「立即安装」即可，用户不需要在磁盘映像里找文件。
 cp "$BUILD/templates/卸载.command" "$DMGROOT/卸载Sky CC.command"
 chmod 755 "$DMGROOT/卸载Sky CC.command"
-cp "$BUILD/templates/说明.txt" "$DMGROOT/说明.txt"
-chmod 644 "$DMGROOT/说明.txt"
+# 2026-11-16：说明.txt 已被用户从仓库删除（网页端提交）——有就放、没有就清掉，
+# 否则 set -euo pipefail 会在 cp 这行断掉，pkg 出了 DMG 却永远是旧文件
+if [ -f "$BUILD/templates/说明.txt" ]; then
+  cp "$BUILD/templates/说明.txt" "$DMGROOT/说明.txt"
+  chmod 644 "$DMGROOT/说明.txt"
+else
+  rm -f "$DMGROOT/说明.txt"
+fi
 
 if [[ "${MC_SKIP_DMG:-0}" == "1" ]]; then
   echo "==> 8/8 跳过 DMG（MC_SKIP_DMG=1）"

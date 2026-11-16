@@ -143,7 +143,10 @@ struct SystemIdentitySection: View {
 
     var body: some View {
         Grid(horizontalSpacing: 14, verticalSpacing: 14) {
-            GridRow {
+            // 2026-11-16（用户反馈）：设备卡 5 行、本机卡 7 行，高度不同；
+            // GridRow 默认垂直居中会把矮的那张顶下去，两卡顶边错开。
+            // 显式 .top 对齐，与下方风扇/电池行（HStack alignment: .top）一致。
+            GridRow(alignment: .top) {
                 deviceCard.gridEqual()
                 machineCard.gridEqual()
             }

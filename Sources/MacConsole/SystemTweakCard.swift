@@ -14,6 +14,7 @@
 //
 
 import SwiftUI
+import AppKit
 
 // MARK: - 通用开关行（标题 + 副标题 + 开关，点击即生效）
 // （原 ControlView.swift 内的 private struct，随「系统调整」卡一起迁来并改为 internal）
@@ -58,6 +59,9 @@ struct SystemTweakSection: View {
     // 系统调整（原厂 FastSwitch 页）：只剩 Win 键锁定（用户要求删 OSD / 安静模式 / 保持唤醒）
     @State private var winLock: Bool
 
+    // 挂载 EFI（2026-11-16 用户要求，1401 方案）
+    @State private var efiMounting = false
+
     private var kextOK: Bool { backend.kextLoaded }
 
     // 2026-11-14（首帧记忆）：构造时同步读软件记忆，首帧即上次选择；
@@ -70,6 +74,29 @@ struct SystemTweakSection: View {
         Card(title: "系统调整 · 原厂 FastSwitch 页") {
             if !kextOK { KextRequiredHint(text: "Win 键锁定要 TongfangFan.kext") }
             VStack(alignment: .leading, spacing: 11) {
+                // 2026-11-16（用户要求）：挂载 EFI 放本卡第一位（显示屏上面）——
+                // 1401 方案定位本机 OpenCore 所在的 EFI 分区并挂载。
+                GroupTitle(text: "EFI 分区", sub: "1401 方案定位 · 机型校验")
+                HStack(spacing: 8) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("挂载 EFI").font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(Theme.txt)
+                        if !hideCardSubs {
+                            Text("按 boot-path → 启动盘兜底定位 OpenCore 的 EFI 分区（校验机型，不会挂错救援盘），挂载后打开访达窗口。需要管理员授权。")
+                                .font(.system(size: 11)).foregroundStyle(Theme.dim2)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    Spacer(minLength: 4)
+                    SecondaryButton(title: efiMounting ? "挂载中…" : "挂载",
+                                    icon: "externaldrive", tint: Theme.cyan) {
+                        mountEFI()
+                    }
+                    .disabled(efiMounting)
+                }
+
+                Divider().overlay(Theme.line)
+
                 GroupTitle(text: "显示屏", sub: "不经 EC")
                 HStack(spacing: 8) {
                     VStack(alignment: .leading, spacing: 2) {
@@ -158,6 +185,69 @@ struct SystemTweakSection: View {
         if let v = UIControlPrefs.bool(UIControlPrefs.K.winLock) { winLock = v }
     }
 
+    // MARK: 挂载 EFI（2026-11-16 用户要求，1401 方案）
+
+    /// 写脚本（函数体照搬 AirportItlwm install.command 的「1401 方案」定位段）→
+    /// 管理员权限执行 → 成功 toast + 打开访达窗口；失败 toast 原因。
+    private func mountEFI() {
+        guard !efiMounting else { return }
+        efiMounting = true
+        let fm = FileManager.default
+        let logURL = fm.temporaryDirectory
+            .appendingPathComponent("SkyCC-efi-\(UUID().uuidString).log")
+        let script = fm.temporaryDirectory
+            .appendingPathComponent("SkyCC-mount-efi-\(UUID().uuidString).sh")
+        do {
+            try Self.mountEFIsh.write(to: script, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        } catch {
+            efiMounting = false
+            showToast("无法写入挂载脚本：\(error.localizedDescription)")
+            return
+        }
+        let shPath = script.path
+        DispatchQueue.global(qos: .userInitiated).async {
+            // 提权执行是阻塞式（密码授权弹窗期间一直等到用户点完），放后台队列
+            let result = DriverInstaller.runWithAdminPrivileges(executable: shPath,
+                                                                logURL: logURL,
+                                                                deadline: 180) { _, _ in }
+            DispatchQueue.main.async {
+                self.efiMounting = false
+                try? fm.removeItem(at: script)
+                try? fm.removeItem(at: logURL)
+                if result.ok {
+                    let mp = Self.marker(result.output, "MOUNT_POINT=") ?? ""
+                    let oc = Self.marker(result.output, "OC_DIR=") ?? ""
+                    if !mp.isEmpty {
+                        showToast("EFI 已挂载：\(mp)\(oc.isEmpty ? "" : "（OpenCore：/\(oc)）")")
+                        NSWorkspace.shared.open(URL(fileURLWithPath: mp))
+                    } else {
+                        showToast("EFI 已挂载")
+                    }
+                } else {
+                    // 取脚本输出的 STOP 行（已带原因）；没有就给通用文案
+                    let reason = Self.stopReason(result.output)
+                        ?? (result.output.isEmpty ? "授权未完成或脚本执行失败" : result.output)
+                    showToast("挂载失败：\(reason)")
+                }
+            }
+        }
+    }
+
+    /// 从脚本输出里取 "KEY=..." 标记值
+    private static func marker(_ out: String, _ key: String) -> String? {
+        out.split(separator: "\n")
+            .first { $0.hasPrefix(key) }
+            .map { String($0.dropFirst(key.count)).trimmingCharacters(in: .whitespaces) }
+    }
+
+    /// 取 "STOP: xxx" 行去掉前缀
+    private static func stopReason(_ out: String) -> String? {
+        out.split(separator: "\n")
+            .first { $0.hasPrefix("STOP:") }
+            .map { $0.dropFirst("STOP:".count).trimmingCharacters(in: .whitespaces) }
+    }
+
     private func showToast(_ s: String) {
         ToastCenter.shared.show(s)
     }
@@ -189,4 +279,100 @@ struct SystemTweakSection: View {
             showToast("关屏失败：\(BackendService.string(r, "error") ?? "未知")")
         }
     }
+}
+
+// MARK: - 挂载 EFI 脚本（1401 方案）
+//
+// 函数体照搬 AirportItlwm-AX200-2.4.2/install.command 的「1401 方案」定位段
+// （原始出处：/Applications/1401.app 的 nullmoth-setup.sh）：
+//   booted_part（NVRAM boot-path 反查 OpenCore 本次引导所用分区）→
+//   失败兜底 boot_esp（当前 macOS 所在物理盘的 EFI 分区）→
+//   NTFS 拦截 → 挂载（已挂载就复用，**不卸载**）→
+//   ocrel_in 按 boot-path 目录 → EFI/OC → EFI/BOOT 找 config.plist 并校验机型。
+// 校验失败只报原因不乱挂；挂上后由 app 打开访达窗口。
+// 输出约定：成功末两行 MOUNT_POINT=<挂载点> / OC_DIR=<OC 目录>；失败 STOP: <原因>。
+private extension SystemTweakSection {
+    static let mountEFIsh = #"""
+    #!/bin/bash
+    # 挂载 OpenCore 所在的 EFI 分区（1401 方案，照搬 AirportItlwm install.command）
+    set -u
+    PB=/usr/libexec/PlistBuddy
+    OCGUID="4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102"
+
+    stop() { echo "STOP: $*" >&2; exit 2; }
+
+    mnt() { diskutil info "$1" 2>/dev/null | awk -F': *' '/Mount Point/{print $2}'; }
+
+    is_ntfs() {
+      diskutil info "$1" 2>/dev/null | grep -qiE '(Type \(Bundle\)|File System Personality):.*ntfs'; }
+
+    boot_ocrel() {   # OpenCore 本次启动用的目录（读 NVRAM boot-path；不在 EFI/ 下或缺省时返回空）
+      local bp p
+      bp=$(nvram "$OCGUID:boot-path" 2>/dev/null | cut -f2-)
+      case "$bp" in *\)*) ;; *) return 0;; esac
+      p=${bp##*\)}; p=${p%%\%*}; p=$(printf '%s' "$p" | tr '\\' '/')
+      while [ "${p#/}" != "$p" ]; do p=${p#/}; done
+      case "$p" in */*) p=${p%/*};; *) return 0;; esac
+      case "/$p/" in /EFI/*/) ;; *) return 0;; esac
+      case "/$p/" in */../*|*/./*|*//*) return 0;; esac
+      printf '%s\n' "$p"; }
+
+    booted_part() {  # OpenCore 启动本机所用分区（boot-path 里的分区 UUID 反查设备号）
+      local bp u d
+      bp=$(nvram "$OCGUID:boot-path" 2>/dev/null | cut -f2-)
+      u=$(printf '%s' "$bp" | grep -oiE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
+      [ -n "$u" ] || return 1
+      for d in $(diskutil list | grep -oE 'disk[0-9]+s[0-9]+$' | sort -u); do
+        diskutil info "$d" 2>/dev/null | grep -qi "Partition UUID: *$u" && { echo "$d"; return 0; }; done
+      return 1; }
+
+    boot_esp() {     # 当前 macOS 所在物理盘的 EFI 分区
+      local c p w
+      c=$(diskutil info / | awk -F': *' '/Part of Whole/{print $2}')
+      p=$(diskutil info "$c" 2>/dev/null | awk -F': *' '/APFS Physical Store/{print $2}'); [ -n "$p" ] || p=$c
+      w=$(diskutil info "$p" | awk -F': *' '/Part of Whole/{print $2}')
+      diskutil list "$w" | awk '/ EFI /{print $NF}' | grep -E '^disk[0-9]+s[0-9]+$' | head -1; }
+
+    ocrel_in() {     # $1 = 挂载点；找 OpenCore 目录并校验 config 是本机的（机型匹配）
+      local d m bo c cm k
+      m=$(sysctl -n hw.model 2>/dev/null); bo=$(boot_ocrel)
+      for d in ${bo:+"$bo"} EFI/OC EFI/BOOT; do
+        [ -f "$1/$d/config.plist" ] || continue
+        [ "$d" = EFI/BOOT ] && [ ! -d "$1/$d/Kexts" ] && continue
+        c="$1/$d/config.plist"; cm=""
+        for k in PlatformInfo.Generic.SystemProductName PlatformInfo.SMBIOS.SystemProductName \
+                 PlatformInfo.DataHub.SystemProductName; do
+          cm=$("$PB" -c "Print :$k" "$c" 2>/dev/null); [ -n "$cm" ] && break; done
+        [ -n "$m" ] && [ -n "$cm" ] && [ "$cm" != "$m" ] && continue
+        echo "$d"; return 0; done
+      return 1; }
+
+    echo "== 定位 OpenCore 的 EFI 分区（1401 方案）=="
+    D=""
+    if D=$(booted_part); then
+        echo "OpenCore 本次引导所用分区：$D"
+    else
+        D=$(boot_esp) || stop "无法确定当前启动盘的 EFI 分区"
+        echo "当前启动盘的 EFI 分区：$D"
+    fi
+    is_ntfs "$D" && stop "$D 是 Windows(NTFS) 分区，OpenCore 不会从它启动 —— 请确认 OpenCore 所在的盘"
+
+    MP=$(mnt "$D")
+    if [ -z "$MP" ]; then
+        diskutil mount "$D" >/dev/null 2>&1 || stop "挂载 $D 失败"
+        MP=$(mnt "$D")
+    fi
+    [ -n "$MP" ] || stop "挂载后拿不到挂载点"
+    if mount | grep -F " on $MP (" | grep -q read-only; then
+        stop "macOS 把 $MP 挂载成了只读，改不了任何文件。常见原因：Windows 快速启动把 ESP 留成脏状态 —— 磁盘工具对该分区跑一次急救，或关掉 Windows 快速启动后完整关机一次再试"
+    fi
+
+    OCREL=$(ocrel_in "$MP" || true)
+    [ -n "$OCREL" ] || stop "$D 上没有找到本机的 OpenCore（已按 boot-path 目录 → EFI/OC → EFI/BOOT 依次找 config.plist，并校验机型匹配）。它不是 OpenCore 的 ESP 或是别的机器的救援盘。分区仍挂在 $MP 供人工检查"
+
+    echo "MOUNT_POINT=$MP"
+    echo "OC_DIR=$OCREL"
+    echo "已挂载：$MP（OpenCore 目录 /$OCREL）"
+    exit 0
+    """#
 }
