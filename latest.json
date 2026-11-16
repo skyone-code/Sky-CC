@@ -1,0 +1,10 @@
+{
+  "tag": "3.0.7",
+  "version": "3.0.7",
+  "pkg_name": "Sky CC-3.0.7-LAPQC71x.pkg",
+  "pkg_url": "https://gitee.com/skyone021396/Sky-CC/releases/download/3.0.7/Sky%20CC-3.0.7-LAPQC71x.pkg",
+  "size": 2772861,
+  "sha256": "d1c6a26935ce08cc6448561e60db9853da03274eddb37fc0db0a3ae7436a4636",
+  "published_at": "2026-11-17T06:15:00+08:00",
+  "notes": "3.0.7：菜单栏监控重构、状态栏显示页逐项开关、EFI 挂载、侧边栏改名；检查更新改走静态 latest.json，启动静默检查 24 小时节流"
+}

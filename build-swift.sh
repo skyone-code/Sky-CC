@@ -130,7 +130,32 @@ DMGROOT="${MC_DMGROOT:-/tmp/mc-build/dmgroot}"
 # pkgbuild --install-location / 直接摊到系统根上。
 PKGROOT="${MC_PKGROOT:-/tmp/mc-build/pkgroot}"
 PKGSCRIPTS="${MC_PKGSCRIPTS:-/tmp/mc-build/pkgscripts}"
-PKGOUT="$BUILD/Sky CC-安装器-$VERSION-LAPQC71x.pkg"
+# 命名口径（2026-11-17 用户定）：
+#   · 发布产物按用户给的规则，**不带「安装器」字样**：Sky CC-<版本>-LAPQC71x.pkg/.dmg
+#   · 归档留存的历史版本必须再带「时间戳 + 内部版本号」：
+#     Sky CC-<版本>-<YYYYMMDD>-<HHMM>-<内部版本号>-LAPQC71x.pkg（内部版本号 = 版本去点，3.0.7→307）
+BUILDNO="${VERSION//./}"
+PKGBASE="Sky CC-$VERSION-LAPQC71x"
+STAMP="$(date +%Y%m%d-%H%M)"
+ARCHIVE_BASE="Sky CC-$VERSION-$STAMP-$BUILDNO-LAPQC71x"
+PKGOUT="$BUILD/$PKGBASE.pkg"
+
+# 归档留存（用户规矩：只增不删不覆盖，归档名必须带时间戳 + 内部版本号）
+# 用法：MC_ARCHIVE_DIR=/path/to/05-安装包 ./build-swift.sh
+mckarchive() {
+  [[ -n "${MC_ARCHIVE_DIR:-}" ]] || return 0
+  mkdir -p "$MC_ARCHIVE_DIR"
+  for f in "$@"; do
+    [[ -f "$f" ]] || continue
+    local ext="${f##*.}"
+    local dst="$MC_ARCHIVE_DIR/$ARCHIVE_BASE.$ext"
+    if [[ -e "$dst" ]]; then
+      echo "    归档已存在，跳过（不覆盖）：$(basename "$dst")"
+    else
+      cp "$f" "$dst" && chmod 644 "$dst" && echo "    归档: $(basename "$dst")"
+    fi
+  done
+}
 
 echo "==> 1/8 清理并重建 staging"
 # 用 find -delete 而不是 rm -rf：本机安全钩子对 rm 系命令的备份暂存目录
@@ -332,6 +357,55 @@ pkgbuild --root "$PKGROOT" \
          --install-location / \
          --ownership recommended \
          "$PKGOUT" > /dev/null
+
+# ⚠️ 2026-11-17：必须剥离 bundle-version，否则 pkg 只能升不能降、甚至同版本重装也会静默失败。
+# pkgbuild 扫到 payload 里有 .app，会自动在 PackageInfo 里写 <bundle-version> /
+# <upgrade-bundle> / <relocate> / <strict-identifier>。PackageKit 装包时拿 payload 的
+# bundle 版本跟已装版本比，**payload 更低就整组件跳过**，而 Installer 界面照样走完流程、
+# 报“安装成功”、写回执 —— 文件一个字节都没落盘。日志原话：
+#   Skipping component "com.macconsole.console" (3.0.6) because the version 3.0.7
+#   is already installed at /Applications/Sky CC.app.
+# <relocate> 更坑：它让 Installer 把“已装 app”认到别的同名副本上（实测认到过
+# ~/Desktop/…/04-已装应用快照/Sky CC.app），于是 /Applications 里那份永远不被替换。
+# 处理：展开 → 删掉这四个节点 → 压平 → 核对 payload 文件数没变。
+PKGX="${MC_PKGX:-/tmp/mc-build/pkgx}"
+# pkgutil --expand 的目标目录**必须不存在**（否则 Error 17: File exists），
+# 所以这里只清空、不 mkdir —— 展开动作自己会建。
+if [[ -d "$PKGX" ]]; then
+  find "$PKGX" -mindepth 1 -delete 2>/dev/null || true
+  rmdir "$PKGX" 2>/dev/null || true
+fi
+rm -rf "$PKGX" 2>/dev/null || true
+pkgutil --expand "$PKGOUT" "$PKGX"
+PYBIN=$(command -v /usr/bin/python3 || command -v python3)
+"$PYBIN" - "$PKGX/PackageInfo" <<'PYSTRIP'
+import re, sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8").read()
+before = s
+for tag in ("bundle-version", "upgrade-bundle", "relocate", "strict-identifier"):
+    s = re.sub(r"[ \t]*<%s\b[^>]*>.*?</%s>[ \t]*\n?" % (tag, tag), "", s, flags=re.S)
+    s = re.sub(r"[ \t]*<%s\b[^>]*/>[ \t]*\n?" % tag, "", s)
+open(p, "w", encoding="utf-8").write(s)
+print("    PackageInfo 剥离完成" if s != before else "    PackageInfo 无需变更")
+PYSTRIP
+mv "$PKGOUT" "$PKGOUT.pre-strip"
+pkgutil --flatten "$PKGX" "$PKGOUT"
+A=$(pkgutil --payload-files "$PKGOUT.pre-strip" | wc -l | tr -d ' ')
+B=$(pkgutil --payload-files "$PKGOUT" | wc -l | tr -d ' ')
+if [[ "$A" != "$B" ]]; then
+  echo "    !! payload 文件数不一致（$A vs $B），回滚为未剥离版本" >&2
+  mv -f "$PKGOUT.pre-strip" "$PKGOUT"
+else
+  rm -f "$PKGOUT.pre-strip"
+  if pkgutil --payload-files "$PKGOUT" | grep -q "Applications/Sky CC.app/Contents/Info.plist"; then
+    echo "    校验通过：payload $B 项，app 在位，已可覆盖/降级安装"
+  else
+    echo "    !! 压平后 payload 里找不到 app，构建中止" >&2
+    exit 1
+  fi
+fi
+
 echo "    pkg: $PKGOUT"
 
 echo "==> 8/8 组装 DMG 内容"
@@ -359,14 +433,16 @@ if [[ "${MC_SKIP_DMG:-0}" == "1" ]]; then
   echo
   echo "完成（仅 pkg）：$PKGOUT"
   echo "完成（仅 app）：$APP"
+  mckarchive "$PKGOUT"
   exit 0
 fi
 
 echo "==> 8/8 打 DMG"
 hdiutil create -volname "Sky CC安装器" -srcfolder "$DMGROOT" -ov -format UDZO \
-  "$BUILD/Sky CC-安装器-$VERSION-LAPQC71x.dmg" | tail -1
-hdiutil verify "$BUILD/Sky CC-安装器-$VERSION-LAPQC71x.dmg" >/dev/null && echo "DMG 校验通过"
+  "$BUILD/$PKGBASE.dmg" | tail -1
+hdiutil verify "$BUILD/$PKGBASE.dmg" >/dev/null && echo "DMG 校验通过"
 
 echo
-echo "完成：$BUILD/Sky CC-安装器-$VERSION-LAPQC71x.dmg"
+echo "完成：$BUILD/$PKGBASE.dmg"
+mckarchive "$PKGOUT" "$BUILD/$PKGBASE.dmg"
 echo "  app 内已无 Python、无 HTTP：硬件后端在 MacConsoleHelper（XPC），助手为 mcutil + 三个编译型二进制"

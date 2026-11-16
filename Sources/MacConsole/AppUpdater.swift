@@ -55,6 +55,34 @@ final class AppUpdater: ObservableObject {
     private var pollTimer: Timer?
     private var launchChecked = false
 
+    // MARK: - 静默检查节流（2026-11-17）
+    // 起因：Gitee 未认证 API 按出口 IP 限流，App 每次启动都联网一枪（连 GitHub 那枪恒 404），
+    // 启动次数一多就把配额打光，之后连手动「检查更新」都只能拿到 403 / 404。
+    // 现在的口径：
+    //   · 启动静默检查：读 UserDefaults 里的上次检查时间，**24 小时内不再联网**；
+    //     真到期了也只打静态 latest.json **一枪**（allowAPI: false，不碰 GitHub / Gitee API）；
+    //   · 失败（断网 / 文件拉不到）：2 小时后再试，避免一次失败就整天不查；
+    //   · 手动「检查更新」：不受节流影响，永远走全链路（静态 → GitHub → Gitee）。
+    private enum ThrottleKeys {
+        static let lastSilentCheck = "SkyCC.updater.lastSilentCheckAt"
+    }
+    private static let silentInterval: TimeInterval = 24 * 3600
+    private static let silentRetryAfterFailure: TimeInterval = 2 * 3600
+
+    /// 距上次启动检查是否已过节流窗口
+    static func silentCheckDue(now: Date = Date()) -> Bool {
+        let last = UserDefaults.standard.double(forKey: ThrottleKeys.lastSilentCheck)
+        guard last > 0 else { return true }
+        return now.timeIntervalSince1970 - last >= silentInterval
+    }
+
+    /// 记录本次静默检查时间；failed=true 时按「2 小时后重试」记（等价于把时间戳往前推）
+    private static func markSilentCheck(failed: Bool, now: Date = Date()) {
+        let stamp = failed ? now.timeIntervalSince1970 - (silentInterval - silentRetryAfterFailure)
+                          : now.timeIntervalSince1970
+        UserDefaults.standard.set(stamp, forKey: ThrottleKeys.lastSilentCheck)
+    }
+
     /// sheet 是否该显示（手动检查的转圈 / 下载中 / 安装中）。
     /// 注意用 spinnerVisible 而不是 checkingUpdate —— 后者静默检查也会置位。
     var sheetVisible: Bool {
@@ -74,6 +102,8 @@ final class AppUpdater: ObservableObject {
     func launchSilentCheck() {
         guard !launchChecked else { return }
         launchChecked = true
+        // 24 小时内已经查过 → 这次开机干脆不联网（原实现是每次启动必打一枪）
+        guard Self.silentCheckDue() else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
             self?.check(silent: true)
         }
@@ -89,15 +119,19 @@ final class AppUpdater: ObservableObject {
         ReleaseFallback.fetchLatest(
             githubAPI: "https://api.github.com/repos/skyone213/Sky-CC/releases/latest",
             giteeRepo: "Sky-CC",
-            userAgent: "SkyCC/\(mcHelperBuildVersion)") { [weak self] dict, _ in
+            userAgent: "SkyCC/\(mcHelperBuildVersion)",
+            staticJSON: ReleaseFallback.staticLatestURL,
+            allowAPI: !silent) { [weak self] dict, _ in
             DispatchQueue.main.async {
                 guard let self else { return }
+                // 静默检查过就落时间戳（失败按 2 小时后再试记），手动检查不动这个窗口
+                if silent { Self.markSilentCheck(failed: dict == nil) }
                 self.checkingUpdate = false
                 self.spinnerVisible = false
                 guard let dict,
                       let tag = dict["tag_name"] as? String else {
                     if !silent {
-                        ToastCenter.shared.show("检查失败：无法获取版本信息（GitHub / Gitee 都不可达）")
+                        ToastCenter.shared.show("检查失败：三个版本源都不可达（静态文件 / GitHub / Gitee）")
                     }
                     return
                 }
