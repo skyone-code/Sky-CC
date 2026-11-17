@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>zh_CN</string>
+	<key>CFBundleExecutable</key>
+	<string>SkyCCEC</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.skycc.EC</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>SkyCCEC</string>
+	<key>CFBundlePackageType</key>
+	<string>KEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.0</string>
+	<key>CFBundleVersion</key>
+	<string>1.0.0</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Sky CC · EC 通道与 CPU 频率读数（重写自 kirainmoe/TongfangEnhancer 的对外契约）</string>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>SkyCCECDriver</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>com.skycc.EC</string>
+			<key>IOClass</key>
+			<string>SkyCCECDriver</string>
+			<key>IOMatchCategory</key>
+			<string>SkyCCEC</string>
+			<key>IOProviderClass</key>
+			<string>IOACPIPlatformDevice</string>
+			<key>IONameMatch</key>
+			<string>PNP0C14</string>
+			<key>IOProbeScore</key>
+			<integer>900</integer>
+			<key>DebugMode</key>
+			<false/>
+		</dict>
+	</dict>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.iokit.IOACPIFamily</key>
+		<string>1.0d1</string>
+		<key>com.apple.kpi.bsd</key>
+		<string>9.0.0</string>
+		<key>com.apple.kpi.iokit</key>
+		<string>9.0.0</string>
+		<key>com.apple.kpi.libkern</key>
+		<string>9.0.0</string>
+		<key>com.apple.kpi.mach</key>
+		<string>9.0.0</string>
+		<key>com.apple.kpi.unsupported</key>
+		<string>9.0.0</string>
+	</dict>
+	<key>OSBundleRequired</key>
+	<string>Root</string>
+</dict>
+</plist>

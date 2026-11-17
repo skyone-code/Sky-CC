@@ -18,3 +18,4 @@ swift-pkgroot/
 build/
 *.app/
 Tools/msrprobe
+Tools/ecprobe
