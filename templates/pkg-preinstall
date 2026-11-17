@@ -7,5 +7,8 @@
 # 退出失败不阻断安装（|| true）。
 # ---------------------------------------------------------------------------
 /usr/bin/pkill -f "Sky CC.app/Contents/MacOS/Sky CC" 2>/dev/null || true
+# 2026-11-17（MacConsole → SkyCC 更名）：helper 二进制改名，新旧两个名字都要杀 ——
+# 装了多个版本的机器上可能两个都在（旧包留下的 MacConsoleHelper 还会抢 EC）。
+/usr/bin/pkill -f "Sky CC.app/Contents/MacOS/SkyCCHelper" 2>/dev/null || true
 /usr/bin/pkill -f "Sky CC.app/Contents/MacOS/MacConsoleHelper" 2>/dev/null || true
 exit 0

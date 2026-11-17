@@ -12,7 +12,7 @@
  *   launchctl setenv DYLD_INSERT_LIBRARIES <本 dylib 路径>
  * 之后启动的 app 全部继承；不需要注入的进程由下面的策略表挡掉。
  *
- * 策略写在 ~/Library/Application Support/MacConsole/gpu-policy.json：
+ * 策略写在 ~/Library/Application Support/SkyCC/gpu-policy.json：
  *   {"mode": "dgpu" | "igpu" | "auto", "exclude": ["com.foo.bar", ...]}
  *
  *   mode=dgpu  → 默认给独显（Windows「高性能」）
@@ -44,7 +44,7 @@ static NSString *policyPath(void) {
     NSArray *dirs = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory,
                                                         NSUserDomainMask, YES);
     if (dirs.count == 0) return nil;
-    return [[dirs[0] stringByAppendingPathComponent:@"MacConsole"]
+    return [[dirs[0] stringByAppendingPathComponent:@"SkyCC"]
             stringByAppendingPathComponent:@"gpu-policy.json"];
 }
 
@@ -52,7 +52,7 @@ static NSString *policyPath(void) {
 static BOOL isExcluded(NSString *bundleID) {
     if (bundleID.length == 0) return NO;
     if ([bundleID hasPrefix:@"com.apple."]) return YES;      /* 系统进程，永不动 */
-    if ([bundleID isEqualToString:@"com.macconsole.console"]) return YES;
+    if ([bundleID isEqualToString:@"com.skycc.console"]) return YES;
 
     NSString *p = policyPath();
     if (!p) return NO;
@@ -138,7 +138,7 @@ static const struct interposer interposers[] __attribute__((section("__DATA,__in
 
 __attribute__((constructor))
 static void init(void) {
-    lg = os_log_create("com.macconsole.gpu-router", "route");
+    lg = os_log_create("com.skycc.gpu-router", "route");
     if (getenv("MC_GPU_ROUTER_DEBUG"))
         os_log(lg, "gpu-router: injected into %{public}s (%{public}@)",
                getprogname() ?: "?", [[NSBundle mainBundle] bundleIdentifier] ?: @"no-bundle");

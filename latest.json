@@ -1,10 +1,10 @@
 {
-  "tag": "3.0.7",
-  "version": "3.0.7",
-  "pkg_name": "Sky CC-3.0.7-LAPQC71x.pkg",
-  "pkg_url": "https://gitee.com/skyone021396/Sky-CC/releases/download/3.0.7/Sky%20CC-3.0.7-LAPQC71x.pkg",
-  "size": 2772861,
-  "sha256": "d1c6a26935ce08cc6448561e60db9853da03274eddb37fc0db0a3ae7436a4636",
-  "published_at": "2026-11-17T06:15:00+08:00",
-  "notes": "3.0.7：菜单栏监控重构、状态栏显示页逐项开关、EFI 挂载、侧边栏改名；检查更新改走静态 latest.json，启动静默检查 24 小时节流"
+  "tag": "3.1.0",
+  "version": "3.1.0",
+  "pkg_name": "Sky CC-3.1.0-LAPQC71x.pkg",
+  "pkg_url": "https://gitee.com/skyone021396/Sky-CC/releases/download/3.1.0/Sky%20CC-3.1.0-LAPQC71x.pkg",
+  "size": 2820422,
+  "sha256": "23882912e828e1f950fe8fb7276aa6fb8786770bef0953282695eba65a416978",
+  "published_at": "2026-11-17T12:05:00+08:00",
+  "notes": "3.1.0：全面更名 MacConsole → Sky CC（应用标识换为 com.skycc.*，kext 同步重签；旧 kext 仍可继续用，想统一标识可在设备控制页点一次「立即安装」；开机自启需重新打开一次）；显卡路由移到「设备控制」页散热模式上方；侧边栏「设备检测」改「性能监测」；触控板与 Fn 锁改为实时回读；检查更新零 API 配额、CPU 占用优化"
 }

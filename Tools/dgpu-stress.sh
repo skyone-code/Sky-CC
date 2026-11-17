@@ -12,7 +12,7 @@
 # 才能排除「驱动写了个固定值」这种假上报。
 #
 # 采样方式：直接读 NVAccel 的 PerformanceStatistics（驱动 2.6.3 起由内核每秒采样，
-# 见 Sources/MacConsole/Native/NativeNVAccel.swift）。不需要 root、不需要 app 在跑、
+# 见 Sources/SkyCC/Native/NativeNVAccel.swift）。不需要 root、不需要 app 在跑、
 # 也不需要自己开 RM 通道。两个要记住的语义：驱动**每秒**才更新一次，采样间隔低于
 # 1 秒只会看到重复值；查询失败或样本超 5 秒没更新时驱动是**删键**而不是写 0。
 #
@@ -24,7 +24,7 @@ set -u
 
 # 脚本所在目录的上一级 = 项目根
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-NATIVE="$ROOT/Sources/MacConsole/Native/NativeNVAccel.swift"
+NATIVE="$ROOT/Sources/SkyCC/Native/NativeNVAccel.swift"
 
 if [[ ! -f "$NATIVE" ]]; then
     print -u2 "错误：找不到 $NATIVE"

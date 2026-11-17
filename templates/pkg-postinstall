@@ -34,6 +34,6 @@ LEGACY=/usr/local/lib/gpu-router.dylib
   /bin/ls -la "$DYLD" 2>&1
   /bin/ls -la "$LEGACY" 2>&1
   /usr/bin/shasum -a 256 "$DYLD" 2>&1
-} >> /tmp/macconsole-gpu-router-install.log 2>&1
+} >> /tmp/skycc-gpu-router-install.log 2>&1
 
 exit 0

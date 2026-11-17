@@ -8,7 +8,7 @@
 #
 # 特性：
 #   - 幂等：kext 已加载 → 直接退出；重复运行安全
-#   - 日志：/tmp/macconsole-kext-install.log（同时保留 stdout，供 app 读取失败原因）
+#   - 日志：/tmp/skycc-kext-install.log（同时保留 stdout，供 app 读取失败原因）
 #   - 非 root 调用时内部自动套 sudo（例如有人手动 bash 它）
 #
 # 2.8.12：kext 不再单独放 DMG，只有 app 内嵌这一份；app 里点「立即安装」调用本脚本。
@@ -18,7 +18,7 @@ set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"     # Resources/native
 KEXT_SRC="$HERE/TongfangFan.kext"
 KEXT_DST="/Library/Extensions/TongfangFan.kext"
-DAEMON_PLIST="/Library/LaunchDaemons/com.macconsole.TongfangFan.plist"
+DAEMON_PLIST="/Library/LaunchDaemons/com.skycc.TongfangFan.plist"
 # 2.8.15：开机加载器用我们自己的二进制，不再让守护直接 exec /usr/bin/kmutil
 # （那样「系统设置 → 登录项」里会显示成一条来路不明的 "kmutil"）。
 # 放 app 自己的支持库：/Library/PrivilegedHelperTools 与 /usr/local/bin 在本机
@@ -32,8 +32,8 @@ if [[ -n "$CONSOLE_USER" && -d "/Users/$CONSOLE_USER" ]]; then
 else
   USER_HOME="${HOME:-/var/root}"
 fi
-LOADER_DST="$USER_HOME/Library/Application Support/MacConsole/bin/Sky CC散热扩展"
-LOG="/tmp/macconsole-kext-install.log"
+LOADER_DST="$USER_HOME/Library/Application Support/SkyCC/bin/Sky CC散热扩展"
+LOG="/tmp/skycc-kext-install.log"
 
 # 既写日志又把输出留给调用方（osascript 只回传 stdout，全导进日志的话
 # app 拿不到任何原因，只能报「未知」）
@@ -47,18 +47,41 @@ fi
 
 kext_running() { ioreg -r -c TongfangFanDriver 2>/dev/null | grep -q TongfangFanDriver; }
 
-# 已加载 → 什么都不做
-if kext_running; then
+SUDO=""
+[[ "$(id -u)" -ne 0 ]] && SUDO="sudo"
+
+# 2026-11-17（MacConsole → SkyCC 更名）：更名把 kext 的 CFBundleIdentifier
+# 从 com.macconsole.TongfangFan 换成了 com.skycc.TongfangFan。已经装过旧版的机器，
+# 磁盘里那份还是旧 id —— 功能上没差别（类名 TongfangFanDriver 不变，
+# 所以 IOServiceMatching 照样能匹配），但「彻底退役」要求系统里不留旧标识。
+# 检测到 id 不匹配就卸掉重装一次；匹配则维持原来的「已加载即退出」幂等语义。
+KEXT_ID_EXPECTED="com.skycc.TongfangFan"
+CURRENT_ID=""
+if [[ -d "$KEXT_DST" ]]; then
+  CURRENT_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+                  "$KEXT_DST/Contents/Info.plist" 2>/dev/null || true)"
+fi
+NEED_ID_MIGRATE=false
+if [[ -d "$KEXT_DST" && "$CURRENT_ID" != "$KEXT_ID_EXPECTED" ]]; then
+  NEED_ID_MIGRATE=true
+fi
+
+# 已加载且标识已是新名 → 什么都不做
+if kext_running && [[ "$NEED_ID_MIGRATE" == "false" ]]; then
   echo "✓ TongfangFanDriver 已在内核运行，无需安装"
   exit 0
+fi
+
+# 已加载但标识是旧名 → 先卸下（否则同一个驱动类被两个 bundle 争用）
+if kext_running && [[ "$NEED_ID_MIGRATE" == "true" ]]; then
+  echo "→ 0/4 旧版 kext 标识为「${CURRENT_ID:-未知}」，先卸下以换成 $KEXT_ID_EXPECTED"
+  $SUDO kmutil unload -p "$KEXT_DST" >/dev/null 2>&1 || true
+  sleep 1
 fi
 
 # SIP 提示（只提示，不阻断；本机此前检查为 disabled）
 csrutil status 2>/dev/null | grep -q "Kext Signing: disabled" || \
   echo "⚠ SIP「Kext Signing」未关闭，kmutil load 大概率失败"
-
-SUDO=""
-[[ "$(id -u)" -ne 0 ]] && SUDO="sudo"
 
 echo "→ 1/4 拷贝 kext 到 $KEXT_DST"
 $SUDO rm -rf "$KEXT_DST"
@@ -99,7 +122,22 @@ else
 fi
 
 # 先卸掉旧守护，避免 label 冲突导致新 ProgramArguments 不生效
-$SUDO launchctl bootout "system/com.macconsole.TongfangFan" 2>/dev/null || true
+$SUDO launchctl bootout "system/com.skycc.TongfangFan" 2>/dev/null || true
+
+# 2026-11-17（MacConsole → SkyCC 更名）：老版本装的是 com.macconsole.TongfangFan，
+# 它的 plist 还留在 /Library/LaunchDaemons 里。两个 label 同时存在会各跑一份加载器，
+# 风扇控制互相打架（一方交还 0x751、另一方又接管）。所以在这里一并摘掉：
+#   · bootout 让 launchd 立刻忘掉这个 job
+#   · launchctl disable 防止它被 RunAtLoad 重新拉起
+#   · 删 plist，避免重启后又被 bootstrap
+OLD_LABEL="com.macconsole.TongfangFan"
+OLD_PLIST="/Library/LaunchDaemons/$OLD_LABEL.plist"
+if [ -e "$OLD_PLIST" ] || launchctl print "system/$OLD_LABEL" >/dev/null 2>&1; then
+  echo "   清理旧守护 $OLD_LABEL（MacConsole 时代遗留）"
+  $SUDO launchctl bootout "system/$OLD_LABEL" 2>/dev/null || true
+  $SUDO launchctl disable "system/$OLD_LABEL" 2>/dev/null || true
+  $SUDO rm -f "$OLD_PLIST"
+fi
 
 $SUDO tee "$DAEMON_PLIST" >/dev/null <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -107,7 +145,7 @@ $SUDO tee "$DAEMON_PLIST" >/dev/null <<PLIST
 <plist version="1.0">
 <dict>
 	<key>Label</key>
-	<string>com.macconsole.TongfangFan</string>
+	<string>com.skycc.TongfangFan</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>$DAEMON_PROG</string>
@@ -116,9 +154,9 @@ $SUDO tee "$DAEMON_PLIST" >/dev/null <<PLIST
 	<key>RunAtLoad</key>
 	<true/>
 	<key>StandardOutPath</key>
-	<string>/tmp/macconsole-fankext.log</string>
+	<string>/tmp/skycc-fankext.log</string>
 	<key>StandardErrorPath</key>
-	<string>/tmp/macconsole-fankext.log</string>
+	<string>/tmp/skycc-fankext.log</string>
 </dict>
 </plist>
 PLIST

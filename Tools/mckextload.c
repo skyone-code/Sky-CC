@@ -13,7 +13,7 @@
 //
 // 为什么必须 root：实测非 root 调 kmutil load 会直接报
 //   "Insufficient permissions for action: Unable to load ... in unprivileged request."
-// 也就没法并进 MacConsoleHelper（它是用户级 LaunchAgent）。
+// 也就没法并进 SkyCCHelper（它是用户级 LaunchAgent）。
 //
 // 退出码：始终保持 0 —— 加载失败也不该让 launchd 反复重启。
 // ============================================================================
@@ -28,7 +28,7 @@
 #include <unistd.h>
 
 #define KEXT_PATH "/Library/Extensions/TongfangFan.kext"
-#define LOG_PATH "/tmp/macconsole-fankext.log"
+#define LOG_PATH "/tmp/skycc-fankext.log"
 
 static FILE *g_log = NULL;
 

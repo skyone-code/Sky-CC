@@ -64,7 +64,7 @@ let rest = Array(args.dropFirst())
 // 16s 就是这么来的。helper 在跑时：只读放行但提示，写入直接拒绝。
 func helperRunning() -> Bool {
     let path = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/MacConsole/helper.lock").path
+        .appendingPathComponent("Library/Application Support/SkyCC/helper.lock").path
     guard let fd = fopen(path, "r") else { return false }
     defer { fclose(fd) }
     return flock(fileno(fd), LOCK_SH | LOCK_NB) != 0   // 拿不到共享锁＝别人持有排他锁

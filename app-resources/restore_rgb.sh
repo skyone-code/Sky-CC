@@ -2,9 +2,9 @@
 # --------------------------------------------------------------------------
 # restore_rgb.sh —— 开机/登录后恢复上次保存的键盘灯效
 #
-# 由 launchd (com.macconsole.rgbrestore) 在登录时调用。
+# 由 launchd (com.skycc.rgbrestore) 在登录时调用。
 # USB 设备在开机初期可能尚未枚举完成，因此这里做有限次重试。
-# 日志: /tmp/macconsole-rgb.log
+# 日志: /tmp/skycc-rgb.log
 #
 # 2026-10-20 v2.5.0：去 Python 化，改调随包 mcutil（Contents/MacOS/mcutil）。
 # 旧版调用：/usr/bin/python3 rgbkb.py profile / apply

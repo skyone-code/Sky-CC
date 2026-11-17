@@ -14,11 +14,11 @@
 # 里那份（同一份文件，少一次「用户该点哪个文件」的困惑）。
 #
 # 架构（2026-10-20 v2.5.0 起，去 Python 化）：
-#   SwiftUI 原生界面（Sources/MacConsole）+ 原生硬件后端
-#   （Sources/MacConsole/Native/*.swift：EC/kext、USB HID、SMC、DPCD——
+#   SwiftUI 原生界面（Sources/SkyCC）+ 原生硬件后端
+#   （Sources/SkyCC/Native/*.swift：EC/kext、USB HID、SMC、DPCD——
 #   由数月逆向成果的 Python 版逐行移植，IOKit 用户客户端直调）。
-#   2.6.0 起硬件后端从 app 进程搬到后台 MacConsoleHelper（launchd LaunchAgent +
-#   Mach service com.macconsole.helper），app 与它只走 NSXPCConnection；
+#   2.6.0 起硬件后端从 app 进程搬到后台 SkyCCHelper（launchd LaunchAgent +
+#   Mach service com.skycc.helper），app 与它只走 NSXPCConnection；
 #   EC/SMC/HID/亮度/风扇曲线只有 helper 读，UI 退出不影响散热。HTTP 与 8787 端口、
 #   内置 web 页面已整体删除。随包只剩三个编译型助手二进制
 #   （nvmetemp / nvmesmart）与 shell 脚本，全部与 Python 无关。
@@ -30,7 +30,7 @@
 set -euo pipefail
 
 BUILD="$(cd "$(dirname "$0")" && pwd)"
-SWIFT="$BUILD"   # Swift 源码在 $BUILD/Sources/MacConsole/（接手包布局，无 swift/ 子目录）
+SWIFT="$BUILD"   # Swift 源码在 $BUILD/Sources/SkyCC/（接手包布局，无 swift/ 子目录）
 # staging 目录可用环境变量改到 /tmp：本机文件策略会拦截「删除/重命名」已存在的
 # app bundle（file-delete / rename source refused），原地重建会一直失败。
 #
@@ -50,7 +50,7 @@ PROJ="$BUILD/app-resources"
 [ -d "$PROJ" ] || { echo "错误：找不到资源目录 $PROJ" >&2; exit 1; }
 
 # 版本号（唯一来源：脚本注入 Info.plist 与 helper 的 BuildVersion.swift）
-VERSION="3.0.7"
+VERSION="3.1.0"
 # 显示版本（侧边栏/设置页文案）：数字版本 + 专用版标识
 DISPLAY_VERSION="$VERSION LAPQC71x"
 # nvmetemp（NVMe 硬盘温度，SMART）——有现成二进制就用，
@@ -194,7 +194,7 @@ SWIFTC_MAIN=(swiftc -O -parse-as-library -target x86_64-apple-macosx14.0 \
   ${MODCACHE_ARGS[@]+"${MODCACHE_ARGS[@]}"} \
   -o "$APP/Contents/MacOS/Sky CC" \
   "$SWIFT"/Sources/Shared/*.swift \
-  "$SWIFT"/Sources/MacConsole/*.swift "$SWIFT"/Sources/MacConsole/Native/*.swift)
+  "$SWIFT"/Sources/SkyCC/*.swift "$SWIFT"/Sources/SkyCC/Native/*.swift)
 m=0; MAXTRY=3
 while (( m < MAXTRY )); do
   m=$((m+1))
@@ -218,16 +218,16 @@ echo "==> 3/8 编译 mcutil（硬件命令行助手，复用 Native 层）"
 swiftc -O -target x86_64-apple-macosx14.0 ${MODCACHE_ARGS[@]+"${MODCACHE_ARGS[@]}"} \
   -o "$APP/Contents/MacOS/mcutil" \
   "$SWIFT"/Sources/Shared/*.swift \
-  "$SWIFT"/Sources/mcutil/main.swift "$SWIFT"/Sources/MacConsole/Native/*.swift "$SWIFT"/Sources/MacConsole/FanCurve.swift
+  "$SWIFT"/Sources/mcutil/main.swift "$SWIFT"/Sources/SkyCC/Native/*.swift "$SWIFT"/Sources/SkyCC/FanCurve.swift
 
-echo "==> 3.5/8 编译 MacConsoleHelper（唯一持有 EC/SMC/HID 的后台进程）"
+echo "==> 3.5/8 编译 SkyCCHelper（唯一持有 EC/SMC/HID 的后台进程）"
 # 与主程序同一套 Native 层源码，但自己带 main.swift：它是 launchd 拉起的
 # LaunchAgent，不是 app 的子进程，所以不能依赖 NSApplication。
 swiftc -O -target x86_64-apple-macosx14.0 ${MODCACHE_ARGS[@]+"${MODCACHE_ARGS[@]}"} \
-  -o "$APP/Contents/MacOS/MacConsoleHelper" \
+  -o "$APP/Contents/MacOS/SkyCCHelper" \
   "$SWIFT"/Sources/Shared/*.swift \
-  "$SWIFT"/Sources/MacConsoleHelper/main.swift \
-  "$SWIFT"/Sources/MacConsole/Native/*.swift "$SWIFT"/Sources/MacConsole/FanCurve.swift
+  "$SWIFT"/Sources/SkyCCHelper/main.swift \
+  "$SWIFT"/Sources/SkyCC/Native/*.swift "$SWIFT"/Sources/SkyCC/FanCurve.swift
 
 echo "==> 3.6/8 编译 gpu-router.dylib（GPU 路由：把 Metal 默认设备重定向到独显）"
 # 「控制 → 显卡」那个开关就是靠它。缺了它 /api/gpu 会报 dylibPresent=false，
@@ -239,6 +239,18 @@ codesign --force --sign - "$RES/gpu-router.dylib"
 
 echo "==> 4/8 组装 app bundle（原生资源，无 Python）"
 cp -R "$PROJ/TongfangFan.kext" "$NATIVE/"
+# kext 的 Info.plist 一旦被改（例如 2026-11-17 更名把 CFBundleIdentifier 从
+# com.macconsole.TongfangFan 换成 com.skycc.TongfangFan），旧的 ad-hoc 签名里
+# 记的 Info.plist 摘要就对不上了 —— 表现是 `invalid Info.plist (plist or
+# signature have been modified)`，装到 /Library/Extensions 后 kext 直接加载失败，
+# 而 app 只会显示「未安装」，很难想到是签名问题。所以这里强制校验一遍，
+# 不通过就地重签（ad-hoc，本机无开发者证书）。
+if ! codesign --verify --strict "$NATIVE/TongfangFan.kext" 2>/dev/null; then
+  echo "    kext 签名与 Info.plist 不一致，重新 ad-hoc 签名"
+  codesign --force --sign - "$NATIVE/TongfangFan.kext"
+fi
+codesign --verify --strict "$NATIVE/TongfangFan.kext" \
+  && echo "    kext 签名校验通过（$(codesign -dv "$NATIVE/TongfangFan.kext" 2>&1 | sed -n 's/^Identifier=//p')）"
 if [[ -x "$PROJ/bin/nvmetemp" ]]; then
   cp "$PROJ/bin/nvmetemp" "$NATIVE/bin/nvmetemp"
   chmod 755 "$NATIVE/bin/nvmetemp"
@@ -248,7 +260,7 @@ if [[ -x "$PROJ/bin/nvmesmart" ]]; then
   chmod 755 "$NATIVE/bin/nvmesmart"
 fi
 # 开机 kext 加载器：install-kext.sh 会把它装到 /Library/PrivilegedHelperTools/，
-# 由 LaunchDaemon com.macconsole.TongfangFan 以 root 调用
+# 由 LaunchDaemon com.skycc.TongfangFan 以 root 调用
 if [[ -x "$PROJ/bin/Sky CC散热扩展" ]]; then
   cp "$PROJ/bin/Sky CC散热扩展" "$NATIVE/bin/Sky CC散热扩展"
   chmod 755 "$NATIVE/bin/Sky CC散热扩展"
@@ -275,22 +287,22 @@ cp "$BUILD/templates/Info.plist" "$APP/Contents/Info.plist"
 # Contents/Library/LaunchAgents/ 找它并注册（实测 ad-hoc 签名无需审批）。
 # BundleProgram 必须相对 app bundle，这样 app 被整体移动/升级也能跟着走。
 mkdir -p "$APP/Contents/Library/LaunchAgents"
-cat > "$APP/Contents/Library/LaunchAgents/com.macconsole.helper.plist" <<'PLIST'
+cat > "$APP/Contents/Library/LaunchAgents/com.skycc.helper.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.macconsole.helper</string>
-  <key>BundleProgram</key><string>Contents/MacOS/MacConsoleHelper</string>
+  <key>Label</key><string>com.skycc.helper</string>
+  <key>BundleProgram</key><string>Contents/MacOS/SkyCCHelper</string>
   <key>MachServices</key>
-  <dict><key>com.macconsole.helper</key><true/></dict>
+  <dict><key>com.skycc.helper</key><true/></dict>
   <key>RunAtLoad</key><true/>
   <!-- 2026-11-13：从 true 改成 SuccessfulExit=false。
        true 的语义是「进程一退就无条件拉起」，导致「退出控制台」永远关不掉 helper
        （前脚 exit(0)，launchd 2 秒后就把新实例拉起来，0x741 bit0 又被置回 1）。
        改成只看退出码：正常退出（0）不再拉起，崩溃 / 被 kill（非 0）照旧自愈；
        升级重启走 /api/helper/shutdown 的 exit(75)，仍然会被拉起来。
-       正常退出后 MachServices 仍然占着 com.macconsole.helper 这个名字，
+       正常退出后 MachServices 仍然占着 com.skycc.helper 这个名字，
        下次 app 连 XPC 时 launchd 会按需把 helper 启动回来，不需要重新注册。 -->
   <key>KeepAlive</key>
   <dict><key>SuccessfulExit</key><false/></dict>
@@ -300,7 +312,7 @@ cat > "$APP/Contents/Library/LaunchAgents/com.macconsole.helper.plist" <<'PLIST'
 </plist>
 PLIST
 
-# 【P2 遗留清理起不再生成 com.macconsole.autostart.plist】
+# 【P2 遗留清理起不再生成 com.skycc.autostart.plist】
 # 静默启动功能 2.8.15 就从代码里删掉了，这份 LaunchAgent 一直跟着 bundle 走，
 # 只为让老机器升级时还能靠 SMAppService.agent(plistName:) 注销掉残留注册
 # （而 SMAppService 只能注销**本 bundle 里真实存在**的 plist）。
@@ -309,7 +321,7 @@ PLIST
 #   ① 老 bundle 里还有 plist 的（≤2.8.15），app 启动时 AutostartHeal 仍能正常注销；
 #   ② 新 bundle 没有 plist 的，由 ensure-agents.sh（helper 启动序列）清掉
 #      ~/Library/LaunchAgents 下的旧 plist 与 launchd 残留，卸载器再兜一层。
-# 详情见 Sources/MacConsole/MacConsoleApp.swift 的 LegacyAutostart。
+# 详情见 Sources/SkyCC/SkyCCApp.swift 的 LegacyAutostart。
 
 echo "==> 5/8 自检（语法 + 助手二进制冒烟）"
 zsh -n "$NATIVE/scripts/ensure-agents.sh"
@@ -325,7 +337,7 @@ fi
 echo "    mcutil sensors 冒烟通过"
 
 echo "==> 6/8 签名（ad-hoc，本机无开发者证书）"
-codesign --force --sign - "$APP/Contents/MacOS/MacConsoleHelper"
+codesign --force --sign - "$APP/Contents/MacOS/SkyCCHelper"
 codesign --force --deep --sign - "$APP"
 codesign --verify "$APP" && echo "签名校验通过"
 
@@ -351,7 +363,7 @@ install -m 755 "$BUILD/templates/pkg-postinstall" "$PKGSCRIPTS/postinstall"
 
 rm -f "$PKGOUT"
 pkgbuild --root "$PKGROOT" \
-         --identifier com.macconsole.installer \
+         --identifier com.skycc.installer \
          --version "$VERSION" \
          --scripts "$PKGSCRIPTS" \
          --install-location / \
@@ -363,7 +375,7 @@ pkgbuild --root "$PKGROOT" \
 # <upgrade-bundle> / <relocate> / <strict-identifier>。PackageKit 装包时拿 payload 的
 # bundle 版本跟已装版本比，**payload 更低就整组件跳过**，而 Installer 界面照样走完流程、
 # 报“安装成功”、写回执 —— 文件一个字节都没落盘。日志原话：
-#   Skipping component "com.macconsole.console" (3.0.6) because the version 3.0.7
+#   Skipping component "com.skycc.console" (3.0.6) because the version 3.0.7
 #   is already installed at /Applications/Sky CC.app.
 # <relocate> 更坑：它让 Installer 把“已装 app”认到别的同名副本上（实测认到过
 # ~/Desktop/…/04-已装应用快照/Sky CC.app），于是 /Applications 里那份永远不被替换。
@@ -445,4 +457,4 @@ hdiutil verify "$BUILD/$PKGBASE.dmg" >/dev/null && echo "DMG 校验通过"
 echo
 echo "完成：$BUILD/$PKGBASE.dmg"
 mckarchive "$PKGOUT" "$BUILD/$PKGBASE.dmg"
-echo "  app 内已无 Python、无 HTTP：硬件后端在 MacConsoleHelper（XPC），助手为 mcutil + 三个编译型二进制"
+echo "  app 内已无 Python、无 HTTP：硬件后端在 SkyCCHelper（XPC），助手为 mcutil + 三个编译型二进制"

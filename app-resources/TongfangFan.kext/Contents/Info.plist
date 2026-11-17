@@ -7,7 +7,7 @@
 	<key>CFBundleExecutable</key>
 	<string>TongfangFan</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.macconsole.TongfangFan</string>
+	<string>com.skycc.TongfangFan</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
@@ -25,7 +25,7 @@
 		<key>TongfangFanDriver</key>
 		<dict>
 			<key>CFBundleIdentifier</key>
-			<string>com.macconsole.TongfangFan</string>
+			<string>com.skycc.TongfangFan</string>
 			<key>IOClass</key>
 			<string>TongfangFanDriver</string>
 			<key>IONameMatch</key>

@@ -12,10 +12,10 @@ import Foundation
 /// 这几种，所以不用转 JSON，省一次编解码。
 
 /// Mach service 名，必须与 LaunchAgent plist 里 MachServices 的键一致。
-let mcHelperServiceName = "com.macconsole.helper"
+let mcHelperServiceName = "com.skycc.helper"
 
 /// 随包 LaunchAgent 的文件名（位于 App/Contents/Library/LaunchAgents/）。
-let mcHelperAgentPlist = "com.macconsole.helper.plist"
+let mcHelperAgentPlist = "com.skycc.helper.plist"
 
 /// 返回统一包成 `["ok": Bool, "data": Any, "error": String]`：
 /// - 成功：`ok=true`，`data` 是原来 HTTP body 里那个对象（字典或数组）
