@@ -31,8 +31,16 @@
 // 标准宏 KMOD_EXPLICIT_DECL 的 name 参数会经过 # 字符串化，带点的 bundle id
 // 不是合法 token，所以照着它的展开形式手写一份（字段顺序与 mach/kmod.h 的
 // kmod_info_t 一致，KMOD_INFO_VERSION / -1U / -1 都照抄宏里的值）。
-// start/stop 留空：匹配靠 IOKitPersonalities，不走 kmod 的启动回调。
+//
+// start / stop 不能留 0：留空时 kmutil load 会报
+//   "kext (kmod) start/stop routine failed (-603946985)"，
+// 内核在任何 IOService::start 之前就先调这两个回调。所有正常 kext 都指向
+// 一对返回 KERN_SUCCESS 的空函数（KMOD_DECL 生成的名字也是这个套路），
+// 真正的初始化在 IOService::start(provider) 里做。
 extern "C" {
+kern_return_t SkyCCMSR_kmod_start(kmod_info_t *ki, void *data);
+kern_return_t SkyCCMSR_kmod_stop(kmod_info_t *ki, void *data);
+
 kmod_info_t kmod_info = {
     0,                    // next
     KMOD_INFO_VERSION,    // info_version
@@ -41,8 +49,19 @@ kmod_info_t kmod_info = {
     { "1.0.0" },
     -1,                   // reference_count
     0, 0, 0, 0,           // reference_list / address / size / hdr_size
-    0, 0                  // start / stop
+    (kmod_start_func_t *)&SkyCCMSR_kmod_start,
+    (kmod_stop_func_t *)&SkyCCMSR_kmod_stop
 };
+
+kern_return_t SkyCCMSR_kmod_start(kmod_info_t *ki, void *data)
+{
+    return KERN_SUCCESS;
+}
+
+kern_return_t SkyCCMSR_kmod_stop(kmod_info_t *ki, void *data)
+{
+    return KERN_SUCCESS;
+}
 }
 
 #define kMSR_MPERF        0xE7
@@ -98,7 +117,10 @@ OSDefineMetaClassAndStructors(SkyCCMSRClient, IOUserClient)
 
 bool SkyCCMSRService::start(IOService *provider)
 {
-    if (!super::start(provider)) return false;
+    if (!super::start(provider)) {
+        IOLog("SkyCCMSR: super::start failed\n");
+        return false;
+    }
     registerService();
     IOLog("SkyCCMSR: started (APERF/MPERF reader)\n");
     return true;
