@@ -45,7 +45,8 @@ STAGE="${MC_STAGE:-/tmp/mc-build/stage}"
 # 2.6.0 去 Python 化之后名不副实，已随遗留清理改名。
 # 当年的 .py 实现、静态页 web/、vendor/ 与那批 .command 启动脚本已一并删除
 # （git 历史里还在）；目录里的 README.md 留作那份实现的逆向结论与实测记录。
-# 现在构建只吃这四样：TongfangFan.kext、bin/、restore_rgb.sh、scripts 来自 templates/。
+# 现在构建只吃这四样：SkyCCEC.kext（由 Sources/ECDriver 现编）、bin/、
+# restore_rgb.sh、scripts 来自 templates/。
 PROJ="$BUILD/app-resources"
 [ -d "$PROJ" ] || { echo "错误：找不到资源目录 $PROJ" >&2; exit 1; }
 
@@ -238,19 +239,26 @@ clang -dynamiclib -O2 -fobjc-arc -target x86_64-apple-macosx14.0 \
 codesign --force --sign - "$RES/gpu-router.dylib"
 
 echo "==> 4/8 组装 app bundle（原生资源，无 Python）"
-cp -R "$PROJ/TongfangFan.kext" "$NATIVE/"
-# kext 的 Info.plist 一旦被改（例如 2026-11-17 更名把 CFBundleIdentifier 从
-# com.macconsole.TongfangFan 换成 com.skycc.TongfangFan），旧的 ad-hoc 签名里
-# 记的 Info.plist 摘要就对不上了 —— 表现是 `invalid Info.plist (plist or
-# signature have been modified)`，装到 /Library/Extensions 后 kext 直接加载失败，
-# 而 app 只会显示「未安装」，很难想到是签名问题。所以这里强制校验一遍，
-# 不通过就地重签（ad-hoc，本机无开发者证书）。
-if ! codesign --verify --strict "$NATIVE/TongfangFan.kext" 2>/dev/null; then
-  echo "    kext 签名与 Info.plist 不一致，重新 ad-hoc 签名"
-  codesign --force --sign - "$NATIVE/TongfangFan.kext"
+# kext 从源码现编，不复制仓库里的旧产物 —— 否则改了 Sources/ECDriver 却忘了
+# 重编，就会打出一个与源码不符的包（2026-11-17 更名时就因为 kext 二进制滞后
+# 出过「界面说未安装」的坑）。构建脚本自己保证「源码 → 二进制」这一环。
+if [[ -x "$SWIFT/Sources/ECDriver/build-ec-kext.sh" ]]; then
+  echo "    从源码编译 SkyCCEC.kext"
+  zsh "$SWIFT/Sources/ECDriver/build-ec-kext.sh" >/tmp/skycc-ecbuild.log 2>&1 \
+    || { echo "错误：SkyCCEC.kext 编译失败，详见 /tmp/skycc-ecbuild.log" >&2; tail -20 /tmp/skycc-ecbuild.log >&2; exit 1; }
 fi
-codesign --verify --strict "$NATIVE/TongfangFan.kext" \
-  && echo "    kext 签名校验通过（$(codesign -dv "$NATIVE/TongfangFan.kext" 2>&1 | sed -n 's/^Identifier=//p')）"
+cp -R "$PROJ/SkyCCEC.kext" "$NATIVE/"
+# kext 的 Info.plist 一旦被改（例如更名把 CFBundleIdentifier 换成 com.skycc.EC），
+# 旧的 ad-hoc 签名里记的 Info.plist 摘要就对不上了 —— 表现是
+# `invalid Info.plist (plist or signature have been modified)`，装到
+# /Library/Extensions 后 kext 直接加载失败，而 app 只会显示「未安装」，
+# 很难想到是签名问题。所以这里强制校验一遍，不通过就地重签（ad-hoc，本机无开发者证书）。
+if ! codesign --verify --strict "$NATIVE/SkyCCEC.kext" 2>/dev/null; then
+  echo "    kext 签名与 Info.plist 不一致，重新 ad-hoc 签名"
+  codesign --force --sign - "$NATIVE/SkyCCEC.kext"
+fi
+codesign --verify --strict "$NATIVE/SkyCCEC.kext" \
+  && echo "    kext 签名校验通过（$(codesign -dv "$NATIVE/SkyCCEC.kext" 2>&1 | sed -n 's/^Identifier=//p')）"
 if [[ -x "$PROJ/bin/nvmetemp" ]]; then
   cp "$PROJ/bin/nvmetemp" "$NATIVE/bin/nvmetemp"
   chmod 755 "$NATIVE/bin/nvmetemp"
@@ -259,8 +267,8 @@ if [[ -x "$PROJ/bin/nvmesmart" ]]; then
   cp "$PROJ/bin/nvmesmart" "$NATIVE/bin/nvmesmart"
   chmod 755 "$NATIVE/bin/nvmesmart"
 fi
-# 开机 kext 加载器：install-kext.sh 会把它装到 /Library/PrivilegedHelperTools/，
-# 由 LaunchDaemon com.skycc.TongfangFan 以 root 调用
+# 开机 kext 加载器：install-kext.sh 会把它装到控制台用户的支持库，
+# 由 LaunchDaemon com.skycc.ec 以 root 调用
 if [[ -x "$PROJ/bin/Sky CC散热扩展" ]]; then
   cp "$PROJ/bin/Sky CC散热扩展" "$NATIVE/bin/Sky CC散热扩展"
   chmod 755 "$NATIVE/bin/Sky CC散热扩展"

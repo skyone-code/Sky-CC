@@ -1,12 +1,13 @@
 //
 //  NativeFan.swift
-//  Sky CC —— TongfangFan.kext 用户态客户端（原生移植）
+//  Sky CC —— EC 通道的用户态客户端（原生移植）
 //
 //  对应 Python 版 app-resources/fanctl.py。
 //
 //  原理：
-//    TongfangFan.kext 挂在 ACPI PNP0C14（WMI）设备上，暴露 TongfangFanDriver
-//    IOService + TongfangFanUserClient。经 IOServiceGetMatchingService →
+//    EC 通道由内核扩展提供，挂在 ACPI PNP0C14（WMI）设备上，暴露
+//    SkyCCECDriver（自维护，Sources/ECDriver）或 TongfangFanDriver（旧二进制）
+//    IOService + UserClient。经 IOServiceGetMatchingService →
 //    IOServiceOpen → IOConnectCallStructMethod(selector=0) 调用：
 //        入参 12 字节: {u32 selector, u32 arg1, u32 arg2}
 //        出参  8 字节: {i32 status, u32 result}
@@ -217,7 +218,12 @@ enum EC {
     static func fanControlFor(_ thermal: Int) -> UInt8 { thermal == 1 ? 0x00 : 0xA0 }
 }
 
-private let serviceClass = "TongfangFanDriver"
+// 服务类名，按顺序找第一个能用的：
+//   SkyCCECDriver    —— 自己维护的 kext（Sources/ECDriver，源码可改）
+//   TongfangFanDriver—— 旧二进制 kext（只有产物、无源码，升级过渡期兜底）
+// 两者对外 ABI 完全一致（IOConnectCallStructMethod selector 0，12 进 8 出），
+// 所以切换不需要改任何调用点。
+private let serviceClasses = ["SkyCCECDriver", "TongfangFanDriver"]
 private let kextID = "com.skycc.TongfangFan"
 
 // MARK: - 客户端
@@ -279,10 +285,22 @@ final class FanControl {
         var arg2: UInt32 = 0
     }
 
-    /// 找服务：枚举所有 TongfangFanDriver，优先 ABBC0F6F 实例（真 WMBC）。
+    /// 找服务：按 `serviceClasses` 顺序，优先取 ABBC0F6F 实例（真 WMBC）。
+    ///
+    /// 注意不能简单地「先匹配第一个类」——一个类下通常有两个实例：
+    /// WMIGuid 前缀 ABBC0F6F 的是 WMBC 通道，DBBC0F6F 的是 OTA 口
+    ///（读回来全 0xFF、写入无效），必须挑对。
     private func findService() -> io_service_t? {
-        guard let matching = IOServiceMatching(serviceClass) else {
-            trace("findService: IOServiceMatching nil")
+        for cls in serviceClasses {
+            if let s = findService(classNamed: cls) { return s }
+        }
+        trace("findService: 所有服务类名都没找到（\(serviceClasses.joined(separator: " / "))）")
+        return nil
+    }
+
+    private func findService(classNamed cls: String) -> io_service_t? {
+        guard let matching = IOServiceMatching(cls) else {
+            trace("findService: IOServiceMatching(\(cls)) nil")
             return nil
         }
         var iter: io_iterator_t = 0
@@ -326,13 +344,20 @@ final class FanControl {
     }
 
     /// kext 是否已加载（不打开连接）
+    ///
+    /// 任一服务类名能匹配到实例就算已加载——旧 kext 与新的并存时也算，
+    /// 因为 EC 通道本身可用就是「已加载」的实质含义。
     static func kextLoaded() -> Bool {
-        guard let matching = IOServiceMatching(serviceClass) else { return false }
-        // 主端口必须传 0（kIOMainPortDefault），传 mach_task_self_ 会找不到服务
-        let svc = IOServiceGetMatchingService(0, matching)
-        guard svc != 0 else { return false }
-        IOObjectRelease(svc)
-        return true
+        for cls in serviceClasses {
+            guard let matching = IOServiceMatching(cls) else { continue }
+            // 主端口必须传 0（kIOMainPortDefault），传 mach_task_self_ 会找不到服务
+            let svc = IOServiceGetMatchingService(0, matching)
+            if svc != 0 {
+                IOObjectRelease(svc)
+                return true
+            }
+        }
+        return false
     }
 
     /// 懒打开/重开长连接（调用方持 stateLock；IOServiceOpen 历史从未挂过，放临界区内）

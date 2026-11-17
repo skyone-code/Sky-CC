@@ -398,7 +398,6 @@ enum NativeSystem {
             cpu["freq_mhz"] = NSNull()
         }
         for (label, key) in [("freq_min_mhz", "hw.cpufrequency_min"),
-                             ("freq_cur_mhz", "hw.cpufrequency"),
                              ("l1i_cache", "hw.l1icachesize"),
                              ("l1d_cache", "hw.l1dcachesize"),
                              ("l2_cache", "hw.l2cachesize"),
@@ -406,6 +405,28 @@ enum NativeSystem {
             if let v = sysctlInt(key), v > 0 {
                 cpu[label] = key.hasSuffix("cachesize") ? v : v / 1_000_000
             }
+        }
+
+        // CPU 实时频率
+        //
+        // sysctl 的 hw.cpufrequency 是**标称基频**（i7-9750H 恒为 2600 MHz），
+        // 空载满载都是这个数，放在「实时频率」的位置上等于假数据。真实频率只能
+        // 从 APERF/MPERF 算（见 CPUFrequency.swift / SkyCCEC.kext selector 1）。
+        //
+        // 拿不到时（kext 未装、跨核连续丢样本）回落到基频，并用 freq_source 标明
+        // 来源 —— 排查「为什么数字不动」时先看这个字段。
+        if let base = sysctlInt("hw.cpufrequency"), base > 0 {
+            cpu["freq_base_mhz"] = base / 1_000_000
+        }
+        if let live = CPUFrequency.shared.sample() {
+            cpu["freq_cur_mhz"] = Int(live.rounded())
+            cpu["freq_source"] = "msr"
+        } else if let base = sysctlInt("hw.cpufrequency"), base > 0 {
+            cpu["freq_cur_mhz"] = base / 1_000_000
+            cpu["freq_source"] = "sysctl"
+        } else {
+            cpu["freq_cur_mhz"] = NSNull()
+            cpu["freq_source"] = "none"
         }
 
         // 系统热压 / 低电量模式：NSProcessInfo（内核通过 notify 推送，零成本）

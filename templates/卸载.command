@@ -12,8 +12,9 @@
 #               的历史遗留，打包时已移除那份 plist，这里只清旧机器残留）
 #               —— 这些记录在系统数据库里，删 plist 或 bootout 都清不掉，
 #               必须让 app 自己调 --unregister-all 注销
-#   ③ 内核扩展  /Library/Extensions/TongfangFan.kext
-#               + /Library/LaunchDaemons/com.skycc.TongfangFan.plist
+#   ③ 内核扩展  /Library/Extensions/SkyCCEC.kext
+#               + /Library/LaunchDaemons/com.skycc.ec.plist
+#               （同时清理 TongfangFan / SkyCCMSR 时代的旧 kext 与旧守护）
 #               + 开机加载器（支持库内「Sky CC散热扩展」）
 #               + kmutil unload（都需要管理员密码）
 #   ④ 登录项    ~/Library/LaunchAgents 下 com.skycc.*（含历史 rgbrestore）
@@ -45,8 +46,14 @@ APP_DIRS=(
 )
 LA_DIR="$HOME/Library/LaunchAgents"
 SUPPORT="$HOME/Library/Application Support/SkyCC"
-DAEMON_PLIST="/Library/LaunchDaemons/com.skycc.TongfangFan.plist"
-KEXT_DST="/Library/Extensions/TongfangFan.kext"
+DAEMON_PLIST="/Library/LaunchDaemons/com.skycc.ec.plist"
+KEXT_DST="/Library/Extensions/SkyCCEC.kext"
+# 旧标识一并清：TongfangFan（第三方二进制时代）、SkyCCMSR（已并入 EC kext）
+DAEMON_LEGACY_LABELS=("com.skycc.TongfangFan" "com.macconsole.TongfangFan")
+KEXT_LEGACY=(
+  "/Library/Extensions/TongfangFan.kext"
+  "/Library/Extensions/SkyCCMSR.kext"
+)
 # 2.8.15：开机加载器放在控制台支持库里（/Library/PrivilegedHelperTools 被 SIP 挡住）
 LOADER_DST="$SUPPORT/bin/Sky CC散热扩展"
 # 旧版本（≤3.0.4.4）加载器的名字，一并清
@@ -67,7 +74,7 @@ echo
 echo "将要清除："
 echo "  · 主程序 / 后台守护 / 历史 pwmwake 残留进程"
 echo "  · 登录项与后台任务注册（helper、静默启动、开机自启）"
-echo "  · TongfangFan.kext 与它的开机加载项"
+echo "  · SkyCCEC.kext（含 TongfangFan / SkyCCMSR 旧驱动）与它的开机加载项"
 echo "  · $SUPPORT（灯效 / 风扇曲线 / 软件记忆）"
 echo "  · com.skycc.app 的全部偏好设置、缓存、日志"
 echo
@@ -137,7 +144,9 @@ for LABEL in com.skycc.helper com.skycc.autostart com.skycc.rgbrestore \
   launchctl bootout "gui/$UID_NUM/$LABEL" >/dev/null 2>&1 && echo "    已 bootout $LABEL"
   launchctl disable "gui/$UID_NUM/$LABEL" >/dev/null 2>&1 || true
 done
-sudo launchctl bootout "system/com.skycc.TongfangFan" >/dev/null 2>&1 || true
+for LABEL in system/com.skycc.ec system/com.skycc.TongfangFan system/com.macconsole.TongfangFan; do
+  sudo launchctl bootout "$LABEL" >/dev/null 2>&1 || true
+done
 
 for LABEL in com.skycc.helper com.skycc.autostart com.skycc.rgbrestore \
              com.user.pwmwake com.user.auxbright com.user.auxsmooth; do
@@ -156,24 +165,33 @@ for LABEL in com.macconsole.helper com.macconsole.autostart com.macconsole.rgbre
     if [[ -e "$f" ]]; then rm -f "$f" && echo "    已删除旧登录项 ${f:t}"; fi
   done
 done
-sudo launchctl bootout "system/com.macconsole.TongfangFan" >/dev/null 2>&1 || true
 sudo rm -f "/Library/LaunchDaemons/com.macconsole.TongfangFan.plist" 2>/dev/null || true
 
 # ------------------------------------------------------------ ③ kext 与 daemon
 echo "→ 3/9 卸载内核扩展（需要管理员密码）"
-if [[ -d "$KEXT_DST" || -f "$DAEMON_PLIST" || -e "$LOADER_DST" || -e "$LOADER_OLD" ]]; then
+LEGACY_PRESENT=false
+for K in "${KEXT_LEGACY[@]}"; do [[ -d "$K" ]] && LEGACY_PRESENT=true; done
+if [[ -d "$KEXT_DST" || -f "$DAEMON_PLIST" || -e "$LOADER_DST" || -e "$LOADER_OLD" \
+      || "$LEGACY_PRESENT" == "true" ]]; then
   sudo -v || echo "    ⚠️ 没拿到管理员权限，kext 部分跳过（其余继续）"
-  sudo launchctl bootout "system/com.skycc.TongfangFan" >/dev/null 2>&1 || true
-  sudo launchctl disable "system/com.skycc.TongfangFan" >/dev/null 2>&1 || true
-  if [[ -d "$KEXT_DST" ]]; then
-    if sudo kmutil unload -p "$KEXT_DST" >/dev/null 2>&1; then
-      echo "    kext 已从内核卸载"
+  for LABEL in "$DAEMON_PLIST" system/com.skycc.ec; do
+    sudo launchctl bootout "$LABEL" >/dev/null 2>&1 || true
+  done
+  for LABEL in "${DAEMON_LEGACY_LABELS[@]}"; do
+    sudo launchctl bootout "system/$LABEL" >/dev/null 2>&1 || true
+    sudo launchctl disable "system/$LABEL" >/dev/null 2>&1 || true
+    sudo rm -f "/Library/LaunchDaemons/$LABEL.plist"
+  done
+  for K in "$KEXT_DST" "${KEXT_LEGACY[@]}"; do
+    [[ -d "$K" ]] || continue
+    if sudo kmutil unload -p "$K" >/dev/null 2>&1; then
+      echo "    已卸载 ${K:t}"
     else
-      echo "    kext 未在内核中（或已卸载）"
+      echo "    ${K:t} 未在内核中（或已卸载）"
     fi
-  fi
+    sudo rm -rf "$K"
+  done
   sudo rm -f "$DAEMON_PLIST"
-  sudo rm -rf "$KEXT_DST"
   # 2.8.15：开机加载器（我们自己的二进制）——先卸守护再删文件，
   # 否则 launchd 会在 KeepAlive/RunAtLoad 下拿不到程序反复失败。
   if [[ -e "$LOADER_DST" ]]; then
@@ -186,8 +204,8 @@ if [[ -d "$KEXT_DST" || -f "$DAEMON_PLIST" || -e "$LOADER_DST" || -e "$LOADER_OL
     sudo rm -f "$LOADER_OLD" && echo "    已删除开机加载器（旧路径残留）"
   fi
   echo "    已删除 kext 与开机加载项"
-  if kmutil showloaded 2>/dev/null | grep -q TongfangFan; then
-    echo "    ⚠️ 内核里仍能看到 TongfangFan（重启后彻底消失）"
+  if kmutil showloaded 2>/dev/null | grep -qE "SkyCCEC|TongfangFan|MSRReader"; then
+    echo "    ⚠️ 内核里仍能看到旧驱动（重启后彻底消失）"
   fi
 else
   echo "    未安装，跳过"

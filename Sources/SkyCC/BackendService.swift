@@ -191,7 +191,7 @@ final class BackendService: ObservableObject {
 
     // MARK: - kext 检测与安装
     //
-    // 【2.8.12 修 bug：kext 其实在内核里，界面却说「需要 TongfangFan.kext」】
+    // 【2.8.12 修 bug：kext 其实在内核里，界面却说「需要装 kext」】
     // 旧实现用 `/usr/sbin/ioreg -r -c TongfangFanDriver` 子进程判断，而且只在
     // app 启动 / 主窗口出现时各跑一次。两个后果：
     //   · 用户先开 app、后装 kext（或 app 启动那一刻 daemon 还没把 kext load 完），
@@ -300,10 +300,19 @@ final class BackendService: ObservableObject {
         }
         await checkKext()
         if !kextLoaded {
-            lastError = p.terminationStatus == 0
-                ? "安装脚本执行完毕，但内核里仍没有 TongfangFanDriver（详见 /tmp/skycc-kext-install.log）"
-                : "安装未完成（可能取消了密码框）"
-            diag("安装后仍未检测到 kext，status=\(p.terminationStatus)")
+            // macOS 26 起第三方 kext 不能热加载：安装脚本会把二进制写进内核集合
+            // 并以 0 退出，但要重启才真正加载。这种情况不能说成「安装失败」，
+            // 否则用户会一直点「立即安装」重试。
+            let needReboot = p.terminationStatus == 0
+                && (out.contains("重启后生效") || out.lowercased().contains("reboot"))
+            if needReboot {
+                lastError = "内核扩展已装入系统，重启后生效（macOS 26 起第三方 kext 不支持热加载）"
+            } else {
+                lastError = p.terminationStatus == 0
+                    ? "安装脚本执行完毕，但内核里仍没有 SkyCCECDriver（详见 /tmp/skycc-kext-install.log）"
+                    : "安装未完成（可能取消了密码框）"
+            }
+            diag("安装后仍未检测到 kext，status=\(p.terminationStatus) reboot=\(needReboot)")
         } else {
             lastError = nil
             diag("kext 安装成功")

@@ -139,6 +139,21 @@ struct MonitorView: View {
                     // （10.5pt 图标 + 15pt 半粗等宽数字 + 按温度着色）。
                     // 型号改挂到右上角胶囊里（见 Card 的 trailing）。
                     HStack(spacing: 10) {
+                        // 实时频率（APERF/MPERF）。右上角胶囊里的「@ 2.60GHz」
+                        // 是标称基频（型号字符串自带的），这一格才是当前实际
+                        // 运行频率。freq_source 不是 msr 说明 kext 那条通道没拿到
+                        // 读数、这里显示的是回落值，所以压暗并写进 tooltip。
+                        if let mhz = BackendService.double(store.cpu, "freq_cur_mhz"), mhz > 0 {
+                            let liveFreq = BackendService.string(store.cpu, "freq_source") == "msr"
+                            HStack(spacing: 4) {
+                                Image(systemName: "gauge.with.dots.needle.67percent")
+                                    .font(.system(size: 10.5, weight: .semibold))
+                                Text(MenuBarMonitors.compactMHz(mhz))
+                                    .font(.system(size: 15, weight: .semibold).monospacedDigit())
+                            }
+                            .foregroundStyle(liveFreq ? Theme.blue : Theme.dim2.opacity(0.8))
+                            .help(freqHelp(live: liveFreq))
+                        }
                         if store.cpuTemp > 0 {
                             HStack(spacing: 4) {
                                 Image(systemName: "thermometer.medium")
@@ -429,6 +444,19 @@ struct MonitorView: View {
                 + String(format: "%.1f℃", BackendService.double(p, "celsius") ?? 0)
         }
         return "封装 / 接近温度（SMC）：\n" + parts.joined(separator: " · ")
+    }
+
+    /// 实时频率的 tooltip。
+    /// 讲清楚「这一格和型号里的 @2.60GHz 不是一回事」，以及为什么有时候是回落的。
+    private func freqHelp(live: Bool) -> String {
+        let base = BackendService.double(store.cpu, "freq_base_mhz") ?? 0
+        let baseText = base > 0 ? String(format: "%.2fGHz", base / 1000) : "—"
+        let head = "CPU 实时运行频率（IA32_APERF / IA32_MPERF）\n"
+            + "公式：基频 \(baseText) × ΔAPERF ÷ ΔMPERF\n"
+            + "型号里的「@」后面是标称基频，不会变；这一格随负载与睿频变化。"
+        if live { return head }
+        return head + "\n\n当前显示的是回落值：内核扩展的 MSR 采样这一拍没成功"
+            + "（跨核或未安装），下方数值等于基频。"
     }
 
     /// 封装功耗的 tooltip。
