@@ -17,3 +17,4 @@ build-swift.shw*
 swift-pkgroot/
 build/
 *.app/
+Tools/msrprobe
