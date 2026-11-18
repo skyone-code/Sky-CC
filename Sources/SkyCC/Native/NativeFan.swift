@@ -285,11 +285,16 @@ final class FanControl {
         var arg2: UInt32 = 0
     }
 
-    /// 找服务：按 `serviceClasses` 顺序，优先取 ABBC0F6F 实例（真 WMBC）。
+    /// 找服务：按 `serviceClasses` 顺序，优先取「真 WMBC 通道」实例。
     ///
-    /// 注意不能简单地「先匹配第一个类」——一个类下通常有两个实例：
-    /// WMIGuid 前缀 ABBC0F6F 的是 WMBC 通道，DBBC0F6F 的是 OTA 口
-    ///（读回来全 0xFF、写入无效），必须挑对。
+    /// 实例挑选（2026-11-18 修转速读全 0xFF 后明确）：一个类下通常有两个实例，
+    /// 对应两个 ACPI EC 设备：
+    ///   * 父设备 **AMW0**（或 WMIGuid 前缀 ABBC0F6F，其他机型）= WMBC 真通道；
+    ///   * 父设备 **OTA0** = OTA 口，**读回来全 0xFF、写入无效**（ecprobe 实测
+    ///     0x0751 都回 0xFF），绝对不能用。
+    /// 本机（LAPQC71）驱动条目上没有 WMIGuid 属性（在父 ACPI 设备上也没有 guid，
+    /// 只能靠父设备名区分），所以「挑对实例」的判据是：父设备名 AMW0 优先、
+    /// OTA0 永远垫底，其余情况按出现顺序兜底。
     private func findService() -> io_service_t? {
         for cls in serviceClasses {
             if let s = findService(classNamed: cls) { return s }
@@ -312,25 +317,48 @@ final class FanControl {
         }
         defer { IOObjectRelease(iter) }
 
-        var fallback: io_service_t = 0
-        var target: io_service_t = 0
+        // 三档候选：amw（真通道）> 普通 > ota（废口，读全 0xFF 写无效）
+        var amw: io_service_t = 0
+        var normal: io_service_t = 0
+        var ota: io_service_t = 0
         while true {
             let svc = IOIteratorNext(iter)
             if svc == 0 { break }
-            if serviceIsABBC(svc) {
-                if target != 0 { IOObjectRelease(target) }
-                target = svc
-            } else if fallback == 0 {
-                fallback = svc
+            // 真 WMBC 通道两种形态：TongFang 机型 WMIGuid 前缀 ABBC0F6F；
+            // 本机（LAPQC71）无 WMIGuid 属性，靠父设备名 AMW0 判定。
+            if serviceIsABBC(svc) || parentKind(svc) == .amw {
+                if amw != 0 { IOObjectRelease(amw) }
+                amw = svc
+            } else if parentKind(svc) == .ota {
+                if ota == 0 { ota = svc } else { IOObjectRelease(svc) }
             } else {
-                IOObjectRelease(svc)
+                if normal == 0 { normal = svc } else { IOObjectRelease(svc) }
             }
         }
-        if target != 0 {
-            if fallback != 0 { IOObjectRelease(fallback) }
-            return target
+        for (keep, drop) in [(amw, normal), (amw, ota), (normal, ota)] {
+            if keep != 0 && drop != 0 { IOObjectRelease(drop) }
         }
-        return fallback != 0 ? fallback : nil
+        if amw != 0 { return amw }
+        if normal != 0 { return normal }
+        return ota != 0 ? ota : nil
+    }
+
+    /// 实例的父 ACPI 设备种类（见 findService 注释）
+    private enum PortKind { case amw, ota, other }
+
+    private func parentKind(_ svc: io_service_t) -> PortKind {
+        var parent: io_registry_entry_t = 0
+        guard IORegistryEntryGetParentEntry(svc, kIOServicePlane, &parent) == KERN_SUCCESS else {
+            return .other
+        }
+        defer { IOObjectRelease(parent) }
+        var name = [CChar](repeating: 0, count: 128)
+        guard IORegistryEntryGetName(parent, &name) == KERN_SUCCESS else { return .other }
+        switch String(cString: name).uppercased() {
+        case "AMW0": return .amw      // WMBC 真通道
+        case "OTA0": return .ota      // OTA 口：读全 0xFF、写无效
+        default: return .other
+        }
     }
 
     private func serviceIsABBC(_ svc: io_service_t) -> Bool {
@@ -1515,17 +1543,26 @@ final class FanControl {
     ///   * 移出 `0x0751` / `0x0741` / `0x07A5` / `0x07AB` → 见 modeStatus()，按需读一次
     ///
     /// 读组不持 bizLock（v2.5.3.1：长连接下每个物理调用已串行，读组无锁化）
+    ///
+    /// 【2026-11-18 转速错值修复】rpm 是 16 位**大端**，跨两个 EC 地址：
+    /// 高位 `0x0464` / 低位 `0x0465`（GPU 同理 `0x046C` / `0x046D`）。
+    /// kext 的 EC_READ 单次只回**一个字节**，旧代码只读了高位字节就按
+    /// `(v&0xFF)<<8 | (v>>8)&0xFF` 硬算 —— 结果永远是「高位×256」，
+    /// 以 256 RPM 为步长跳变（实测 0x0A → 显示 2560，真实 2610）。
+    /// ecprobe 实测本机（AMW0 通道）：0464=0A 0465=32 → 0x0A32 = 2610 ✓
     func fanRPMStatus() -> [String: Any] {
-        func rpmOf(_ r: FanReply?) -> Int {
-            // qc71: rpm = b1 << 8 | b2（大端）
-            let v = r?.result ?? 0
-            return Int((v & 0xFF) << 8 | (v >> 8) & 0xFF)
+        func rpmOf(hi: FanReply?, lo: FanReply?) -> Int {
+            // 任一字节没读到就放弃这一拍（0 会被上层按「读数不可用」处理）
+            guard let hi, hi.ok, let lo, lo.ok else { return 0 }
+            return Int((hi.result & 0xFF) << 8 | (lo.result & 0xFF))
         }
-        let rpm1 = ecRead(EC.fanRPM1)
-        let rpm2 = ecRead(EC.fanRPM2)
+        let rpm1hi = ecRead(EC.fanRPM1)
+        let rpm1lo = ecRead(EC.fanRPM1 + 1)
+        let rpm2hi = ecRead(EC.fanRPM2)
+        let rpm2lo = ecRead(EC.fanRPM2 + 1)
         return [
-            "rpm_cpu": rpmOf(rpm1),
-            "rpm_gpu": rpmOf(rpm2),
+            "rpm_cpu": rpmOf(hi: rpm1hi, lo: rpm1lo),
+            "rpm_gpu": rpmOf(hi: rpm2hi, lo: rpm2lo),
             // 温度不走 EC：CPU 取 SMC 封装温度，GPU 取 SMC（本机无键时退 NVAccel 驱动上报）。
             "temp_cpu": TempSources.cpuCelsius(),
             "temp_gpu": TempSources.gpuCelsius(),
