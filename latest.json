@@ -1,10 +1,12 @@
 {
-  "tag": "3.1.0",
-  "version": "3.1.0",
-  "pkg_name": "Sky CC-3.1.0-LAPQC71x.pkg",
-  "pkg_url": "https://gitee.com/skyone021396/Sky-CC/releases/download/3.1.0/Sky%20CC-3.1.0-LAPQC71x.pkg",
-  "size": 2820422,
-  "sha256": "23882912e828e1f950fe8fb7276aa6fb8786770bef0953282695eba65a416978",
-  "published_at": "2026-11-17T12:05:00+08:00",
-  "notes": "3.1.0：全面更名 MacConsole → Sky CC（应用标识换为 com.skycc.*，kext 同步重签；旧 kext 仍可继续用，想统一标识可在设备控制页点一次「立即安装」；开机自启需重新打开一次）；显卡路由移到「设备控制」页散热模式上方；侧边栏「设备检测」改「性能监测」；触控板与 Fn 锁改为实时回读；检查更新零 API 配额、CPU 占用优化"
+  "tag": "3.2.0",
+  "version": "3.2.0",
+  "dmg_name": "Sky CC-3.2.0-LAPQC71x.dmg",
+  "dmg_url": "https://gitee.com/skyone021396/Sky-CC/releases/download/3.2.0/Sky%20CC-3.2.0-LAPQC71x.dmg",
+  "pkg_name": "Sky CC-3.2.0-LAPQC71x.pkg",
+  "pkg_url": "https://gitee.com/skyone021396/Sky-CC/releases/download/3.2.0/Sky%20CC-3.2.0-LAPQC71x.pkg",
+  "size": 7092537,
+  "sha256": "a32c69373716e2ac7f905980e88645cff432f140f4fb4cf2f1f979aea2fba19d",
+  "published_at": "2026-11-18T13:50:00+08:00",
+  "notes": "3.2.0：实时频率（CPU 频率随负载与睿频真实跳动，IA32_PERF_STATUS 主路）；EC 通道重写为源码可审的 SkyCCEC.kext（GPL-2.0）；全新品牌素材 + 玻璃效果皮肤（默认开）；真实机型识别 Intel® NUC 9 Extreme Laptop Kit - LAPQC71x（A/B/C/D）；自研安装器（应用内更新走 DMG，安装前自动清旧残留）；修复风扇转速错值（16 位大端跨两地址）与 EC 实例选择"
 }
