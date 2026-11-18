@@ -966,7 +966,9 @@ struct RootView: View {
                 }
             }
         }
-        .listStyle(.sidebar)
+        // 2026-11-18（探针 A/B 对照 + 用户定案）：不再用 .listStyle(.sidebar)——
+        // 用户更喜欢单独 List 的观感（选中态是普通高亮，不带 sidebar 样式的
+        // 系统材质语义）；背景透明度仍由下面这组 modifier 控制。
         .navigationSplitViewColumnWidth(min: 210, ideal: 232, max: 270)
         // 2026-11-15 用户定案（第三轮）：侧边栏**透到公共背景层**，不再有独立背景层 ——
         // 公共背景（皮肤预设色 / 背景图）在根视图整窗铺一次（见 body 最外层 .pageBackground()），

@@ -74,10 +74,9 @@ struct PageBackgroundModifier: ViewModifier {
                 //   上层 = 所选颜色的低透明度染色（三版改轻：旧版三层渐变 0.55–0.66
                 //   把桌面盖得几乎看不见，用户观感「不透桌面」）。
                 GlassVibrancyView().ignoresSafeArea()
-                // 染色透明度（2026-11-18 用户反馈两轮）：浅色 0.38→0.18（近白染色
-                // 把桌面洗掉、观感与纯色无异）；深色 0.48→0.32（用户要求再透一些）。
-                // 磨砂主导、染色只给一点色调倾向。
-                skin.bgColor.opacity(colorScheme == .light ? 0.18 : 0.32).ignoresSafeArea()
+                // 染色透明度（2026-11-18 用户三轮反馈）：浅色 0.38→0.18；
+                // 深色 0.48→0.32→0.24（「还能再透一些」）。磨砂主导、染色只给色调倾向。
+                skin.bgColor.opacity(colorScheme == .light ? 0.18 : 0.24).ignoresSafeArea()
             } else {
                 skin.bgColor.ignoresSafeArea()
             }
@@ -221,21 +220,28 @@ enum Theme {
     // 皮肤不变时零分配；玻璃态是前两者的派生值，键已覆盖。
     private static var surfaceCache: [String: Color] = [:]
     static var panel: Color { surfaceSkin("panel", light: 0xffffff, dark: 0x2a2b2e, alphaLight: 0.62, alphaDark: 0.72) } // 卡片
-    static var panel2: Color { surfaceSkin("panel2", light: 0xeef0f4, dark: 0x34353a, alphaLight: 0.28, alphaDark: 0.38) } // 卡片内磁贴 / 控件底
-    static var barBg: Color { surfaceSkin("barBg", light: 0xe6e9ee, dark: 0x3a3b40, alphaLight: 0.35, alphaDark: 0.45) }  // 进度条底
+    static var panel2: Color { surfaceSkin("panel2", light: 0xeef0f4, dark: 0x34353a, alphaLight: 0.28, alphaDark: 0.38, glassScale: false) } // 卡片内磁贴 / 控件底
+    static var barBg: Color { surfaceSkin("barBg", light: 0xe6e9ee, dark: 0x3a3b40, alphaLight: 0.35, alphaDark: 0.45, glassScale: false) }  // 进度条底 / 环描边
     static let line = Theme.dyn(light: 0xe0e3e9, dark: 0x3e3f44)      // 描边
 
-    /// 表面色的皮肤 + 外观开关（带缓存，见上面 panel 注释）
+    /// 表面色的皮肤 + 外观开关（带缓存，见上面 panel 注释）。
+    /// glassScale：玻璃态下是否再降透明度 —— 只降卡片本体（panel）；
+    /// panel2 / barBg 这类叠在卡片内的二级表面**不降**：卡片已经降过了，
+    /// 再叠一层降过的二级表面会被双重稀释（2026-11-18 用户实测：浅色玻璃下
+    /// 风扇环描边 barBg 0.35×0.72=0.25 直接隐身）。
     private static func surfaceSkin(_ id: String, light: UInt32, dark: UInt32,
-                                    alphaLight: Double, alphaDark: Double) -> Color {
+                                    alphaLight: Double, alphaDark: Double,
+                                    glassScale: Bool = true) -> Color {
         let skin = SkinCenter.shared
         // 缓存键：玻璃开关 + 是否自定义图（色值不影响表面色，不进键）
         let key = "\(id)|\(skin.isCustomImage)|\(skin.glassOn)"
         if let c = surfaceCache[key] { return c }
         let aL: Double, aD: Double
-        if skin.isGlassActive {
-            aL = alphaLight * 0.72   // 如 panel 0.62 → 0.45
-            aD = alphaDark * 0.76    // 如 panel 0.72 → 0.55
+        if skin.isGlassActive && glassScale {
+            // 2026-11-18（用户实测定案）：浅色 ×0.30（0.62→0.19）；深色最终定
+            // ×0.44（0.72→0.32）—— 0.40 用户仍嫌厚，0.32 是用户给的准数。
+            aL = alphaLight * 0.30
+            aD = alphaDark * 0.44
         } else {
             aL = alphaLight; aD = alphaDark
         }

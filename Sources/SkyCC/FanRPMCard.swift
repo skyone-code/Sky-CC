@@ -45,17 +45,44 @@ struct FanRPMCard: View {
         }
     }
 
-    /// 风扇环（2.7.2）：环只是「占空比」的可视化背景，主角是转速。
+    /// 底环色（2026-11-18 用户定案）：浅色用实灰 —— 玻璃态下 barBg 0.35 的
+    //  浅色底环又淡到看不见；深色不变（仍用 barBg 的深色值+透明度）。
+    private static let fanRingBase = Color(nsColor: NSColor(name: nil, dynamicProvider: { ap in
+        (ap.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua)
+            ? NSColor(hex: 0x3a3b40).withAlphaComponent(0.45)
+            : NSColor(hex: 0xaab1bb)
+    }))
+
+    /// 风扇环（2.7.2 → 2026-11-18 重做）：底环 + 进度环，主角仍是转速。
     ///
     /// 版面自上而下：风扇名（CPU / 独显）→ 大号 RPM 数字 → RPM 单位 →
-    /// 底部一行小字温度。上一版把 % 做成 60pt 主数字、环铺满卡片，
-    /// 视线全被环和百分比抓走，跟「风扇看的是转速」这件事相反。
-    /// 风扇环（2.8.15）：2.7.2 起环是「占空比」背景，现在 PWM 不再采集，
-    /// 环退回纯装饰底环，主角只有转速 + 温度。
+    /// 底部一行小字温度。
+    /// 进度环（2026-11-18 用户定案）：以 **6000 RPM 为满环**，起点 12 点钟
+    /// 方向（顶）**逆时针**扫（12→9→6）；环色按绝对转速分档（<2500 绿 /
+    /// 2500–3500 蓝 / 3500–4500 橙 / 4500+ 红），rpm 变化时 0.5s 缓动跟进。
     private func fanBig(_ name: String, rpm: Int, temp: Int, side: CGFloat = 158) -> some View {
         let lw: CGFloat = 9.5
+        let progress = min(1.0, max(0.0, Double(rpm) / 6000.0))
+        // 环色随转速分档（2026-11-18 用户定案，准数）：绿 → 蓝 → 橙 → 红，
+        // 按绝对转速切：<2500 绿、2500–3500 蓝、3500–4500 橙、4500+ 红。
+        let accent: Color = {
+            switch Double(rpm) {
+            case ..<2500: return Theme.green
+            case ..<3500: return Theme.blue
+            case ..<4500: return Theme.amber
+            default: return Theme.red
+            }
+        }()
         return ZStack {
-            Circle().stroke(Theme.barBg, lineWidth: lw)
+            Circle().stroke(Self.fanRingBase, lineWidth: lw)
+            if progress > 0.004 {
+                Circle()
+                    .trim(from: 0, to: progress)
+                    .stroke(accent, style: StrokeStyle(lineWidth: lw, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                    .scaleEffect(x: -1)   // 镜像翻转：起点保持 12 点钟（顶），扫向改逆时针（12→9→6）
+                    .animation(.easeInOut(duration: 0.5), value: rpm)
+            }
             VStack(spacing: 0) {
                 Text(name)
                     .font(.system(size: 10.5, weight: .semibold))
