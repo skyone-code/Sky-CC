@@ -109,7 +109,6 @@ enum EC {
     /// 一次性触发位 `0x767`：写哪一位 EC 就执行对应动作（**toggle 语义**，先读状态再写）。
     static let triggerByte: UInt32   = 0x0767
     static let statusByte: UInt32    = 0x0768
-    static let silentModeStatus: UInt32 = 0x045B   // 0=关 1=开（安静模式实际状态）
     static let keyboardBacklightState: UInt32 = 0x07C4  // bit6：键盘背光开（原厂服务写）
     static let support1: UInt32     = 0x0765   // bit7 = 支持 FAN_BOOST
     static let support2: UInt32     = 0x0766   // bit0 = 支持静音模式（本机不支持）
@@ -177,9 +176,12 @@ enum EC {
     /// 只写 0x074E → 几秒内被 EC 退回 0x00，无效果；
     /// 只写本一位 → 按键映射不动。两个一起写 → 生效且稳定。
     static let fnLockSwitch: UInt8 = 0x08
-    static let ctrl4OverboostDynTempOff: UInt8 = 0x02 // 0x07A6 bit1（1=关闭动态温控）
+    // 0x07A6 bit1（1=关闭动态温控）：原厂基准模式序列里要关掉它（benchmark 链专用）。
+    // 2026-11-18 起不再作为独立开关暴露（原「超频动态温控」UI 移除）。
+    static let ctrl4OverboostDynTempOff: UInt8 = 0x02
     static let ctrl4TouchpadToggleOff: UInt8 = 0x40   // 0x07A6 bit6（1=禁用触控板）
-    static let biosCtrl3ReducedDuty: UInt8 = 0x20     // 0x07A3 bit5（含义未经包内确认，实验位）
+    /// 0x07A3 bit5（含义未经包内确认，实验位）：2026-11-18 连同 UI 一并移除。
+    /// （原「风扇降低占空比」，仅注释留档）
     /// 0x07A3 bit6：1 = 「禁用被动散热模式」已勾选。
     /// 【2026-10-24 00:33 / 00:38 / 00:49 三次实测双向确认】
     ///   早先的注释写成「风扇常转」是错的 —— 包内 `EcMap.BiosOem3PassiveBit` 定案为禁用被动散热。
@@ -197,7 +199,6 @@ enum EC {
     static let triggerWinLock: UInt8      = 0x01
     static let triggerLightBar: UInt8     = 0x02
     static let triggerFanBoost: UInt8     = 0x04
-    static let triggerSilentMode: UInt8   = 0x08
     static let triggerUsbCharger: UInt8   = 0x10
     static let triggerRgbKeyboard: UInt8  = 0x20
 
@@ -1188,7 +1189,6 @@ final class FanControl {
         let b3 = byte(EC.biosCtrl3)      // 0x07A3
         let kb = byte(EC.keyboardBacklightState)  // 0x07C4
         let st = byte(EC.statusByte)     // 0x0768
-        let sm = byte(EC.silentModeStatus) // 0x045B
         return [
             // Fn 锁：状态位 0x074E bit4，**总闸** 0x07A4 bit3 必须同时为 1 才算生效
             // （2026-11-17 实测：gate=0 时 Fn+Esc 完全无效）。UI 真值取两者之与：
@@ -1200,7 +1200,6 @@ final class FanControl {
             "win_lock": (st & EC.statusByteWinLock) != 0,
             // 接电自动开机（0x0726 bit3），纯 EC 位，无状态影子寄存器
             "ac_auto_boot": (ac & EC.acAutoBootBit) != 0,
-            "silent_mode": sm == 1,
             "benchmark": benchmarkMode(),
             // 2.7.7：touchpad_off 只是 EC 那一位的回读（诊断用），在本机是无效位，
             // UI 不能拿它当开关状态，否则拨了没反应还会自己弹回去。
@@ -1211,8 +1210,6 @@ final class FanControl {
             // 打回「已启用」，表现为「关了又自己弹回开」。真值改由 app 进程读
             // `/api/touchpad`（NativeTrackpadLock.status()）。
             "touchpad_off": (c4 & EC.ctrl4TouchpadToggleOff) != 0,
-            "overboost_dyn_temp_off": (c4 & EC.ctrl4OverboostDynTempOff) != 0,
-            "fan_reduced_duty": (b3 & EC.biosCtrl3ReducedDuty) != 0,
             // 2.7.10：改名。0x7A3 bit6 是「禁用被动散热模式」，不是「风扇常转」。
             "passive_cooling_disabled": (b3 & EC.biosOem3PassiveBit) != 0,
         ]
@@ -1273,18 +1270,7 @@ final class FanControl {
         modifyBit(EC.ctrl4, EC.ctrl4TouchpadToggleOff, !enabled)
     }
 
-    /// 超频动态温控（0x07A6 bit1，1=关闭）
-    func setOverboostDynTemp(enabled: Bool) -> FanReply? {
-        modifyBit(EC.ctrl4, EC.ctrl4OverboostDynTempOff, !enabled)
-    }
-
-    /// 风扇降低占空比（0x07A3 bit5）：更安静。
-    /// ⚠️ 包内未定案这一位（原厂仅注册表 `EnableFanDutyCycleReduction`），实验项。
-    func setFanReducedDuty(_ on: Bool) -> FanReply? {
-        modifyBit(EC.biosCtrl3, EC.biosCtrl3ReducedDuty, on)
-    }
-
-    // MARK: - 触发位开关（0x767 → 0x768 / 0x45B 回读）
+    // MARK: - 触发位开关（0x767 → 0x768 回读）
     //
     // 【三个必须记住的坑】
     //   ① `0x767` 是 **toggle** 语义：每成功写一次就翻转一次，写 0x00 不起作用。
@@ -1311,21 +1297,6 @@ final class FanControl {
             }
         }
         return FanReply(status: -1, result: UInt32(winKeyLocked() ? 1 : 0))
-    }
-
-    /// 安静模式状态（0x45B：0 关 1 开）
-    func silentModeOn() -> Bool { readByte(EC.silentModeStatus) == 1 }
-
-    func setSilentMode(_ on: Bool) -> FanReply? {
-        bizLock.lock()
-        defer { bizLock.unlock() }
-        if silentModeOn() == on { return FanReply(status: 0, result: UInt32(on ? 1 : 0)) }
-        _ = ecWriteVerified(EC.triggerByte, EC.triggerSilentMode)
-        for _ in 0..<24 {
-            usleep(50_000)
-            if silentModeOn() == on { return FanReply(status: 0, result: UInt32(on ? 1 : 0)) }
-        }
-        return FanReply(status: -1, result: UInt32(silentModeOn() ? 1 : 0))
     }
 
     /// USB 关机充电（0x767 bit4）。无状态回读，返回的只是「触发位写进去了」。
@@ -1457,7 +1428,6 @@ final class FanControl {
             "proj_id": rb(EC.projID),
             "support_fan_boost": (s1 & 0x80) != 0,
             "support_lightbar": (s1 & 0x40) != 0,
-            "support_silent_mode": (s2 & 0x01) != 0,
             "support_usb_charger": (s2 & 0x02) != 0,
             "support_fan_turbo": (s5 & 0x10) != 0,
             // 2.7.10：PL1/PL2 是**单字节瓦数**（实测 0x41=65W、0x64=100W），
@@ -1473,7 +1443,6 @@ final class FanControl {
             "fn_lock_switch": (rb(EC.apBiosByte) & EC.fnLockSwitch) != 0,
             "keyboard_backlight": (rb(EC.keyboardBacklightState) & EC.keyboardBacklightBit) != 0,
             "win_lock": (rb(EC.statusByte) & EC.statusByteWinLock) != 0,
-            "silent_mode": rb(EC.silentModeStatus) == 1,
             // 原始低 7 位为 0 = 不限制，界面还原成 100%
             "charge": chargeRaw == 0 ? 100 : chargeRaw,
             "charge_raw": Int(rb(EC.battCharge)),

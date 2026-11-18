@@ -1,12 +1,12 @@
 {
-  "tag": "3.2.0",
-  "version": "3.2.0",
-  "dmg_name": "Sky CC-3.2.0-LAPQC71x.dmg",
-  "dmg_url": "https://gitee.com/skyone021396/Sky-CC/releases/download/3.2.0/Sky%20CC-3.2.0-LAPQC71x.dmg",
-  "pkg_name": "Sky CC-3.2.0-LAPQC71x.pkg",
-  "pkg_url": "https://gitee.com/skyone021396/Sky-CC/releases/download/3.2.0/Sky%20CC-3.2.0-LAPQC71x.pkg",
-  "size": 7092537,
-  "sha256": "a32c69373716e2ac7f905980e88645cff432f140f4fb4cf2f1f979aea2fba19d",
-  "published_at": "2026-11-18T13:50:00+08:00",
-  "notes": "3.2.0：实时频率（CPU 频率随负载与睿频真实跳动，IA32_PERF_STATUS 主路）；EC 通道重写为源码可审的 SkyCCEC.kext（GPL-2.0）；全新品牌素材 + 玻璃效果皮肤（默认开）；真实机型识别 Intel® NUC 9 Extreme Laptop Kit - LAPQC71x（A/B/C/D）；自研安装器（应用内更新走 DMG，安装前自动清旧残留）；修复风扇转速错值（16 位大端跨两地址）与 EC 实例选择"
+  "tag": "3.2.2",
+  "version": "3.2.2",
+  "dmg_name": "Sky CC-3.2.2-LAPQC71x.dmg",
+  "dmg_url": "https://gitee.com/skyone021396/Sky-CC/releases/download/3.2.2/Sky%20CC-3.2.2-LAPQC71x.dmg",
+  "pkg_name": "Sky CC-3.2.2-LAPQC71x.pkg",
+  "pkg_url": "https://gitee.com/skyone021396/Sky-CC/releases/download/3.2.2/Sky%20CC-3.2.2-LAPQC71x.pkg",
+  "size": 8896229,
+  "sha256": "c45dabc0eeb087dec666952b00f886aa38dde414dd97e906001a37aaf7b20ca4",
+  "published_at": "2026-11-18T20:00:00+08:00",
+  "notes": "3.2.2：快捷指令 / 命令行控制（mcutil 新增 13 条硬件控制命令，手机快捷指令可经 SSH 调用）；皮肤系统重构（预设配色改为色板自选任意颜色，玻璃效果改为真正独立开关，玻璃态染色跟随所选颜色）；修复键盘灯效卡展开后大片空白"
 }

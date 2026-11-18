@@ -7,11 +7,15 @@
 //
 //  覆盖：
 //    GET  /api/overview /api/sensors /api/battery /api/disks /api/processes
-//         /api/hid /api/rgb /api/fan /api/lightbar /api/capability /api/all
+//         /api/rgb /api/fan /api/lightbar /api/all
 //    POST /api/control /api/fan /api/lightbar /api/rgb
-//         /api/rgb/apply /api/rgb/forget /api/rgb/save
-//         /api/rgb/whitecal /api/rgb/whitegain /api/rgb/whitegain/reset
+//         /api/rgb/apply /api/rgb/save
+//         /api/ec/read
 //
+//  2026-11-18 清理：移除无 UI 的隐藏接口 —— /api/hid、/api/capability、
+//  RGB 白平衡三接口（whitecal / whitegain / reset）、/api/rgb/forget、
+//  doControl 的 caffeinate，以及 doFan 的 keyboard_backlight / silent_mode /
+//  overboost_dyn_temp / fan_reduced_duty 四个分支。
 
 import Foundation
 import IOKit
@@ -121,7 +125,6 @@ enum NativeAPI {
         case "/api/battery":    return NativeSystem.battery()
         case "/api/disks":      return NativeSystem.disks()
         case "/api/processes":  return NativeSystem.processes()
-        case "/api/hid":        return NativeSystem.hidDevices()
         case "/api/rgb":        return rgbState()
         case "/api/fan":        return fanState()
         // 「AP 心跳」开关（灯效页，2026-11-13）：0x741 bit0 的真实状态。
@@ -148,7 +151,6 @@ enum NativeAPI {
         // 不续转速采样租约 —— 这些页面不需要实时转速。
         case "/api/fan/refresh": return fanState(fresh: true, renewLease: false)
         case "/api/lightbar":   return lightbarState()
-        case "/api/capability": return capability()
         case "/api/all":        return allPayload(slim: false)
         case "/api/snapshot":   return allPayload(slim: true)
         // GPU 路由开关状态（是否注入 gpu-router.dylib + 例外名单 + dylib 就位情况）
@@ -173,7 +175,7 @@ enum NativeAPI {
 
     /// 全量快照（2.7.0 起统一入口）
     ///
-    /// `/api/all`   = 全部字段（含 rgb / lightbar / hid / capability，给「全部信息」页）
+    /// `/api/all`   = 全部字段（含 rgb / lightbar，给「全部信息」页）
     /// `/api/snapshot` = 高频精简版（去掉 GPU 原始统计与 HID/能力矩阵，给 1 秒轮询）
     ///
     /// 两个都包含 fan（走后台采样器的热缓存，不触发 EC 冷扫描），所以 UI 一次
@@ -192,8 +194,6 @@ enum NativeAPI {
         if !slim {
             payload["rgb"] = rgbState()
             payload["lightbar"] = lightbarState()
-            payload["hid"] = NativeSystem.hidDevices()
-            payload["capability"] = capability()
         }
         return payload
     }
@@ -232,50 +232,15 @@ enum NativeAPI {
         case "/api/fan":                  return doFan(params)
         case "/api/lightbar":             return doLightbar(params)
         case "/api/rgb":                  return doRGB(params)
-        case "/api/rgb/apply":            return RGBProfile.apply()
-        case "/api/rgb/forget":           return ["ok": RGBProfile.clear()]
+        case "/api/rgb/apply":
+            // 用户点「开」：先落总开关状态（enabled=true），再把存档灯效覆盖回去
+            _ = RGBProfile.setEnabled(true)
+            return RGBProfile.apply()
         case "/api/rgb/save":
             guard let prof = params["profile"] as? [String: Any], !prof.isEmpty else {
                 return ["ok": false, "error": "profile 无效"]
             }
             return ["ok": RGBProfile.save(prof), "profile": prof]
-        case "/api/rgb/whitecal":
-            // 由「肉眼看到的偏色」反算三通道增益（与 BetterRGB 同款算法）
-            let observed = (params["observed"] as? String ?? "").replacingOccurrences(of: "#", with: "")
-            guard let res = RGBGains.calcWhiteGains(observed) else {
-                return ["ok": false, "error": "observed 颜色无效"]
-            }
-            RGBGains.save(res["R"] as? Int ?? 1000, res["G"] as? Int ?? 1000, res["B"] as? Int ?? 1000,
-                          observed: observed)
-            // 这次标定即成为滑条端点（对应 t=100），之后滑条可无损往外拖
-            RGBSlider.saveEndpoint(res["R"] as? Int ?? 1000, res["G"] as? Int ?? 1000,
-                                   res["B"] as? Int ?? 1000)
-            let re = RGBProfile.apply()
-            return ["ok": true, "white_gain": res, "slider": 100,
-                    "reapplied": re["ok"] as? Bool ?? false]
-        case "/api/rgb/whitegain":
-            // 两种用法：直接给 R/G/B 增益，或给滑条位置 t（按端点插值）
-            if let t = params["t"] as? Double {
-                let g = RGBSlider.toGains(t)
-                RGBGains.save(g.0, g.1, g.2)
-                let re = RGBProfile.apply()
-                return ["ok": true, "white_gain": ["R": g.0, "G": g.1, "B": g.2],
-                        "slider": RGBSlider.fromGains(g),
-                        "reapplied": re["ok"] as? Bool ?? false]
-            } else {
-                let g = RGBGains.save(params["R"] as? Int ?? 1000,
-                                      params["G"] as? Int ?? 1000,
-                                      params["B"] as? Int ?? 1000)
-                let re = RGBProfile.apply()
-                return ["ok": true, "white_gain": ["R": g.0, "G": g.1, "B": g.2],
-                        "slider": RGBSlider.fromGains(g),
-                        "reapplied": re["ok"] as? Bool ?? false]
-            }
-        case "/api/rgb/whitegain/reset":
-            RGBGains.clear()
-            RGBSlider.clearEndpoint()
-            let re = RGBProfile.apply()
-            return ["ok": true, "slider": 0, "reapplied": re["ok"] as? Bool ?? false]
         case "/api/ec/read":
             // 2.8.8：实验性页的 EC 寄存器探针（**只读**，不提供写入）
             guard FanControl.kextLoaded() else {
@@ -306,24 +271,8 @@ enum NativeAPI {
 
     static func rgbState() -> [String: Any] {
         let prof = RGBProfile.load()
-        let g = RGBGains.load()
-        let e = RGBSlider.loadEndpoint()
-        // 拆成小表达式，避免巨型字典字面量拖垮类型推断
-        let gFactors = [round3(Double(g.0) / 1000), round3(Double(g.1) / 1000), round3(Double(g.2) / 1000)]
-        let eFactors = [round3(Double(e.0) / 1000), round3(Double(e.1) / 1000), round3(Double(e.2) / 1000)]
-        let (wr, wg, wb) = RGBGains.apply((255, 255, 255))
-        var gains: [String: Any] = [:]
-        gains["R"] = g.0
-        gains["G"] = g.1
-        gains["B"] = g.2
-        gains["factors"] = gFactors
-        gains["end"] = ["R": e.0, "G": e.1, "B": e.2]
-        gains["end_factors"] = eFactors
-        gains["slider"] = RGBSlider.fromGains(g)
-        // 满白经校准后实际下发的 RGB（便于直观看出被压了多少）
-        gains["white_rgb"] = [wr, wg, wb]
         if !KeyboardRGB.available() {
-            return ["available": false, "profile": prof ?? NSNull(), "white_gain": gains]
+            return ["available": false, "profile": prof ?? NSNull()]
         }
         do {
             let kb = try KeyboardRGB().open()
@@ -335,14 +284,29 @@ enum NativeAPI {
             return ["available": true,
                     "info": kb.info(),
                     "state": kb.getState(fallbackBrightness: savedBright) ?? NSNull(),
-                    "firmware": kb.getFirmware(),
+                    "firmware": cachedFirmware(kb),
                     "profile": prof ?? NSNull(),
-                    "profile_path": profilePath(),
-                    "white_gain": gains]
+                    "profile_path": profilePath()]
         } catch {
             return ["available": false, "error": "\(error)",
-                    "profile": prof ?? NSNull(), "white_gain": gains]
+                    "profile": prof ?? NSNull()]
         }
+    }
+
+    /// 固件版本终身不变，缓存起来（2026-11-18）。
+    /// 之前每拍都发 0x80 查询 —— 除了拖慢轮询，还会把芯片 feature 缓冲里的
+    /// 关灯报文覆盖成查询报文，直接导致 getState 的 off 判定被破坏（详见
+    /// getState 的修复注释）。缓存后稳态零额外 HID 写入。
+    private static let fwLock = NSLock()
+    private static var fwCache: [String: Any]?
+
+    private static func cachedFirmware(_ kb: KeyboardRGB) -> [String: Any] {
+        fwLock.lock()
+        defer { fwLock.unlock() }
+        if let c = fwCache { return c }
+        let fw = kb.getFirmware()
+        fwCache = fw
+        return fw
     }
 
     private static func profilePath() -> String {
@@ -402,39 +366,6 @@ enum NativeAPI {
                 return ["ok": false, "error": "\(error)"]
             }
 
-        case "caffeinate":
-            // 不带 on 参数 = 查询当前状态（按钮高亮必须反映真实运行状态）
-            guard let on = params["on"] as? Bool else {
-                return ["ok": true, "on": caffeinateRunning()]
-            }
-            if on {
-                if caffeinateRunning() {
-                    return ["ok": true, "on": true, "note": "已在运行"]
-                }
-                let p = Process()
-                p.executableURL = URL(fileURLWithPath: "/usr/bin/caffeinate")
-                p.arguments = ["-d", "-i", "-s"]
-                p.standardOutput = FileHandle.nullDevice
-                p.standardError = FileHandle.nullDevice
-                do {
-                    try p.run()
-                    let pidFile = caffeinatePIDURL()
-                    let dir = pidFile.deletingLastPathComponent()
-                    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-                    try? String(p.processIdentifier).write(to: pidFile,
-                                                           atomically: true, encoding: .utf8)
-                    return ["ok": true, "on": true, "pid": p.processIdentifier]
-                } catch {
-                    return ["ok": false, "error": "\(error)"]
-                }
-            } else {
-                if let pid = caffeinatePID() {
-                    kill(pid_t(pid), SIGTERM)
-                }
-                try? FileManager.default.removeItem(at: caffeinatePIDURL())
-                return ["ok": true, "on": false]
-            }
-
         case "rgb":
             return doRGB(params)
 
@@ -442,26 +373,6 @@ enum NativeAPI {
             return ["ok": false, "error": "未知动作: \(action)"]
         }
     }
-
-    // MARK: caffeinate 辅助
-
-    private static func caffeinatePIDURL() -> URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/SkyCC/.caffeinate.pid")
-    }
-
-    private static func caffeinatePID() -> Int? {
-        guard let data = try? Data(contentsOf: caffeinatePIDURL()),
-              let s = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              let pid = Int(s) else { return nil }
-        return pid
-    }
-
-    private static func caffeinateRunning() -> Bool {
-        guard let pid = caffeinatePID() else { return false }
-        return kill(pid_t(pid), 0) == 0
-    }
-
     // MARK: RGB 动作（对应 Python do_rgb()）
 
     static func doRGB(_ params: [String: Any]) -> [String: Any] {
@@ -629,17 +540,17 @@ enum NativeAPI {
             }
         }
 
-        // 成功后自动记住，供开机恢复
+        // 成功后自动记住，供开机恢复 / 「开」时覆盖回去。
+        // 关灯（2026-11-18，用户定案）：只置总开关标记，灯效选项原样保留在存档里；
+        // 绝不把 mode 覆盖成 off —— 否则下次「开」就没东西可恢复了。
         if result["ok"] as? Bool == true, params["remember"] as? Bool ?? true {
-            let prof = RGBProfile.fromParams(params)
-            result["remembered"] = RGBProfile.save(prof)
-            result["profile"] = prof
-        }
-        // 记账：写进 rgb_keepalive.log，和 0x88 的状态流水共用一条时间线。
-        // 「灯自己灭了」这类问题就靠它分清是谁写的、写成了什么。
-        if params["remember"] as? Bool ?? true {
-            let bri = params["brightness"] as? Int ?? params["level"] as? Int
-            RGBKeepAlive.note("write mode=\(mode) bri=\(bri.map(String.init) ?? "-") ok=\(result["ok"] as? Bool ?? false)")
+            if mode == "off" {
+                result["remembered"] = RGBProfile.setEnabled(false)
+            } else {
+                let prof = RGBProfile.fromParams(params)
+                result["remembered"] = RGBProfile.save(prof)
+                result["profile"] = prof
+            }
         }
         return result
     }
@@ -1096,29 +1007,6 @@ enum NativeAPI {
             let back = (fc.miscStatus()["ac_auto_boot"] as? Bool) ?? v
             return ["ok": r.ok, "reply": r.dict, "ac_auto_boot": back]
         }
-        if let v = params["keyboard_backlight"] as? Bool {
-            // 包内 SystemView 的关键一条（用户 X15 实测）：TurnOff 关掉的是「灯效」，
-            // 之后单发 SetBrightness 是点不亮的 —— 开的时候必须重新下发一次完整灯效。
-            // 所以这条命令是「EC 状态位 + 灯效通道」两段式，缺一段就会出现
-            // 「开关是开的但键盘全黑」。
-            let ec = fc.setKeyboardBacklightState(v)
-            var led: [String: Any]
-            if v {
-                led = RGBProfile.apply()
-            } else {
-                var kr = -1
-                if let kb = try? KeyboardRGB().open() {
-                    kr = kb.disable()
-                    kb.close()
-                }
-                led = ["ok": kr == 0, "kr": kr]
-            }
-            return ["ok": ec?.ok ?? false, "reply": ec?.dict ?? [:],
-                    "keyboard_backlight": v,
-                    "led": led,
-                    "note": v ? "已重新下发灯效（单改亮度点不亮）" : "已发 CTRL_OFF 熄灯"]
-        }
-        // 灯效页「AP 心跳」：0x741 bit0（AP exist / 控制中心在线标志）双向写。
         // 和 0x767 那套不一样 —— 这是**持久状态位**，读-改-写，没有 toggle 语义，
         // 也不会连带抛电源键事件。关掉后键盘背光回到固件的 10 分 40 秒空闲熄灯。
         if let v = params["ap_present"] as? Bool {
@@ -1130,10 +1018,6 @@ enum NativeAPI {
         if let v = params["win_lock"] as? Bool {
             guard let r = fc.setWinKeyLock(v) else { return ["ok": false, "error": "写入失败"] }
             return ["ok": r.ok, "reply": r.dict, "win_lock": v]
-        }
-        if let v = params["silent_mode"] as? Bool {
-            guard let r = fc.setSilentMode(v) else { return ["ok": false, "error": "写入失败"] }
-            return ["ok": r.ok, "reply": r.dict, "silent_mode": v]
         }
         if params["usb_charger"] != nil {
             guard let r = fc.triggerUsbCharger() else { return ["ok": false, "error": "写入失败"] }
@@ -1172,14 +1056,6 @@ enum NativeAPI {
             out["touchpad"] = v
             if out["via"] == nil { out["via"] = "hid-seize" }
             return out
-        }
-        if let v = params["overboost_dyn_temp"] as? Bool {
-            guard let r = fc.setOverboostDynTemp(enabled: v) else { return ["ok": false, "error": "写入失败"] }
-            return ["ok": r.ok, "reply": r.dict, "overboost_dyn_temp": v]
-        }
-        if let v = params["fan_reduced_duty"] as? Bool {
-            guard let r = fc.setFanReducedDuty(v) else { return ["ok": false, "error": "写入失败"] }
-            return ["ok": r.ok, "reply": r.dict, "fan_reduced_duty": v]
         }
 
         if let pct = params["charge"] as? Int {
@@ -1322,172 +1198,6 @@ enum NativeAPI {
         return out
     }
 
-    // MARK: 能力矩阵（对应 Python capability()）
-
-    static func capability() -> [String: Any] {
-        let fn = SMCSnapshot.snapshot()
-        let fanKext = FanControl.kextLoaded()
-
-        var usable: [[String: Any]] = [
-            ["name": "CPU 各核心温度", "detail": "SMC TC1C~TC6C，6 个物理核心独立读数"],
-            ["name": "CPU 封装温度", "detail": "SMC TC0P / TC0D / TC0E / TC0F / TC0H"],
-            ["name": "CPU 电流与功耗", "detail": "SMC PC0C / PCPC / PCPT / PCTR (sp96 定点)"],
-            ["name": "内存 / 负载 / 运行时间", "detail": "sysctl + host_statistics64"],
-            ["name": "显卡信息", "detail": "system_profiler，iGPU + RTX 2070S 均可见"],
-            ["name": "电池", "detail": "IORegistry AppleSmartBattery + pmset"],
-            ["name": "磁盘占用", "detail": "df，含 Word / Windows 分区"],
-            ["name": "键盘灯控制", "detail": "ITE 8291 (048d:6004/6006/600B/CE00，原厂 PID 白名单) HID Feature 报告，已实测可写"],
-        ]
-        var partial: [[String: Any]] = [
-            ["name": "电池健康度", "detail": "VirtualSMC 对电池建模较粗：循环次数恒为 0、"
-                + "设计容量 = 最大容量，容量读数可信度有限"],
-        ]
-
-        if fanKext {
-            usable.append(["name": "散热模式（性能 / 标准 / 安静）",
-                           "detail": "对应原厂「散热设置」。写 EC 0x0751（性能 0x00 / 标准·安静 0xA0）"
-                + " + 0x07A5（功耗档+散热档共同决定）"
-                + " + 0x07AB 低半字节（1/2/3）+ 该功耗档自己的曲线索引槽 0x7B{n-1}。"
-                + "四个寄存器一起写才对 —— 0x7AB 是 EC 的「整组设置应用完毕」收尾信号，"
-                + "只写 0x751 会在秒级内被 EC 覆盖回去"])
-            usable.append(["name": "基准模式（增压 5000+ RPM）",
-                           "detail": "按移植文档 §3.3 完整链：快照 → Gaming PL(0x730/731→0x783/784) → "
-                + "dstate=1 → 0x7A5 bit7+bit4+LED=01（0x91）→ 0x7A6 DynamicTemp 开 → "
-                + "0x7AB=0x11 → 0x751=0x40。前提是 0x741 bit0（AP exist / 控制中心接管）在位。"
-                + "关闭：0x751←0x00 → 快照整字节恢复 → 重放 SetPowerMode+SetFanMode 全链。"
-                + "0x7A5 写不进时不再写 0x751，直接回滚（顺序反了会触发 FAN_ABNORMAL，整片拒写）"])
-            usable.append(["name": "风扇转速与温度读数",
-                           "detail": "转速绕开 SMC，直接读 EC 0x0464(CPU) / 0x046C(GPU)（大端，实测 "
-                + ecLiveRPMText() + "）。温度一律不走 EC（2.8.15 起）："
-                + "CPU 取 SMC 封装温度 TC0P/TC0D/TC0E/TC0F/TC0H，"
-                + "与「监测」页传感器表同源。"
-                + "dGPU 温度自 2.7.6 起改读 NVAccel 上报的核心温度"
-                + "（驱动侧 TSENS → PerformanceStatistics[\"Temperature(C)\"]，PR #323），"
-                + "不再轮询 EC 0x044F。"
-                + "实测两路 PWM 数值始终相同（12 进程满载全程 80→177 一致），"
-                + "EC 给两颗风扇的是同一个占空比；转速差来自风扇个体/型号差异，不是接反。"
-                + "归属按原厂口径 + 用户实物确认：0x0464 是 **CPU 主风扇**"
-                + "（原厂 ADDR_EC_MAIN_FAN_RPM_BYTE1/2，监测页只读这一路），"
-                + "0x046C 是 GPU 第二颗（qc71 驱动的 FAN_RPM_2，前程序才加的扩展项）。"
-                + "2026-10-16 曾按「转速高的那路」反推成 0x46C=CPU，2026-11-11 已纠正 —— "
-                + "同一占空下 GPU 那颗本来就转得快一点，不能拿来判归属。"
-                + "换掉 0x044F 的依据：同期 0x043E 从 64℃ 升到 89℃ 而 0x044F 仅 60→62℃，"
-                + "说明它是 GPU 附近的板级环境温度，不是核心温度"])
-            let prob = FanControl.shared.ecProbe()
-            let mi = Int(prob["modeindex"] as? UInt8 ?? 0)
-            let pLabel = ["高性能", "平衡", "节能"]
-            let tLabel = ["性能", "标准", "安静"]
-            let pl = Int(prob["power_level"] as? Int ?? 0)
-            let tl = Int(prob["thermal_level"] as? Int ?? 0)
-            let pName = (1...3).contains(pl) ? pLabel[pl - 1] : "未知"
-            let tName = (1...3).contains(tl) ? tLabel[tl - 1] : "未知"
-            usable.append(["name": "系统功耗设置（高性能 / 平衡 / 节能）",
-                           "detail": "对应原厂「系统功耗设置」。写 EC 0x07AB（MyFanCCI_Mode_Index）"
-                + " = (功耗档<<4)|散热档，即 0x11/0x22/0x33，"
-                + "就是 BIOS「Power Mode」和键盘上那颗模式按钮的同一个开关，"
-                + "键盘灯实时跟随（高性能=2 灯、平衡=1 灯、节能=不亮）。"
-                + "原厂点这一档是「功耗 + 散热两组一起写」：PL1 0x783 / PL2 0x784 / "
-                + "0x78B / 0x7A6 / 0x751 / 0x7A5 / 0x7AB / 0x7B{n-1}，我们照整张表写。"
-                + "12 子进程满载实测：高性能档 CPU 算力最快、风扇随温度爬升 29→44%；"
-                + "平衡档风扇最猛（78℃ 就 41~47%）、算力慢 4~5%；"
-                + "节能档风扇压在 31% 不动、算力慢 5~9%（A/B/C/A 交叉复现）。"
-                + String(format: "当前档位：0x%02X（%@ + 散热 %@）", mi, pName, tName)])
-            let charge = prob["charge"] as? Int ?? 100
-            usable.append(["name": "电池充电阈值",
-                           "detail": "EC 0x07B9，值为 0x80|百分比（bit7 是「限制启用」，低 7 位是百分比），"
-                + "0x00 = 不限制。实测 0xD0=80%、0xBC=60%；设 80 → 回读 0xD0，"
-                + "bit7 reached 置位后停止充电。当前阈值 \(charge)%"])
-            let misc = FanControl.shared.miscStatus()
-            usable.append(["name": "系统调整（原厂 FastSwitch 页）",
-                           "detail": "键盘背光 EC 0x07C4 bit6 / Fn 锁 0x074E bit4 + 0x07A4 bit3（必须同写）/ "
-                + "Win 键锁定 0x0767 bit0 触发 → 0x0768 bit0 回读 / "
-                + "安静模式 0x0767 bit3 触发 → 0x045B 回读（0x0766 bit0 = 0，本机固件标称不支持）/ "
-                + "禁用被动散热 0x07A3 bit6。"
-                + "0x767 是 **toggle** 语义（写一次翻一次，写 0x00 无效），"
-                + "所以每次写前先读状态；状态位要 ~600ms 才跟上，这里轮询最多 1.5 秒。"
-                + String(format: "当前：背光%@ / Fn锁%@ / Win锁%@ / 安静%@ / 禁用被动散热%@",
-                         (misc["keyboard_backlight"] as? Bool ?? false) ? "开" : "关",
-                         (misc["fn_lock"] as? Bool ?? false) ? "开" : "关",
-                         (misc["win_lock"] as? Bool ?? false) ? "锁定" : "解锁",
-                         (misc["silent_mode"] as? Bool ?? false) ? "开" : "关",
-                         (misc["passive_cooling_disabled"] as? Bool ?? false) ? "开" : "关")])
-            usable.append(["name": "键盘与风扇行为（非原厂 / 实验位）",
-                           "detail": "EC 0x074E bit4（Fn 锁）/ 0x07A6 bit6（触控板开关）/ "
-                + "0x07A6 bit1（超频动态温控）/ 0x07A3 bit5（风扇降低占空比），"
-                + "全部读-改-写单位，qc71_laptop 同族开源驱动交叉验证（sysfs 同款属性）。"
-                + "原厂 UI 没有这些入口，属于复刻版追加的实验能力。"
-                + String(format: "当前：Fn锁%@ / 触控板%@ / 动态温控%@ / 降载%@",
-                         (misc["fn_lock"] as? Bool ?? false) ? "开" : "关",
-                         (misc["touchpad_off"] as? Bool ?? false) ? "禁用" : "启用",
-                         (misc["overboost_dyn_temp_off"] as? Bool ?? false) ? "关" : "开",
-                         (misc["fan_reduced_duty"] as? Bool ?? false) ? "开" : "关")])
-            if prob["support_lightbar"] as? Bool == true {
-                usable.append(["name": "海岸灯（Lightbar / 灯条）",
-                               "detail": "EC 0x0748 控制字节 + 0x0749-0x074B RGB，实测可写、回读一致。"
-                    + "已肉眼验证三种状态：ctrl=0x80 多彩轮换动画（机器出厂行为）、"
-                    + "ctrl=0x00 停在固定色（显示 RGB 寄存器里存的颜色）、ctrl=0x84 关灯——"
-                    + "即 bit7 是「轮换/动画」位（不是开关位），bit2 才是关灯位。"
-                    + "bit4/5 被 EC 掩码写不进去；bit0/1/3/6 语义未知"
-                    + "（OEM 侧还有 WelcomeMode、BreathingLightEffect 未对应）。"
-                    + "OEM 的 DefaultRGBLightbar.exe 同走这组寄存器；HID 侧 MyLightBar 设备"
-                    + "本机不存在，EC 是唯一通路"])
-            }
-        } else {
-            partial.append(["name": "散热模式 / 系统功耗设置 / 系统调整 / 风扇转速 / 充电阈值 / 海岸灯",
-                            "detail": "方案已备好（TongfangFan.kext），首次运行 app 会自动安装："
-                + "散热模式（性能/标准/安静）+ 基准模式、系统功耗设置（高性能/平衡/节能）、"
-                + "系统调整（键盘背光/海岸灯/Win 键锁/Fn 锁/OSD/安静模式/禁用被动散热）、"
-                + "风扇转速与温度读数、电池充电阈值、海岸灯"])
-        }
-
-        return [
-            "usable": usable,
-            "partial": partial,
-            "unavailable": [
-                ["name": "硬盘 / NVMe 温度",
-                 "detail": "所有来源都查过：SMC 只枚举出 TC* 一串 "
-                    + "CPU 温度键（无 TH*/Tm*）；ioreg 里 "
-                    + "IONVMeController 与 IOBlockStorageDevice "
-                    + "都不上报温度（全系统唯一的 Temperature 键是电池的）；"
-                    + "EC 页 0x04 整页扫描也没有像硬盘热敏的寄存器。"
-                    + "常规做法要靠 smartctl（smartmontools），"
-                    + "本机未安装且无 brew，且 macOS 读 NVMe SMART 需管理员权限"],
-                ["name": "GPU 占用率与功耗",
-                 "detail": "dGPU 占用率读 NVAccel 发布的 PerformanceStatistics"
-                    + "（驱动 2.6.3 起由内核每秒采样并写入 GPU Core / Memory / Video 三个引擎的利用率），"
-                    + "iGPU 走 IOAccelerator 的 Device Utilization %；"
-                    + "两者都是引擎忙碌时间占比，不是显存占用率。"
-                    + "GPU 功耗 macOS 下没有用户态接口，本机未接入。"
-                    + "iGPU 与 CPU 同封装、本机没有它的独立热敏"
-                    + "（SMC 无 TG* 键），界面上 iGPU 那一格温度是 CPU 封装温度的参考值"],
-                ["name": "自定义风扇曲线（BIOS Fan Control Mode）",
-                 "detail": "BIOS 里「Fan Control Mode」"
-                    + "（Fixed/Custom/Cool/Balanced/Quiet/Fanless，"
-                    + "NVRAM 0x12F4）才是真正的风扇设置，但运行时换不了："
-                    + "OEM 地址表（keyboard.dll 774 个常量）里没有对应寄存器；"
-                    + "MYFAN2 曲线单元格 0x0743-47 写得进、回读一致，却完全无效"
-                    + "（改成温度断点或占空比值，风扇都毫无反应，"
-                    + "与 PL 设置一样是 EC 独占的死单元格）；"
-                    + "CTRL_3 (0x07A5) 低三位在模式索引有效时被 EC 秒级覆盖，"
-                    + "清空索引后能写住但负载下测不出差异。"
-                    + "结论：它是 POST 时按 NVRAM 一次性选好的内部曲线，"
-                    + "之后 EC 自己调度。可试路径：BIOS 里设为 Custom 再重启，"
-                    + "EC 可能就会启用曲线单元格（待验证）"],
-            ],
-            "smc": [
-                "available": fn["available"] ?? false,
-                "key_count": fn["key_count"] ?? 0,
-                "fan_note": fn["fan_note"] ?? NSNull(),
-            ],
-        ]
-    }
-
-    private static func ecLiveRPMText() -> String {
-        let s = FanControl.shared.fanStatus()
-        return String(format: "CPU %d RPM / GPU %d RPM",
-                      s["rpm_cpu"] as? Int ?? 0, s["rpm_gpu"] as? Int ?? 0)
-    }
-
     // MARK: 登录项守护安装（对应 Python install_login_agents）
 
     static func installLoginAgents() {
@@ -1540,7 +1250,7 @@ enum NativeAPI {
             let g = FanControl.shared.ensureFnLockGate()
             print("Fn 锁总闸(0x07A4 bit3): \(g?.ok == true ? "已确保在位" : "写入失败（EC 不可写）")")
         }
-        // 启动时恢复上次保存的键盘灯效（含白平衡增益）。
+        // 启动时恢复存档灯效。存档 enabled=false（总开关关）时 apply() 内部走关灯，保持熄灭。
         //
         // 【2.8.12】以前这里恢复一次，另外还有一条 com.skycc.rgbrestore 登录项
         // （/bin/bash 跑 restore_rgb.sh）在登录时再恢复一次 —— 同一件事做两遍，

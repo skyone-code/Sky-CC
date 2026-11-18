@@ -291,11 +291,6 @@ private var profileDir: URL {
         .appendingPathComponent("Library/Application Support/SkyCC", isDirectory: true)
 }
 private var profileURL: URL { profileDir.appendingPathComponent("rgb_profile.json") }
-private var gainURL: URL { profileDir.appendingPathComponent("rgb_white_gain.json") }
-private var endURL: URL { profileDir.appendingPathComponent("rgb_white_end.json") }
-
-private let defaultGain: (Int, Int, Int) = (1000, 1000, 1000)
-private let defaultEnd: (Int, Int, Int) = (1000, 300, 200)
 
 private let timeFormatter: DateFormatter = {
     let f = DateFormatter()
@@ -427,8 +422,12 @@ final class KeyboardRGB {
     func getState(fallbackBrightness: Int? = nil) -> [String: Any]? {
         guard let d = readFeature(8) else { return nil }
         let isEffectReport = (d[0] == 0x08)
+        // 关灯报文（0x08 0x01）也是 0x08 开头，但第 5 字节恒 0 —— 拿它当亮度
+        // 会读出 ~2%（用户实测：关灯后亮度滑条闪 2% 又回 100%）。灯关着亮度
+        // 无意义，一律回落到存档值（那是下次「开」要恢复的亮度）。
+        let brightnessUsable = isEffectReport && d[1] != 0x01
         let pct: Int?
-        if isEffectReport {
+        if brightnessUsable {
             pct = pctFromRaw(d[4])
         } else if let f = fallbackBrightness {
             pct = normalizePct(f)
@@ -444,15 +443,24 @@ final class KeyboardRGB {
             // 亮度字节只在 0x08 报文里有效；别的报文下这里照原样给出，仅供排障
             "brightness_raw": d[4],
             "brightness_max": brightnessMax(),
-            "brightness_valid": isEffectReport,
-            "brightness_source": isEffectReport ? "hid" : (pct == nil ? "unknown" : "profile"),
+            "brightness_valid": brightnessUsable,
+            "brightness_source": brightnessUsable ? "hid" : (pct == nil ? "unknown" : "profile"),
             "colour": d[5],
             "direction": d[6],
         ]
         if let p = pct { st["brightness_pct"] = p }
         // 老键名保留：菜单栏 / 旧调用还在读 brightness_level（1…4）
         st["brightness_level"] = max(1, min(4, ((pct ?? 75) + 12) / 25))
-        st["off"] = (d[0] == 0x08 && d[1] == 0x01)
+        // 【2026-11-18 修复】off 不能再看缓冲里「上一笔报文」：rgbState 每次轮询
+        // 都会有 feature 查询报文（0x88 / 0x80）写进同一个缓冲，下一拍读到的
+        // 就是查询报文而非关灯报文 → off 恒为 false → 总开关被轮询顶回「开」
+        //（用户反馈的 bug）。改用 0x88 现场查询芯片真实状态（纯查询，不重置
+        // 固件熄灯计时）；查询失败才退回缓冲推导。
+        if let q = queryState() {
+            st["off"] = (q.control == 0x01 || q.brightness == 0)
+        } else {
+            st["off"] = (d[0] == 0x08 && d[1] == 0x01)
+        }
         st["led_vendor"] = WkdColor.vendor.label
         st["led_variant"] = WkdColor.variantLabel
         return st
@@ -768,6 +776,17 @@ enum RGBProfile {
         catch { return false }
     }
 
+    /// 总开关状态并入存档（2026-11-18，用户定案）：
+    /// 关灯 = 只置 enabled=false，灯效字段原样保留；开灯 = 置 true 后由 apply()
+    /// 把存档灯效覆盖回去。绝不把 mode 覆盖成 off —— 否则「开=恢复上次灯效」
+    /// 就永远恢复不出来了（旧 bug：关一次灯后开灯无效）。
+    @discardableResult
+    static func setEnabled(_ on: Bool) -> Bool {
+        var p = load() ?? ["mode": on ? "color" : "off", "hex": "#ff9500", "brightness": 75]
+        p["enabled"] = on
+        return save(p)
+    }
+
     /// 逐键矩阵规格：6 行 × 21 列
     static let keyRows = 6
     static let keyCols = 21
@@ -855,8 +874,14 @@ enum RGBProfile {
     /// - Parameter save: 1 = 写进芯片 NVM（正常应用）；0 = 只作用于当前会话。
     ///   灯效保活每分钟会重放一次存档，必须用 0，否则等于每分钟擦写一次 NVM。
     static func apply(_ profile: [String: Any]? = nil, save: Int = 1) -> [String: Any] {
-        guard let prof = profile ?? load() else {
+        guard var prof = profile ?? load() else {
             return ["ok": false, "error": "没有已保存的灯效配置"]
+        }
+        // 总开关状态（2026-11-18）：关灯时不把 mode 覆盖成 off，只置 enabled=false。
+        // 恢复请求（profile 为空 = 开机恢复 / 旧调用）读到 enabled=false 就保持关灯；
+        // 用户点「开」走 /api/rgb/apply，路由会先 setEnabled(true) 再到这里。
+        if profile == nil, prof["enabled"] as? Bool == false {
+            prof = ["mode": "off", "enabled": false]
         }
         guard KeyboardRGB.available() else {
             return ["ok": false, "error": "未检测到 ITE 8291 键盘灯设备"]
@@ -942,19 +967,22 @@ enum RGBProfile {
         } catch {
             return ["ok": false, "error": "\(error)", "mode": mode, "profile": prof]
         }
-        let gains = RGBGains.load()
         var out: [String: Any] = [
             "ok": kr == 0, "kr": kr, "mode": mode, "profile": prof,
-            "gains": [gains.0, gains.1, gains.2],
             "led_vendor": WkdColor.vendor.label,
             "led_variant": WkdColor.variantLabel,
         ]
         if let appliedRGB = appliedRGB { out["applied_rgb"] = appliedRGB }
+        // 灯真的点亮了：把总开关状态落回存档（开机恢复 / doRGB 各分支共用本函数）
+        if kr == 0, mode != "off" {
+            prof["enabled"] = true
+            _ = RGBProfile.save(prof)   // save 参数（Int）会遮蔽本枚举的 save()，须显式调用
+        }
         return out
     }
 }
 
-// MARK: - 灯效保活（2026-10-25）
+// MARK: - 灯效活动标记（音乐律动帧与恢复动作的互斥信号）
 
 /// 灯效活动标记：音乐律动每帧都会刷一次「逐行上色」，保活循环据此避让，
 /// 免得不打字时把正在跑的频谱画面覆盖回旧灯效。
@@ -977,116 +1005,6 @@ enum RGBActivity {
     /// 15 秒内刷过逐行上色 = 音乐律动还活着
     static var musicActive: Bool { Date().timeIntervalSince(lastZones) < 15 }
 }
-
-/// 键盘背光「约 11 分钟自己熄灭」的处理（2026-10-26 三组实测后的定案）。
-///
-/// 【实测结论，别再猜了】断开一切干扰，只留一条 HID 通道：
-///   · 写 `0x08`（steady、亮度 `0x30`）后**完全不碰键盘**，亮度字节在 **11 分钟**整被清零
-///     （`88 02 01 0A 00 01 00 00`），`ctrl/effect/speed` 一个没变；
-///   · 同一时间段 EC `0x7C4` bit6 始终 = 1（`0x40`）→ **不是 EC 断 LED 供电**；
-///   · 每 60 秒发 `0x88` 查询 → 照样灭（**查询不重置计时**）；
-///   · 每 60 秒重下发整条 `0x08` → 照样灭，且**救不回来**（用户实测「黑了而且没救活」）；
-///   · 按一下键 → 灯立刻回来，亮度是芯片 NVM 里存的 36。
-/// 即：**计时器在 ITE 8291 固件里，认的是「有没有按键」；被它熄掉之后，任何 HID 报文
-/// 都点不亮，只有物理按键能唤醒。** 所以「保活」在 HID 侧做不到，硬写只会变成闪一下。
-///
-/// 【现在做的两件事】
-///   ① 纯观察：每 5 秒 `0x88` 读一次真状态，流水写进 `rgb_keepalive.log`。
-///      一次都不写 —— 不闪、不掩盖真实状态，出问题时时间线可信。
-///   ② 按键即时回贴：熄灯后用户一按键，芯片只会还他一个 NVM 里的白（36），
-///      原来调好的灯效/逐键图案就丢了。所以检测到「刚按下键」且「近期确实熄过灯」时，
-///      立刻把存档灯效重下发一次 —— 用户感觉就是「一碰键盘，我的灯效回来了」。
-///      只在这一种情况下写，平时不打扰（动画不会被打断）。
-enum RGBKeepAlive {
-    private static var started = false
-    private static let queue = DispatchQueue(label: "com.skycc.rgbkeepalive", qos: .utility)
-    /// 观察间隔。也是「按键后多久把灯效贴回」的上限。
-    private static let tickInterval: TimeInterval = 5
-
-    private static var lastState = ""
-    private static var tick = 0
-    /// 读到过「灯被固件熄了」，但还没把灯效贴回去
-    private static var needReapply = false
-
-    private static let logURL: URL = {
-        let dir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/SkyCC", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("rgb_keepalive.log")
-    }()
-
-    static func start() {
-        guard !started else { return }
-        started = true
-        queue.async {
-            while true {
-                Thread.sleep(forTimeInterval: tickInterval)
-                autoreleasepool { step() }
-            }
-        }
-    }
-
-    /// 记一笔「谁在什么时候写了灯效」，和状态流水共用一条时间线。
-    static func note(_ s: String) {
-        queue.async {
-            needReapply = false        // app 自己写了灯效：不用再贴
-            log(s, force: true)
-        }
-    }
-
-    private static func step() {
-        tick &+= 1
-        // 音乐律动在跑：它每 83ms 写一帧，既不缺活动信号也不该被打断
-        guard !RGBActivity.musicActive else { return }
-        guard let prof = RGBProfile.load(),
-              (prof["mode"] as? String ?? "color") != "off" else { return }
-        guard KeyboardRGB.available(), let kb = try? KeyboardRGB().open() else {
-            log("device=gone", force: true)
-            return
-        }
-        defer { kb.close() }
-
-        // ① 纯查询，判断固件有没有把灯熄了
-        guard let st = kb.queryState() else {
-            log("query=nil")
-            return
-        }
-        let off = st.control == 0x01 || st.brightness == 0
-        log("ctrl=\(st.control) eff=\(st.effect) bri=\(st.brightness)\(off ? "  → 灭了" : "" )")
-
-        // ② 熄过灯、后来又被唤醒（用户按键，芯片把 NVM 亮度还回来）→ 把存档灯效贴回去。
-        //    不贴的话用户看到的就是「一个忽明忽暗的灰白」，亮度 36、图案全丢。
-        //    用「亮度重新 > 0」当唤醒信号，不依赖按键事件（更可靠，也不用辅助功能权限）。
-        if off {
-            needReapply = true
-            return
-        }
-        guard needReapply else { return }
-        needReapply = false
-        let r = RGBProfile.apply(prof, save: 0)
-        log("唤醒回贴 ok=\(r["ok"] as? Bool ?? false) mode=\(r["mode"] as? String ?? "?")",
-            force: true)
-    }
-
-    /// 落盘一份状态流水（状态变化 / 每 60 拍≈5 分钟 / 强制）。排查靠它看时间线：
-    /// `write …` 是 app 写的，`ctrl=… bri=…` 是这里读的，`按键回贴 …` 是这里补的。
-    private static func log(_ s: String, force: Bool = false) {
-        guard force || s != lastState || tick % 60 == 0 else { return }
-        lastState = s
-        let line = "\(timeFormatter.string(from: Date())) \(s)\n"
-        guard let data = line.data(using: .utf8) else { return }
-        if let attrs = try? FileManager.default.attributesOfItem(atPath: logURL.path),
-           let size = attrs[.size] as? Int, size > 256 * 1024 {
-            try? FileManager.default.removeItem(at: logURL)
-        }
-        if let h = try? FileHandle(forWritingTo: logURL) {
-            h.seekToEndOfFile(); h.write(data); try? h.close()
-        } else {
-            try? data.write(to: logURL)
-        }
-    }
-}
-
 // MARK: - AP exist 常驻（控制中心接管 / 键盘灯 10 分钟熄灯，2026-11-11）
 
 /// 让 EC `0x741` bit0 一直是 1 —— 这一位就是文档 §4.2 的 **AP exist：控制软件在线标志**。
@@ -1117,133 +1035,6 @@ enum ECAPPresentKeeper {
         }
     }
 }
-
-// MARK: - 白色微调（原厂补偿之后的二次手工微调）
-
-/// 原厂补偿已经把三通道配比拉到接近中性白；这里保留一个二次微调，
-/// 默认 (1000,1000,1000) = 不动。与旧版的区别：旧版用它来"补救"
-/// 缺失的补偿，会在补偿补上之后过度修正，所以旧配置需要重置一次。
-enum RGBGains {
-    static func load() -> (Int, Int, Int) {
-        guard let data = try? Data(contentsOf: gainURL),
-              let d = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              // 只接受 Version 2（补偿上线后的配置）；旧版裸数组直接丢弃
-              (d["Version"] as? Int ?? 0) >= 2,
-              let r = d["R"] as? Int, let g = d["G"] as? Int, let b = d["B"] as? Int else {
-            return defaultGain
-        }
-        return (clamp(r), clamp(g), clamp(b))
-    }
-
-    @discardableResult
-    static func save(_ gr: Int, _ gg: Int, _ gb: Int, observed: String? = nil) -> (Int, Int, Int) {
-        let g = (clamp(gr), clamp(gg), clamp(gb))
-        let dir = gainURL.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        var payload: [String: Any] = ["Version": 2, "R": g.0, "G": g.1, "B": g.2]
-        if let observed = observed { payload["observed"] = observed }
-        payload["updated"] = timeFormatter.string(from: Date())
-        if let data = try? JSONSerialization.data(withJSONObject: payload) {
-            try? data.write(to: gainURL)
-        }
-        return g
-    }
-
-    @discardableResult
-    static func clear() -> (Int, Int, Int) {
-        try? FileManager.default.removeItem(at: gainURL)
-        return defaultGain
-    }
-
-    static func apply(_ rgb: (Int, Int, Int)) -> (Int, Int, Int) {
-        let (gr, gg, gb) = load()
-        return (min(255, (rgb.0 * gr + 500) / 1000),
-                min(255, (rgb.1 * gg + 500) / 1000),
-                min(255, (rgb.2 * gb + 500) / 1000))
-    }
-
-    private static func clamp(_ v: Int) -> Int { max(50, min(1000, v)) }
-
-    private static func srgbToLinear(_ c: Double) -> Double {
-        let v = max(0, min(255, c)) / 255.0
-        return v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4)
-    }
-
-    static func calcWhiteGains(_ observedHex: String) -> [String: Any]? {
-        var s = observedHex
-        if s.hasPrefix("#") { s = String(s.dropFirst()) }
-        guard s.count == 6, let r = Int(s[0..<2], radix: 16),
-              let g = Int(s[2..<4], radix: 16), let b = Int(s[4..<6], radix: 16) else { return nil }
-        let lin = (srgbToLinear(Double(r)), srgbToLinear(Double(g)), srgbToLinear(Double(b)))
-        let strongest = max(lin.0, lin.1, lin.2)
-        let weakest = min(lin.0, lin.1, lin.2)
-        if strongest < 0.01 || weakest < 0.0005 { return nil }
-        let out = [lin.0, lin.1, lin.2].map { ch -> Int in
-            ch <= 1e-6 ? 1000 : max(50, min(1000, Int(weakest / ch * 1000.0 + 0.5)))
-        }
-        return ["R": out[0], "G": out[1], "B": out[2],
-                "observed": s.lowercased(),
-                "factors": out.map { (Double($0) / 1000 * 1000).rounded() / 1000 }]
-    }
-}
-
-// MARK: - 滑条端点（让「去蓝强度」滑条可无跳变往返）
-
-enum RGBSlider {
-    static func loadEndpoint() -> (Int, Int, Int) {
-        guard let data = try? Data(contentsOf: endURL),
-              let d = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return defaultEnd
-        }
-        let r = max(50, min(1000, d["R"] as? Int ?? 1000))
-        let g = max(50, min(1000, d["G"] as? Int ?? defaultEnd.1))
-        let b = max(50, min(1000, d["B"] as? Int ?? defaultEnd.2))
-        return (r, g, b)
-    }
-
-    @discardableResult
-    static func saveEndpoint(_ gr: Int, _ gg: Int, _ gb: Int) -> (Int, Int, Int) {
-        let g = (max(50, min(1000, gr)), max(50, min(1000, gg)), max(50, min(1000, gb)))
-        let dir = endURL.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        var payload: [String: Any] = ["R": g.0, "G": g.1, "B": g.2]
-        payload["updated"] = timeFormatter.string(from: Date())
-        if let data = try? JSONSerialization.data(withJSONObject: payload) {
-            try? data.write(to: endURL)
-        }
-        return g
-    }
-
-    @discardableResult
-    static func clearEndpoint() -> (Int, Int, Int) {
-        try? FileManager.default.removeItem(at: endURL)
-        return defaultEnd
-    }
-
-    static func toGains(_ t: Double) -> (Int, Int, Int) {
-        let end = loadEndpoint()
-        let tt = max(0, min(100, t))
-        let f = { (e: Int) -> Int in
-            Int((1000 - Double(1000 - e) * tt / 100.0).rounded(.toNearestOrEven))
-        }
-        return (f(end.0), f(end.1), f(end.2))
-    }
-
-    static func fromGains(_ gains: (Int, Int, Int)? = nil) -> Int {
-        let cur = gains ?? RGBGains.load()
-        let end = loadEndpoint()
-        var ts: [Double] = []
-        for (c, e) in [(cur.0, end.0), (cur.1, end.1), (cur.2, end.2)] {
-            let span = Double(1000 - e)
-            if span <= 0 { continue }
-            ts.append(Double(1000 - c) / span * 100.0)
-        }
-        guard !ts.isEmpty else { return 0 }
-        let mx = ts.max() ?? 0
-        return Int(max(0, min(100, mx.rounded(.toNearestOrEven))))
-    }
-}
-
 // MARK: - 小工具
 
 private func hexOf(_ bytes: [UInt8]) -> String {

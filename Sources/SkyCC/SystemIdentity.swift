@@ -80,46 +80,79 @@ struct MonitorHeroBar: View {
     @EnvironmentObject var store: MonitorStore
 
     var body: some View {
-        HStack(alignment: .center, spacing: 14) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(Theme.accentGradient)
-                    .frame(width: 44, height: 44)
-                Image(systemName: "laptopcomputer")
-                    .font(.system(size: 19, weight: .light))
-                    .foregroundStyle(.white)
-            }
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text(machineName)
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(Theme.txt)
-                    .lineLimit(1)
-                HStack(spacing: 5) {
-                    Chip(text: macOSFull, color: Theme.blue)
-                    Chip(text: modelID, color: Theme.dim)
-                    Chip(text: store.connected ? "后台服务在线" : "后台服务离线",
-                         color: store.connected ? Theme.green : Theme.red,
-                         filled: !store.connected)
-                }
-            }
-
-            Spacer(minLength: 12)
-
-            HStack(spacing: 0) {
-                heroStat("运行时间", compactUptime(BackendService.double(store.overview, "uptime") ?? 0), "clock")
-                heroDivider
-                heroStat("进程", "\(BackendService.int(store.overview, "process_count") ?? 0)", "list.bullet")
-                heroDivider
-                heroStat("热压", thermalText, "thermometer.medium")
-                heroDivider
-                heroStat("电源", powerModeText, "bolt")
-            }
+        // 2026-11-18（最小宽排查）：原布局「图标 + 机型名/3 芯片 + 右侧 4 统计」
+        // 固有宽 ~780，是概览页在窗口最小宽 + 侧边栏（详情列 ~788）下被裁切的
+        // 元凶 —— 芯片不换行、统计一行 4 格 + 3 分隔线，谁也压不动。
+        // 用 ViewThatFits 提供宽窄两版：放得下用单行（现状），放不下统计
+        // 整排换到第二行，芯片/名称行照旧 —— 内容不减，只是折行。
+        ViewThatFits(in: .horizontal) {
+            heroRow(statsBelow: false)
+            heroRow(statsBelow: true)
         }
         .padding(12)
         .background(Theme.panel, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
             .strokeBorder(Theme.line, lineWidth: 1))
+    }
+
+    @ViewBuilder
+    private func heroRow(statsBelow: Bool) -> some View {
+        if statsBelow {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .center, spacing: 14) {
+                    heroIcon
+                    nameColumn
+                    Spacer(minLength: 12)
+                }
+                statsRow
+            }
+        } else {
+            HStack(alignment: .center, spacing: 14) {
+                heroIcon
+                nameColumn
+                Spacer(minLength: 12)
+                statsRow
+            }
+        }
+    }
+
+    private var heroIcon: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Theme.accentGradient)
+                .frame(width: 44, height: 44)
+            Image(systemName: "laptopcomputer")
+                .font(.system(size: 19, weight: .light))
+                .foregroundStyle(.white)
+        }
+    }
+
+    private var nameColumn: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(machineName)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(Theme.txt)
+                .lineLimit(1)
+            HStack(spacing: 5) {
+                Chip(text: macOSFull, color: Theme.blue)
+                Chip(text: modelID, color: Theme.dim)
+                Chip(text: store.connected ? "后台服务在线" : "后台服务离线",
+                     color: store.connected ? Theme.green : Theme.red,
+                     filled: !store.connected)
+            }
+        }
+    }
+
+    private var statsRow: some View {
+        HStack(spacing: 0) {
+            heroStat("运行时间", compactUptime(BackendService.double(store.overview, "uptime") ?? 0), "clock")
+            heroDivider
+            heroStat("进程", "\(BackendService.int(store.overview, "process_count") ?? 0)", "list.bullet")
+            heroDivider
+            heroStat("热压", thermalText, "thermometer.medium")
+            heroDivider
+            heroStat("电源", powerModeText, "bolt")
+        }
     }
 
     private var heroDivider: some View {
@@ -439,18 +472,30 @@ struct BootArgsCard: View {
                     ("架构", BackendService.string(BackendService.dict(store.overview, "cpu"), "arch") ?? "—"),
                     ("低电量模式", BackendService.bool(store.overview, "low_power_mode") == true ? "已开启" : "关闭"),
                 ], columns: 2)
-                if !bootArgs.isEmpty {
-                    Divider().overlay(Theme.line)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("BOOT ARGS")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(Theme.dim2)
-                            .tracking(0.9)
-                        Text(bootArgs)
+                // BOOT ARGS 固定槽位（2026-11-18 用户要求）：没设置也占位显示「（未设置）」；
+                // 有值时固定 44pt 高，超出部分出滚动条，卡片不随内容无限拉高。
+                Divider().overlay(Theme.line)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("BOOT ARGS")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(Theme.dim2)
+                        .tracking(0.9)
+                    if bootArgs.isEmpty {
+                        Text("（未设置）")
                             .font(.system(size: 11.5, design: .monospaced))
-                            .foregroundStyle(Theme.dim)
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
+                            .foregroundStyle(Theme.dim2)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .frame(height: 44, alignment: .topLeading)
+                    } else {
+                        ScrollView(.vertical) {
+                            Text(bootArgs)
+                                .font(.system(size: 11.5, design: .monospaced))
+                                .foregroundStyle(Theme.dim)
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .frame(height: 44)
                     }
                 }
             }

@@ -13,6 +13,7 @@ import SwiftUI
 /// 硬性约束：本页**所有**写硬件的动作只能由用户点击/拖动产生。
 /// 程序化回读一律直接改 @State，绝不经过 onChange —— 否则一进页面就
 /// 把界面默认值（比如「彩虹」「75%」）当成用户操作写进键盘。
+
 struct RGBView: View {
     @EnvironmentObject var backend: BackendService
     @EnvironmentObject var store: MonitorStore
@@ -126,7 +127,7 @@ struct RGBView: View {
     /// 守夜可能被 FAN_ABNORMAL 挡住没补写，界面要显示 EC 现在的态度。
     @State private var apPresent = true
 
-    /// 2.8.9：卡片说明默认隐藏（实验性页放行）
+    // 2.8.9：卡片说明默认隐藏（实验性页放行）
     @Environment(\.hideCardSubs) private var hideCardSubs
 
     // 2026-11-14（用户要求，首帧记忆）：构造时同步读软件记忆镜像，首帧即上次选择。
@@ -168,8 +169,7 @@ struct RGBView: View {
         }
         _lbLastMode = State(initialValue: UIControlPrefs.string(UIControlPrefs.K.lightbarMode) ?? "cycle")
         _lbBreathing = State(initialValue: UIControlPrefs.bool(UIControlPrefs.K.lightbarBreathing) ?? true)
-        _kbOn = State(initialValue: UIControlPrefs.bool(UIControlPrefs.K.rgbKbOn)
-                      ?? UIControlPrefs.bool(UIControlPrefs.K.kbBacklight) ?? true)
+        _kbOn = State(initialValue: UIControlPrefs.bool(UIControlPrefs.K.rgbKbOn) ?? true)
         _apPresent = State(initialValue: UIControlPrefs.bool(UIControlPrefs.K.apbeat) ?? true)
     }
 
@@ -203,22 +203,27 @@ struct RGBView: View {
                     if !rgbAvailable {
                         unavailableCard
                     } else {
-                        HStack(alignment: .top, spacing: 14) {
-                            // 左：键盘灯效（宽，内容最多）
+                        // 键盘灯效行（2026-11-18 二次修正）：改用自定义 Layout——
+                        // 之前的「探针 + frame(height:)」有反馈死循环：探针量到的是
+                        // 已被撑高后的高度，撑→缩→再撑反复横跳，卡在撑高状态时
+                        // 卡内留出一大块空白（用户实测）。RGBRowLayout 在布局层
+                        // 直接量自然高，无状态、无回路；2026-11-18 三次修正：量高
+                        // 改按实际摆放宽（LazyVGrid 在 unspecified 宽下会量出
+                        // 一列竖排的离谱高值，展开灯效列表后卡内空一大块）。
+                        RGBRowLayout(trailingWidth: 360, spacing: 14) {
                             effectCard
-                                .frame(maxWidth: .infinity, alignment: .top)
-                            // 右：海岸灯 + AP 心跳（灯效通用已删，用户要求）
                             VStack(spacing: 14) {
                                 lightbarCard
                                 apBeatCard
-                                Spacer(minLength: 0)
                             }
-                            .frame(width: 360)
                         }
                         // 2.8.8：原来这里给 HStack 一个 560 的固定下限，卡片被拉高、
                         // 内部空出一整块。改成按内容自然高度，再用下面这张设备信息卡
                         // 把剩下的版面填上（信息是真的有用，不是拿空白凑）。
+                        // 2026-11-18：Card 内部的尾部 Spacer 会在外层 minHeight 拉伸时
+                        // 把这张卡撑高、下面空一大块 —— fixedSize 让它严格按内容高。
                         deviceCard
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
                 .padding(22)
@@ -460,11 +465,16 @@ struct RGBView: View {
         .buttonStyle(.plain)
     }
 
-    /// 键盘灯总开关：开 = 恢复上次灯效（/api/rgb/apply），关 = CTRL_OFF。
-    /// 逻辑沿用原「灯效通用」卡的两个按钮（2026-11-14 该卡删除，功能并进这个开关）。
+    /// 键盘灯总开关（2026-11-18 定案）：
+    /// 关 = CTRL_OFF，存档只置 enabled=false（灯效选项原样保留）；
+    /// 开 = /api/rgb/apply 把存档灯效覆盖回去。
     private var kbOnBinding: Binding<Bool> {
         Binding(get: { kbOn }, set: { on in
             kbOn = on
+            // 【2026-11-18 修复】锁住轮询回读：点「开」后 UI 里 store 还是上一拍
+            // 旧快照（灯 off 状态），不锁的话 syncFromBackend 会把开关刷回关，
+            // 等下一拍新快照到了又变回开（实测闪关再闪开）。4s 覆盖两拍。
+            locks.lock("kbOn", 4)
             Task { await setKeyboardLight(on) }
         })
     }
@@ -1163,8 +1173,9 @@ struct RGBView: View {
             }
         }
 
-        // 键盘灯总开关以芯片真实状态为准（state.off 由 HID 报文推导，NativeRGB 下发）
-        if let off = BackendService.dict(store.rgb, "state")?["off"] as? Bool {
+        // 键盘灯总开关以芯片真实状态为准（state.off 由 getState 里 0x88 现场查询判定）；
+        // 用户刚拨动过（4s 锁内）不回读，避免旧快照把开关顶回去。
+        if !locks.locked("kbOn"), let off = BackendService.dict(store.rgb, "state")?["off"] as? Bool {
             kbOn = !off
         }
         // AP 心跳真值镜像（EC 0x741 bit0）

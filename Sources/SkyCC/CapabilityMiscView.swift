@@ -30,21 +30,20 @@ struct MiscView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 header
-                // 2026-11-18（用户要求）：皮肤卡拆分 —— 预设配色 + 玻璃开关并入
-                // 外观与通用卡（外观行下方）；背景图两行独立成「自定义背景」卡
-                Grid(horizontalSpacing: 14, verticalSpacing: 14) {
-                    GridRow {
-                        generalCard.gridEqualFull()
-                        aboutCard.gridEqualFull()
-                    }
-                    GridRow {
-                        customBgCard.gridEqual().gridCellColumns(2)
-                    }
+                // 2026-11-18（用户要求）：两行式两列布局，行内左右等高（EqualHeightHStack）——
+                //   第一行：版本卡 | 系统与启动参数卡（BOOT ARGS 固定槽位补齐高度差）
+                //   第二行：外观与通用卡+自定义背景卡 | 系统调整卡
+                EqualHeightHStack(spacing: 14) {
+                    aboutCard
+                    BootArgsCard()
                 }
-                // 「系统调整」整卡（显卡路由已拆去控制页，见 SystemTweakCard.swift）
-                SystemTweakSection()
-                // 「系统与启动参数」（自概览页迁来，用户要求置底）
-                BootArgsCard()
+                EqualHeightHStack(spacing: 14) {
+                    VStack(alignment: .leading, spacing: 14) {
+                        generalCard
+                        customBgCard
+                    }
+                    SystemTweakSection()
+                }
             }
             .padding(22)
         }
@@ -241,39 +240,26 @@ private struct MenuBarIconStylePicker: View {
                     UserDefaults.standard.set(new.rawValue, forKey: AppAppearance.defaultsKey)
                 }
 
-                // 2026-11-18（用户要求）：预设配色 + 玻璃效果开关从皮肤卡迁入本卡（外观行下方）。
-                // 开关随时可开可关（像系统设置的透明开关）：开 = 切到玻璃皮肤，关 = 回上一个皮肤。
+                // 2026-11-18（用户三版定稿）：预设全删，配色 = 色板自选颜色
+                //（浅/深外观各记一色，选的是当前外观那一档）+ 玻璃独立开关。
+                // 色板管颜色、玻璃管材质，正交可叠加。
                 Divider().overlay(Theme.line)
 
                 HStack(spacing: 10) {
                     Text("配色").font(.system(size: 12.5, weight: .medium)).foregroundStyle(Theme.txt)
-                    HStack(spacing: 9) {
-                        ForEach(SkinCenter.Preset.allCases) { p in
-                            // 色板圆点 = 当前外观实际生效的那一档底色
-                            Circle()
-                                .fill(p.swatchColor)
-                                .frame(width: 22, height: 22)
-                                .overlay(Circle().strokeBorder(Theme.line, lineWidth: 1))
-                                .overlay {
-                                    // 当前生效（选了图片时不算任何预设，只亮底色描边）
-                                    if skin.preset == p && !skin.isCustomImage {
-                                        Circle().strokeBorder(Theme.blue, lineWidth: 1.8)
-                                            .padding(-3.5)
-                                    }
-                                }
-                                .contentShape(Circle())
-                                .onTapGesture { withAnimation(.easeOut(duration: 0.18)) { skin.select(p) } }
-                                .help("背景配色：\(p.label)")
-                        }
-                    }
+                    ColorPicker("", selection: Binding(
+                        get: { skin.pickerColor },
+                        set: { skin.setColor($0) }), supportsOpacity: false)
+                        .labelsHidden()
+                        .help("页面底色（浅色/深色外观各记一色）")
                     Spacer(minLength: 0)
-                    // 玻璃效果开关（右对齐；选中玻璃色板时开关同步为开）
+                    // 玻璃效果开关：只切材质（窗口透明 + 磨砂透桌面），与颜色无关
                     Toggle("玻璃效果", isOn: Binding(
                         get: { skin.glassOn },
                         set: { skin.setGlassEffect($0) }))
                         .toggleStyle(.switch)
                         .controlSize(.small)
-                        .help("开启后窗口透出桌面模糊、卡片更透（即玻璃配色）；关闭回到上一个配色。铺了自定义背景图时玻璃暂停生效。")
+                        .help("开启后窗口透出桌面模糊、卡片更透，染色跟随所选颜色；关闭后页面为所选颜色实心底。铺了自定义背景图时玻璃暂停生效。")
                 }
 
                 Divider().overlay(Theme.line)
@@ -286,12 +272,16 @@ private struct MenuBarIconStylePicker: View {
                                 .foregroundStyle(Theme.txt)
                         }
                         Spacer(minLength: 4)
-                        Toggle("", isOn: $launchAtLogin)
-                            .toggleStyle(.switch)
-                            .labelsHidden()
-                    }
-                    .onChange(of: launchAtLogin) { _, _ in
-                        applyAutostart()
+                        // 2026-11-18（用户反馈）：不能用 onChange 监听 launchAtLogin ——
+                        // 进页 .task { refreshLaunchState() } 把开关从初始 false 设成真实状态
+                        // 也会触发 onChange，导致每次进设置都弹「已开启 · 开机自启」。
+                        // 改成只在用户拨动开关的动作里调 applyAutostart()。
+                        Toggle("", isOn: Binding(
+                            get: { launchAtLogin },
+                            set: { on in launchAtLogin = on; applyAutostart() }
+                        ))
+                        .toggleStyle(.switch)
+                        .labelsHidden()
                     }
 
                     if let note = launchNote {

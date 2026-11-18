@@ -68,12 +68,13 @@ struct PageBackgroundModifier: ViewModifier {
                 .ignoresSafeArea()
                 skin.bgColor.opacity(maskOpacity).ignoresSafeArea()
             } else if skin.isGlassActive {
-                // 玻璃皮肤（2026-11-18 新增）：
+                // 玻璃材质（2026-11-18 三版）：
                 //   底层 = NSVisualEffectView（behindWindow 模糊，透出窗口后面的桌面，
                 //   配合 applyGlassWindowTransparency 把窗口改成透明）；
-                //   上层 = 品牌染色渐变（半透明），把玻璃染成 Sky CC 的蓝紫调。
+                //   上层 = 所选颜色的低透明度染色（三版改轻：旧版三层渐变 0.55–0.66
+                //   把桌面盖得几乎看不见，用户观感「不透桌面」）。
                 GlassVibrancyView().ignoresSafeArea()
-                glassGradient(for: colorScheme).ignoresSafeArea()
+                skin.bgColor.opacity(colorScheme == .light ? 0.38 : 0.48).ignoresSafeArea()
             } else {
                 skin.bgColor.ignoresSafeArea()
             }
@@ -83,20 +84,8 @@ struct PageBackgroundModifier: ViewModifier {
         // 注：customImage 是 NSImage（非 Equatable），onChange 用 isCustomImage 这个
         // Bool 标志代替 —— skin 是 @EnvironmentObject，任何变更都会触发 body 重算。
         .onAppear { applyGlassWindowTransparency(skin) }
-        .onChange(of: skin.preset) { _, _ in applyGlassWindowTransparency(skin) }
+        .onChange(of: skin.glassOn) { _, _ in applyGlassWindowTransparency(skin) }
         .onChange(of: skin.isCustomImage) { _, _ in applyGlassWindowTransparency(skin) }
-    }
-
-    /// 玻璃染色渐变：浅色 = 蓝→淡紫→薄荷的柔和三段；深色 = 深空蓝→暗紫。
-    /// 只做低饱和染色，避免喧宾夺主；真正的质感来自底层的窗口 vibrancy。
-    private func glassGradient(for scheme: ColorScheme) -> LinearGradient {
-        LinearGradient(
-            colors: scheme == .light
-                ? [Color(hex: 0xdceaff).opacity(0.66), Color(hex: 0xe9e2ff).opacity(0.60),
-                   Color(hex: 0xdff5ec).opacity(0.66)]
-                : [Color(hex: 0x1c2b52).opacity(0.58), Color(hex: 0x2a1e4d).opacity(0.55),
-                   Color(hex: 0x12333a).opacity(0.58)],
-            startPoint: .topLeading, endPoint: .bottomTrailing)
     }
 
     /// 窗口透明开关（2026-11-18 第三版，用户定案「两边标题栏模式必须写一样」）。
@@ -237,26 +226,21 @@ enum Theme {
     private static func surfaceSkin(_ id: String, light: UInt32, dark: UInt32,
                                     alphaLight: Double, alphaDark: Double) -> Color {
         let skin = SkinCenter.shared
-        // 缓存键：皮肤预设 + 是否自定义图 —— 玻璃态由这两者派生（isGlassActive），键已覆盖
-        let key = "\(id)|\(skin.preset)|\(skin.isCustomImage)"
+        // 缓存键：玻璃开关 + 是否自定义图（色值不影响表面色，不进键）
+        let key = "\(id)|\(skin.isCustomImage)|\(skin.glassOn)"
         if let c = surfaceCache[key] { return c }
-        var color: Color
-        if skin.preset == .ink && !skin.isCustomImage {
-            color = Theme.dyn(light: light, dark: dark)
+        let aL: Double, aD: Double
+        if skin.isGlassActive {
+            aL = alphaLight * 0.72   // 如 panel 0.62 → 0.45
+            aD = alphaDark * 0.76    // 如 panel 0.72 → 0.55
         } else {
-            let aL: Double, aD: Double
-            if skin.isGlassActive {
-                aL = alphaLight * 0.72   // 如 panel 0.62 → 0.45
-                aD = alphaDark * 0.76    // 如 panel 0.72 → 0.55
-            } else {
-                aL = alphaLight; aD = alphaDark
-            }
-            color = Color(nsColor: NSColor(name: nil, dynamicProvider: { appearance in
-                let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-                return NSColor(hex: isDark ? dark : light)
-                    .withAlphaComponent(isDark ? aD : aL)
-            }))
+            aL = alphaLight; aD = alphaDark
         }
+        let color = Color(nsColor: NSColor(name: nil, dynamicProvider: { appearance in
+            let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            return NSColor(hex: isDark ? dark : light)
+                .withAlphaComponent(isDark ? aD : aL)
+        }))
         surfaceCache[key] = color
         return color
     }
@@ -670,5 +654,80 @@ struct KextBanner: View {
         .background(Theme.amber.opacity(0.10), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
             .strokeBorder(Theme.amber.opacity(0.4), lineWidth: 1))
+    }
+}
+
+// MARK: - 行内等高水平布局（2026-11-18，设置页两行两列用）
+//
+// 以行内自然高度最高的子视图为准，给每个子视图都提这个高度：
+// Card 内部的尾部 Spacer 会吸收差值，底边自然对齐。
+// 比「探针 + PreferenceKey + frame(height:)」少一套状态机，宽度按等分分配。
+struct EqualHeightHStack: Layout {
+    var spacing: CGFloat = 14
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let natural = subviews.map { $0.sizeThatFits(.unspecified) }
+        let h = natural.map(\.height).max() ?? 0
+        let w = natural.map(\.width).reduce(0, +)
+            + spacing * CGFloat(max(subviews.count - 1, 0))
+        return CGSize(width: proposal.width ?? w, height: h)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let h = subviews.map { $0.sizeThatFits(.unspecified).height }.max() ?? 0
+        let count = max(subviews.count, 1)
+        let cw = (bounds.width - spacing * CGFloat(subviews.count - 1)) / CGFloat(count)
+        var x = bounds.minX
+        for s in subviews {
+            s.place(at: CGPoint(x: x, y: bounds.minY), anchor: .topLeading,
+                    proposal: ProposedViewSize(width: cw, height: h))
+            x += cw + spacing
+        }
+    }
+}
+
+// MARK: - 键盘灯效页左右行布局（2026-11-18）
+//
+// 左（键盘灯效卡）与右列（海岸灯 + AP 心跳）底边对齐：
+//   行高 = 两侧自然高度的较大者；
+//   左列提案行高（Card 内部尾部 Spacer 吸收差值，底边对齐）；
+//   右列提案高度 unspecified（永远按内容自然高，左列展开灯效列表变高时不跟随）。
+//   宽度：右列固定 trailingWidth，左列占余下全部。
+//
+// 2026-11-18（二次修正）：量高度不能再用 .unspecified 宽度提案 —— 左列的灯效
+// 网格是 LazyVGrid(自适应列数)，无宽度提案时按「一列竖排」量出离谱的高值：
+// 展开灯效列表后行高被顶到几百 pt，卡片真实内容远没有这么高，Card 底部
+// Spacer 把余量全吃掉 → 卡内下方一大片空白（收起时被 frame(maxHeight:34)
+// 钳住所以看不出来）。现在统一按两侧实际摆放宽度测量，无状态、无回路。
+struct RGBRowLayout: Layout {
+    var trailingWidth: CGFloat = 360
+    var spacing: CGFloat = 14
+
+    /// 行高：两侧各按自己实际会占用的宽度量自然高，取较大者
+    private func rowHeight(_ subviews: Subviews, leftW: CGFloat) -> CGFloat {
+        guard subviews.count == 2 else { return 0 }
+        let leftH = subviews[0].sizeThatFits(
+            ProposedViewSize(width: leftW, height: nil)).height
+        let rightH = subviews[1].sizeThatFits(
+            ProposedViewSize(width: trailingWidth, height: nil)).height
+        return max(leftH, rightH)
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard subviews.count == 2 else { return .zero }
+        let w = proposal.width
+            ?? subviews[0].sizeThatFits(.unspecified).width + trailingWidth + spacing
+        let leftW = max(0, w - trailingWidth - spacing)
+        return CGSize(width: w, height: rowHeight(subviews, leftW: leftW))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        guard subviews.count == 2 else { return }
+        let leftW = bounds.width - trailingWidth - spacing
+        let h = rowHeight(subviews, leftW: leftW)
+        subviews[0].place(at: CGPoint(x: bounds.minX, y: bounds.minY),
+                          proposal: ProposedViewSize(width: leftW, height: h))
+        subviews[1].place(at: CGPoint(x: bounds.maxX - trailingWidth, y: bounds.minY),
+                          proposal: ProposedViewSize(width: trailingWidth, height: nil))
     }
 }

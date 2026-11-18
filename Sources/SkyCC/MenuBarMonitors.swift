@@ -91,6 +91,29 @@ enum MenuBarSegment: String, CaseIterable, Identifiable {
     /// （2026-11-16 用户反馈），换成与语义一致的有效符号名。
     /// 菜单栏拼接条本身按原版 Stats 风格**不放图标**（见 MenuBarMonitorBar），
     /// 这里的符号只出现在「状态栏显示」页与面板明细行。
+    /// 「状态栏显示」页每行的采样来源灰字（2026-11-18 用户要求：填上开关与
+    /// 文字之间的空档，同时标明数字从哪里读的）。
+    var source: String {
+        switch self {
+        case .cpuTemp:   return "SMC · TC0P"
+        case .cpuFreq:   return "MSR · IA32_PERF_STATUS"
+        case .cpuUsage:  return "内核 mach 采样"
+        case .cpuPower:  return "SMC · PCPT"
+        case .cpuFan:    return "EC · 0x0464"
+        case .igpuUsage: return "IOAccelerator"
+        case .igpuVram:  return "IOAccelerator"
+        case .gpuTemp:   return "NVAccel"
+        case .gpuFreq:   return "NVAccel · core_mhz"
+        case .gpuUsage:  return "NVAccel · 5s 均值"
+        case .grUsage:   return "NVAccel · 瞬时"
+        case .gpuPower:  return "NVAccel · power_avg"
+        case .gpuFan:    return "EC · 0x046C"
+        case .gpuVram:   return "NVAccel"
+        case .memUsage:  return "内核 mach 采样"
+        case .netDown, .netUp, .netBoth: return "getifaddrs 差值"
+        }
+    }
+
     var symbol: String {
         switch self {
         case .cpuTemp: return "thermometer.medium"

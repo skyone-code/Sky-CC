@@ -45,11 +45,171 @@ func usage() -> Never {
       sensors                     SMC 传感器快照
       xpc ping                    后台服务健康检查（走 XPC）
       xpc get /api/fan            直接问后台服务取数（等价旧 curl）
+      xpc post /api/fan '{"thermal":2}'
+                                  向后台服务提交操作
       sys [overview|battery|disks|processes|all]
                                   系统信息全量导出（默认 all）
+
+    ── 以下为「快捷指令 / 命令行控制」（全部经 XPC 交后台服务执行）──
+
+      status                      状态速览（散热/充电阈值/开关组）
+      thermal <1|2|3>             散热模式（1性能 2标准 3安静）
+      charge <20-100>             充电阈值（%）
+      kb <on|off>                 键盘灯总开关
+      lightbar <cycle|static|off> 海岸灯
+      apbeat <on|off>             AP 心跳
+      winlock <on|off>            Win 键锁定
+      fnlock <on|off>             Fn 锁
+      gpu <on|off>                独显注入（新启动的 app 生效）
+      volume <0-100>              系统音量
+      mute | unmute               静音 / 取消静音
+      displaysleep                关闭内屏
+
+    手机快捷指令用法：iPhone「快捷指令」→「通过 SSH 运行脚本」连接本机
+    （Mac 需在系统设置开启「远程登录」），执行上面任意一条命令。
     """
     print(text)
     exit(1)
+}
+
+// MARK: - XPC 调用（3.2.2 从 "xpc" 分支提升到顶层：新增控制命令同样要经 XPC
+// 让后台服务执行，mcutil 直写会与 helper 争用 EC 串行通道）
+
+func xpcCall(_ path: String, _ params: [String: Any]?) -> [String: Any] {
+    let sem = DispatchSemaphore(value: 0)
+    var out: [String: Any] = ["ok": false, "error": "no reply"]
+    Task {
+        out = await HelperClient.shared.call(path, params: params, timeout: 15)
+        sem.signal()
+    }
+    _ = sem.wait(timeout: .now() + 20)
+    return out
+}
+
+func xpcPing() -> [String: Any] {
+    let sem = DispatchSemaphore(value: 0)
+    var out: [String: Any] = ["ok": false, "error": "no reply"]
+    Task {
+        out = await HelperClient.shared.health(timeout: 3)
+        sem.signal()
+    }
+    _ = sem.wait(timeout: .now() + 5)
+    return out
+}
+
+// MARK: - 快捷指令 / 命令行控制（3.2.2）
+//
+// 硬件控制命令组，全部经 XPC 交后台 helper 执行（mcutil 直写会争用 EC 串行通道）。
+// 手机快捷指令：iPhone「通过 SSH 运行脚本」→ 连本机 → 执行任意一条；
+// 本机快捷指令：「运行 Shell 脚本」动作调同一条命令。
+
+/// 解析 on/off（大小写不敏感）
+func parseOnOff(_ s: String) -> Bool? {
+    switch s.lowercased() {
+    case "on", "1", "true", "开": return true
+    case "off", "0", "false", "关": return false
+    default: return nil
+    }
+}
+
+/// 快捷指令组：散热/充电阈值/键盘灯/海岸灯/AP 心跳/Win 锁/Fn 锁/独显/音量/关屏
+func runCliControl(_ sub: String, _ rest: [String]) -> Never {
+    func expectArg(_ what: String) -> String {
+        guard let a = rest.first else {
+            printJSON(["ok": false, "error": "缺少参数：\(what)"])
+            exit(1)
+        }
+        return a
+    }
+    let r: [String: Any]
+    switch sub {
+    case "status":
+        let fan = xpcCall("/api/fan", nil)
+        guard fan["ok"] as? Bool == true else { r = fan; break }
+        var out: [String: Any] = ["ok": true]
+        for k in ["thermal_level", "power_level", "benchmark"] {
+            if let v = fan[k] { out[k] = v }
+        }
+        if let c = fan["charge"] as? [String: Any] { out["charge"] = c }
+        if let m = fan["misc"] as? [String: Any] { out["misc"] = m }
+        r = out
+    case "thermal":
+        let a = expectArg("1|2|3")
+        guard let n = Int(a), (1...3).contains(n) else {
+            printJSON(["ok": false, "error": "散热模式取值 1(性能)/2(标准)/3(安静)"])
+            exit(1)
+        }
+        r = xpcCall("/api/fan", ["thermal": n])
+    case "charge":
+        let a = expectArg("20-100")
+        guard let n = Int(a), (20...100).contains(n) else {
+            printJSON(["ok": false, "error": "充电阈值取值 20-100（百分比）"])
+            exit(1)
+        }
+        r = xpcCall("/api/fan", ["charge": n])
+    case "kb":
+        let on = expectArg("on|off")
+        guard let b = parseOnOff(on) else {
+            printJSON(["ok": false, "error": "kb 取值 on|off"])
+            exit(1)
+        }
+        // 开 = 应用存档灯效（helper 侧先置使能再覆盖）；关 = HID 关灯报文 + 存档置 disabled
+        r = b ? xpcCall("/api/rgb/apply", [:]) : xpcCall("/api/rgb", ["mode": "off"])
+    case "lightbar":
+        let m = expectArg("cycle|static|off")
+        guard ["cycle", "static", "off"].contains(m) else {
+            printJSON(["ok": false, "error": "lightbar 取值 cycle|static|off"])
+            exit(1)
+        }
+        r = xpcCall("/api/lightbar", ["mode": m])
+    case "apbeat":
+        let a = expectArg("on|off")
+        guard let b = parseOnOff(a) else {
+            printJSON(["ok": false, "error": "apbeat 取值 on|off"])
+            exit(1)
+        }
+        r = xpcCall("/api/fan", ["ap_present": b])
+    case "winlock":
+        let a = expectArg("on|off")
+        guard let b = parseOnOff(a) else {
+            printJSON(["ok": false, "error": "winlock 取值 on|off"])
+            exit(1)
+        }
+        // 与 Win 键锁定开关同款副作用：EC 会额外抛一次 PWRBTN，可能触发关屏/睡眠
+        r = xpcCall("/api/fan", ["win_lock": b])
+    case "fnlock":
+        let a = expectArg("on|off")
+        guard let b = parseOnOff(a) else {
+            printJSON(["ok": false, "error": "fnlock 取值 on|off"])
+            exit(1)
+        }
+        r = xpcCall("/api/fan", ["fn_lock": b])
+    case "gpu":
+        let a = expectArg("on|off")
+        guard let b = parseOnOff(a) else {
+            printJSON(["ok": false, "error": "gpu 取值 on|off"])
+            exit(1)
+        }
+        r = xpcCall("/api/gpu/mode", ["mode": b ? "dgpu" : "off"])
+    case "volume":
+        let a = expectArg("0-100")
+        guard let n = Int(a), (0...100).contains(n) else {
+            printJSON(["ok": false, "error": "volume 取值 0-100"])
+            exit(1)
+        }
+        r = xpcCall("/api/control", ["action": "volume", "value": n])
+    case "mute":
+        r = xpcCall("/api/control", ["action": "mute"])
+    case "unmute":
+        r = xpcCall("/api/control", ["action": "unmute"])
+    case "displaysleep":
+        r = xpcCall("/api/control", ["action": "display_sleep"])
+    default:
+        usage()
+    }
+    printJSON(r)
+    if r["ok"] as? Bool != true { exit(2) }
+    exit(0)
 }
 
 // --force 只是互斥开关，不参与命令解析
@@ -70,11 +230,17 @@ func helperRunning() -> Bool {
     return flock(fileno(fd), LOCK_SH | LOCK_NB) != 0   // 拿不到共享锁＝别人持有排他锁
 }
 
-if cmd != "xpc", helperRunning(), !CommandLine.arguments.contains("--force") {
+/// 快捷指令组命令：全部经 XPC 交后台服务执行，不与 helper 争用通道
+let CliControlCommand: Set<String> = [
+    "status", "thermal", "charge", "kb", "lightbar", "apbeat",
+    "winlock", "fnlock", "gpu", "volume", "mute", "unmute", "displaysleep",
+]
+
+if cmd != "xpc", !CliControlCommand.contains(cmd), helperRunning(), !CommandLine.arguments.contains("--force") {
     let isWrite = (cmd == "fan" || cmd == "rgb")
     if isWrite {
         fail("后台服务正在运行，它独占 EC/SMC 通道，直写会与其争用。\n"
-             + "  建议改用 app 界面或 HTTP 接口；确需强来加 --force")
+             + "  建议改用 app 界面或 XPC 接口；确需强来加 --force")
     }
     FileHandle.standardError.write(
         Data("提示：后台服务在运行，本次直读会与其争用 EC 通道（排障可忽略）\n".utf8))
@@ -118,26 +284,6 @@ case "xpc":
     //   mcutil xpc ping            健康检查（版本/pid/kext）
     //   mcutil xpc get /api/fan    等价于旧的 curl /api/fan
     guard let sub = rest.first else { usage() }
-    func xpcCall(_ path: String, _ params: [String: Any]?) -> [String: Any] {
-        let sem = DispatchSemaphore(value: 0)
-        var out: [String: Any] = ["ok": false, "error": "no reply"]
-        Task {
-            out = await HelperClient.shared.call(path, params: params, timeout: 15)
-            sem.signal()
-        }
-        _ = sem.wait(timeout: .now() + 20)
-        return out
-    }
-    func xpcPing() -> [String: Any] {
-        let sem = DispatchSemaphore(value: 0)
-        var out: [String: Any] = ["ok": false, "error": "no reply"]
-        Task {
-            out = await HelperClient.shared.health(timeout: 3)
-            sem.signal()
-        }
-        _ = sem.wait(timeout: .now() + 5)
-        return out
-    }
     switch sub {
     case "ping":
         printJSON(xpcPing())
@@ -180,6 +326,15 @@ case "sys":
     default:
         usage()
     }
+
+// MARK: - 快捷指令 / 命令行控制（实验性，走 XPC）
+//
+// 手机快捷指令（iPhone「通过 SSH 运行脚本」→ 连本机 → 执行命令）与本机
+// 快捷指令（「运行 Shell 脚本」动作）共用这一组。
+
+case "status", "thermal", "charge", "kb", "lightbar", "apbeat",
+     "winlock", "fnlock", "gpu", "volume", "mute", "unmute", "displaysleep":
+    runCliControl(cmd, rest)
 
 default:
     usage()

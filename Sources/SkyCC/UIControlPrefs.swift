@@ -29,13 +29,9 @@ enum UIControlPrefs {
         static let perfIndex = "pref.control.perfIndex"    // 0x11/0x22/0x33
         static let benchmark = "pref.control.benchmark"
         static let charge = "pref.control.charge"          // 20…100
-        static let kbBacklight = "pref.control.kbBacklight"
         static let winLock = "pref.control.winLock"
         static let osd = "pref.control.osd"
-        static let silentMode = "pref.control.silentMode"
         static let passiveCooling = "pref.control.passiveCooling"
-        /// caffeinate（不是 EC 状态，但也统一走软件记忆，避免每进页面探一次进程）
-        static let caffeinate = "pref.control.caffeinate"
         // 实验性页
         static let fanMode = "pref.exp.fanMode"            // normal/custom/curve
         static let fanLevel = "pref.exp.fanLevel"          // 0…7
@@ -82,10 +78,8 @@ enum UIControlPrefs {
     /// `/api/fan` 的参数名 → 记忆键（开关类都走这条映射）
     static func prefKey(forFanKey fanKey: String) -> String? {
         switch fanKey {
-        case "keyboard_backlight": return K.kbBacklight
         case "win_lock": return K.winLock
         case "osd": return K.osd
-        case "silent_mode": return K.silentMode
         case "passive_cooling_disabled": return K.passiveCooling
         case "fn_lock": return K.fnLock
         default: return nil
@@ -129,10 +123,8 @@ enum UIControlPrefs {
             func seedBool(_ k: String, _ src: String) {
                 if d.object(forKey: k) == nil, let v = BackendService.bool(misc, src) { d.set(v, forKey: k) }
             }
-            seedBool(K.kbBacklight, "keyboard_backlight")
             seedBool(K.winLock, "win_lock")
             seedBool(K.osd, "osd")
-            seedBool(K.silentMode, "silent_mode")
             seedBool(K.passiveCooling, "passive_cooling_disabled")
             seedBool(K.fnLock, "fn_lock")
         }
@@ -187,10 +179,8 @@ enum UIControlPrefs {
                 changed.append("\(fanKey)=\(cur)")
             }
         }
-        adopt(K.kbBacklight, "keyboard_backlight")
         adopt(K.winLock, "win_lock")
         adopt(K.osd, "osd")
-        adopt(K.silentMode, "silent_mode")
         adopt(K.passiveCooling, "passive_cooling_disabled")
         adopt(K.fnLock, "fn_lock")
         if let cur = BackendService.int(fan, "charge") {
@@ -209,8 +199,8 @@ enum UIControlPrefs {
 
     /// 调试用：把记忆清空，下次启动重新从 EC 播种
     static func resetAll() {
-        for k in [K.thermal, K.perfIndex, K.benchmark, K.charge, K.kbBacklight,
-                  K.winLock, K.osd, K.silentMode, K.passiveCooling,
+        for k in [K.thermal, K.perfIndex, K.benchmark, K.charge,
+                  K.winLock, K.osd, K.passiveCooling,
                   K.fanMode, K.fanLevel, K.fnLock, K.lightbarMode, K.lightbarHex] {
             d.removeObject(forKey: k)
         }

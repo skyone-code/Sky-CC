@@ -620,12 +620,6 @@ struct MenuBarView: View {
                               selection: thermalBinding)
                     .disabled(benchmark)
                     .opacity(benchmark ? 0.5 : 1)
-
-                Toggle(isOn: benchmarkBinding) {
-                    Text("基准模式").font(.system(size: 11))
-                }
-                .toggleStyle(.switch)
-                .controlSize(.mini)
             }
 
             // 系统功耗设置（= 原厂同名卡片：0x7AB 高半字节 0x11/0x22/0x33）
@@ -658,11 +652,21 @@ struct MenuBarView: View {
                         .labelsHidden()
                         .disabled(gpuBusy || gpuUnavailable)
                 }
+                // 2026-11-18（用户要求）：基准模式行挪到显卡状态提示行下方，
+                // 与「默认使用独显」行同构 —— 11.5 号文字 + mini 开关右对齐。
                 Text(gpuStatusText)
                     .font(.system(size: 10.5))
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    Text("基准模式").font(.system(size: 11.5))
+                    Spacer(minLength: 4)
+                    Toggle("", isOn: benchmarkBinding)
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                        .labelsHidden()
+                }
             }
 
             Divider()
@@ -676,7 +680,7 @@ struct MenuBarView: View {
             }
         }
         .padding(14)
-        .frame(width: 280)
+        .frame(width: 220)
         .background(VisualEffectBackground())
         .onAppear {
             syncFromBackend()
@@ -895,6 +899,11 @@ struct RootView: View {
     }
 
     @State private var page: Page = .overview
+    // 最小宽度（2026-11-18 用户定案）：整窗最小 = 1020，**与侧边栏无关** ——
+    // 侧边栏展开时详情列 = 1020 − 侧边栏实际宽（~788），各页卡片必须能压到
+    // 这个宽度（概览双环/电池环已改自适应，灯效页右列 360 之外的左列自适应，
+    // 其余页的网格/文本全部可压缩）。窗口级下限由 Window 场景根部的
+    // frame(minWidth: 1020) 提供，不再做 1020 + 侧边栏的动态 contentMinSize。
     @EnvironmentObject private var backend: BackendService
     // 2026-11-17（性能自查）：**不要**在这里持有 MonitorStore。
     // @EnvironmentObject / @ObservedObject 是「整对象订阅」——只要 store 发出
@@ -911,6 +920,10 @@ struct RootView: View {
             sidebar
         } detail: {
             detailView
+            // 2026-11-18（用户定案）：整窗最小宽 = 1020（含侧边栏），详情列不再
+            // 挂自己的 frame(minWidth:) —— 之前那道框会跟侧边栏列抢宽度，把
+            // 侧边栏挤到 210 下限以下、内容整体溢出裁切。详情列宽度 =
+            // 窗口宽 − 侧边栏实际宽，各页卡片必须能在 ~788 下跟着压缩。
             // 2026-11-14（用户要求）：去掉详情列顶部工具条里的小字页名 ——
             // 每页内容区已有 PageHeader 大标题，重复了。窗口标题仍是「Sky CC」。
         }

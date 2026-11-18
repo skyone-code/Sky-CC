@@ -27,14 +27,30 @@ struct MiscToggleRow: View {
     let sub: String
     @Binding var on: Bool
     let action: () -> Void
+    /// 行内警告（2026-11-18 用户要求）：跟在标题后方、开关之前的琥珀色小字。
+    /// 原来是卡片底部独立警告条，现在内联到对应开关行（目前只有 Win 键锁定用）。
+    var note: String? = nil
     /// 2.8.9：副标题默认隐藏（实验性页放行）
     @Environment(\.hideCardSubs) private var hideCardSubs
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(Theme.txt)
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(title).font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(Theme.txt)
+                    if let note {
+                        HStack(spacing: 4) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.system(size: 10))
+                                .foregroundStyle(Theme.amber)
+                            Text(note)
+                                .font(.system(size: 10.5))
+                                .foregroundStyle(Theme.amber)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
                 // 副标题（寄存器说明）默认不显示；代码保留
                 if !hideCardSubs && !sub.isEmpty {
                     Text(sub).font(.system(size: 11)).foregroundStyle(Theme.dim2)
@@ -180,32 +196,16 @@ struct SystemTweakSection: View {
 
                 MiscToggleRow(title: "Win 键锁定",
                               sub: "0x767 bit0 触发 → 0x768 bit0 回读，状态 ~600ms 才跟上",
-                              on: $winLock) {
+                              on: $winLock,
+                              action: {
                     Task { await applySystem("win_lock", winLock, "Win 键锁定") }
-                }
+                },
+                              note: "拨动本开关会触发睡眠，唤醒的时候点键盘就能打断睡眠。")
                 .kextGated(kextOK)
 
-                // 2026-11-14（用户指定文案）：拨动本开关会触发睡眠，属于 EC 副作用，
-                // 黑屏的时候点点键盘就能打断睡眠。
-                // 成因：EC 响应 0x767 bit0 时会额外抛一次 PWRBTN 固定事件，macOS 直接当
+                // 2026-11-18（用户定稿文案）：警告内联在标题后方，措辞去掉「属于 EC 副作用」。
+                // 成因备注（留档）：EC 响应 0x767 bit0 时会额外抛一次 PWRBTN 固定事件，macOS 直接当
                 // 「电源键」消费 → 关屏 / 睡眠。锁功能本身不受影响（0x768 bit0 回读正常）。
-                HStack(alignment: .top, spacing: 6) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 10))
-                        .foregroundStyle(Theme.amber)
-                        .padding(.top, 1)
-                    Text("拨动本开关会触发睡眠，属于 EC 副作用；黑屏的时候点点键盘就能打断睡眠。")
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(Theme.dim)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 9)
-                .padding(.vertical, 6)
-                .background(Theme.amber.opacity(0.10),
-                            in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .strokeBorder(Theme.amber.opacity(0.32), lineWidth: 1))
 
                 // 2026-11-17（用户要求）：显卡路由段已从本卡拆出，
                 // 独立成卡放「设备控制」页（见 ControlView.swift 的 gpuCard）。

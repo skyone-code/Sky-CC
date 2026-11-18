@@ -221,8 +221,11 @@ struct OverviewView: View {
                 HStack(alignment: .center, spacing: 18) {
                     // 2.7.2：环跟着右列行数走，把卡片高度撑满（用户要求）；
                     // 用 GeometryReader 取高度而不是写死 128，右侧多出「剩余时间」时也会自适应。
+                    // 2026-11-18（最小宽排查）：固定 190 是概览页挤爆的第二元凶 ——
+                    // 改成 130–190 弹性宽，窗口窄时环跟着缩（batteryRing 内部本来
+                    // 就按 min(宽,高) 取直径，无需改）。
                     batteryRing(pct)
-                        .frame(width: 190)
+                        .frame(minWidth: 130, maxWidth: 190)
                     VStack(spacing: 0) {
                         TightRow(label: "电压", value: String(format: "%.2f V",
                                  Double(BackendService.int(store.battery, "voltage_mv") ?? 0) / 1000))
@@ -241,6 +244,8 @@ struct OverviewView: View {
                             TightRow(label: "剩余时间", value: Fmt.minutes(m))
                         }
                     }
+                    // 数值列先按自然宽排（TightRow 的值不许被挤截断），余量归环
+                    .layoutPriority(1)
                 }
             }
         }

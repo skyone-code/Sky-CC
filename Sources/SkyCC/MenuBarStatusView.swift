@@ -15,46 +15,78 @@ struct MenuBarStatusView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
-                PageHeader(title: "状态栏显示", sub: "菜单栏监控项 · 逐项开关 · 按盘显示")
-                menuBarCard
+                PageHeader(title: "状态栏显示", sub: "状态栏监控项 · 逐项开关 · 按盘显示")
+                // 2026-11-18（用户要求，三次定稿）：拆卡重排为**两列式**，列等高 ——
+                //   左列两张：CPU 监控 / 内存与硬盘（内存和硬盘同卡，用户定案）
+                //   右列两张：GPU 监控 / 网速
+                // 两列叠起来的总高相等（底边对齐）：EqualHeightHStack 量两列自然高
+                // 取较大者，矮的一列被撑高时列内 Card 尾部 Spacer 吸收差值。
+                // 不是逐行等高 —— 只看两列总高。
+                EqualHeightHStack(spacing: 14) {
+                    VStack(alignment: .leading, spacing: 14) {
+                        cpuCard
+                        memDiskCard
+                    }
+                    VStack(alignment: .leading, spacing: 14) {
+                        gpuCard
+                        netCard
+                    }
+                }
                 previewCard
             }
             .padding(22)
         }
     }
 
-    /// 监控项逐组开关
-    private var menuBarCard: some View {
-        Card(title: "菜单栏监控项") {
+    /// CPU 监控卡。note = 采样来源（2026-11-18 用户要求：填上中间空档，
+    // 也让每项到底从哪里读的一目了然）
+    private var cpuCard: some View {
+        Card {
             VStack(alignment: .leading, spacing: 8) {
-                // CPU 组
-                groupHeader(SegmentGroup.cpu)
+                sectionLabel("CPU 监控")
                 ForEach(MenuBarMonitors.segments(in: .cpu)) { seg in
                     MenuBarToggleRow(icon: seg.symbol,
                                      title: seg.title,
+                                     note: seg.source,
                                      key: seg.defaultsKey,
                                      defaultOn: seg.defaultEnabled)
                 }
-                divider
-                // GPU 组
-                groupHeader(SegmentGroup.gpu)
+            }
+        }
+    }
+
+    /// GPU 监控卡（无卡标题，小节标题样式）
+    private var gpuCard: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 8) {
+                sectionLabel("GPU 监控")
                 ForEach(MenuBarMonitors.segments(in: .gpu)) { seg in
                     MenuBarToggleRow(icon: seg.symbol,
                                      title: seg.title,
+                                     note: seg.source,
                                      key: seg.defaultsKey,
                                      defaultOn: seg.defaultEnabled)
                 }
-                divider
-                // 内存组
+            }
+        }
+    }
+
+    /// 内存与硬盘卡（2026-11-18 用户定案：两项同卡不拆开；无卡标题，只留内部小节标题）
+    private var memDiskCard: some View {
+        // 无卡标题（2026-11-18 用户定案）：内部「内存 / 硬盘」小节标题即可
+        Card {
+            VStack(alignment: .leading, spacing: 8) {
+                // 内存
                 groupHeader(SegmentGroup.mem)
                 ForEach(MenuBarMonitors.segments(in: .mem)) { seg in
                     MenuBarToggleRow(icon: seg.symbol,
                                      title: seg.title,
+                                     note: seg.source,
                                      key: seg.defaultsKey,
                                      defaultOn: seg.defaultEnabled)
                 }
                 divider
-                // 硬盘组（动态：overview.smart 里的每块盘一个开关，显示该盘温度）
+                // 硬盘（动态：overview.smart 里的每块盘一个开关，显示该盘温度）
                 groupHeader(SegmentGroup.disk)
                 if diskRows.isEmpty {
                     Text("正在读取磁盘…")
@@ -64,25 +96,27 @@ struct MenuBarStatusView: View {
                     ForEach(diskRows, id: \.bsd) { d in
                         MenuBarToggleRow(icon: "internaldrive",
                                          title: d.model.isEmpty ? d.bsd : "\(d.bsd) · \(d.model)",
-                                         note: "温度",
+                                         note: "SMART · 温度",
                                          key: MenuBarMonitors.diskKey(d.bsd),
                                          defaultOn: false)
                     }
                 }
-                divider
-                // 网速组
-                groupHeader(SegmentGroup.net)
+            }
+        }
+    }
+
+    /// 网速卡（无卡标题，小节标题样式）
+    private var netCard: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 8) {
+                sectionLabel("网速")
                 ForEach(MenuBarMonitors.segments(in: .net)) { seg in
                     MenuBarToggleRow(icon: seg.symbol,
                                      title: seg.title,
+                                     note: seg.source,
                                      key: seg.defaultsKey,
                                      defaultOn: seg.defaultEnabled)
                 }
-
-                Text("开关实时生效。监控数字拼接在 S 飘带右侧的独立状态项里；全部关掉时该状态项隐藏。取不到的读数显示「—」，不显示假数字。")
-                    .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
-                    .padding(.top, 2)
-                    .cardNote()
             }
         }
     }
@@ -92,7 +126,12 @@ struct MenuBarStatusView: View {
     }
 
     private func groupHeader(_ g: SegmentGroup) -> some View {
-        Text(g.title)
+        sectionLabel(g.title)
+    }
+
+    /// 小节标题（2026-11-18 用户定案：全部卡都用这种小标题，不再用卡大标题）
+    private func sectionLabel(_ text: String) -> some View {
+        Text(text)
             .font(.system(size: 10, weight: .semibold))
             .foregroundStyle(Theme.dim)
             .tracking(1.2)

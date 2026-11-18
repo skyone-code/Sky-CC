@@ -51,7 +51,7 @@ PROJ="$BUILD/app-resources"
 [ -d "$PROJ" ] || { echo "错误：找不到资源目录 $PROJ" >&2; exit 1; }
 
 # 版本号（唯一来源：脚本注入 Info.plist 与 helper 的 BuildVersion.swift）
-VERSION="3.2.0"
+VERSION="3.2.2"
 # 显示版本（侧边栏/设置页文案）：纯数字版本（2026-11-18 用户要求：全 app 去掉
 # 版本号里的机型后缀字样；PKGBASE 文件名里的 LAPQC71x 保留仅作分发区分）
 DISPLAY_VERSION="$VERSION"

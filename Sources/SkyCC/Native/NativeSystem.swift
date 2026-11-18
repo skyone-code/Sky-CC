@@ -1479,22 +1479,4 @@ enum NativeSystem {
         return rows
     }
 
-    // MARK: HID 设备列表（对应 Python hid_devices()）
-
-    static func hidDevices() -> [[String: Any]] {
-        NativeHID.findDevices().map { d in
-            var out: [String: Any] = [
-                "product": d.product ?? NSNull(),
-                "manufacturer": d.manufacturer ?? NSNull(),
-            ]
-            out["vendor_id"] = d.vendorID.map { String(format: "%#06x", $0) } ?? NSNull()
-            out["product_id"] = d.productID.map { String(format: "%#06x", $0) } ?? NSNull()
-            out["usage_page"] = d.usagePage.map { String(format: "%#06x", $0) } ?? NSNull()
-            out["usage"] = d.usage ?? NSNull()
-            out["feature_size"] = d.maxFeatureReportSize ?? NSNull()
-            out["output_size"] = d.maxOutputReportSize ?? NSNull()
-            out["input_size"] = d.maxInputReportSize ?? NSNull()
-            return out
-        }
-    }
 }

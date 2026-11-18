@@ -25,13 +25,21 @@ struct FanRPMCard: View {
             } else {
                 // 2.7.2：环缩到 158pt 固定直径。上一版铺满整张卡（环比卡片还抢眼）
                 // 被用户否掉——现在环只当背景仪表，尺度回落到「跟正文同量级」。
-                HStack(spacing: 34) {
-                    fanBig("CPU", rpm: BackendService.int(store.live, "rpm_cpu") ?? 0,
-                           temp: BackendService.int(store.live, "temp_cpu") ?? 0)
-                    fanBig("dGPU", rpm: BackendService.int(store.live, "rpm_gpu") ?? 0,
-                           temp: BackendService.int(store.live, "temp_gpu") ?? 0)
+                // 2026-11-18（最小宽排查）：双环 158×2 + 34 = 350pt 固定宽，是全 app
+                // 最宽的不可压缩内容 —— 概览页在「窗口最小宽 + 侧边栏」时被挤爆的
+                // 元凶。改为按卡片实际宽度缩放环径（上限仍 158，下限 120）。
+                GeometryReader { geo in
+                    let side = max(120, min(158, (geo.size.width - 34) / 2))
+                    HStack(spacing: 34) {
+                        fanBig("CPU", rpm: BackendService.int(store.live, "rpm_cpu") ?? 0,
+                               temp: BackendService.int(store.live, "temp_cpu") ?? 0,
+                               side: side)
+                        fanBig("dGPU", rpm: BackendService.int(store.live, "rpm_gpu") ?? 0,
+                               temp: BackendService.int(store.live, "temp_gpu") ?? 0,
+                               side: side)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
                 }
-                .frame(maxWidth: .infinity)
                 .padding(.vertical, 2)
             }
         }
@@ -44,8 +52,7 @@ struct FanRPMCard: View {
     /// 视线全被环和百分比抓走，跟「风扇看的是转速」这件事相反。
     /// 风扇环（2.8.15）：2.7.2 起环是「占空比」背景，现在 PWM 不再采集，
     /// 环退回纯装饰底环，主角只有转速 + 温度。
-    private func fanBig(_ name: String, rpm: Int, temp: Int) -> some View {
-        let side: CGFloat = 158
+    private func fanBig(_ name: String, rpm: Int, temp: Int, side: CGFloat = 158) -> some View {
         let lw: CGFloat = 9.5
         return ZStack {
             Circle().stroke(Theme.barBg, lineWidth: lw)
