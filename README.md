@@ -85,8 +85,6 @@ CPU 全系 i7-9750H + HM370；机型按出厂独显 device-id 自动判定子型
 
 本项目整体以 **GPL-2.0** 发布。
 
-其中 **EC 内核扩展 SkyCCEC.kext** 基于开源项目 [TongfangEnhancer](https://github.com/kirainmoe/TongfangEnhancer)（© 2019 kirainmoe，GPL-2.0）构建，在此致谢；其余组件为本项目原创。
-
 ## ⚠️ 声明
 
 本程序为社区驱动项目，与 **英特尔（Intel）** 官方无关，也不获得其任何支持或背书。
