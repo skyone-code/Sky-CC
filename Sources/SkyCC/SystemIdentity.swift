@@ -18,6 +18,62 @@
 import SwiftUI
 import AppKit
 
+// MARK: - 真实机型显示名（hero 条 / 机器卡 / 设置页版本卡共用）
+
+enum RealModel {
+    /// 真实机型优先（2026-11-18 用户要求）：
+    /// SkyCCEC.kext 只匹配 ACPI PNP0C14（LAPQC71x 家族的 EC/WMI 平台），驱动实例
+    /// 存在即说明这台机器是 Intel NUC 9 Extreme Laptop Kit——SMBIOS 的 hw.model
+    /// 在黑果上是仿冒的（会假报 MacBook Pro），不可信。
+    /// 检测不到 EC 平台（其他机器）再回退到 SMBIOS 市场名。
+    /// 全称按 Intel ARK 官方命名：「Intel® NUC 9 Extreme Laptop Kit - LAPQC71D」。
+    /// @MainActor：BackendService.string 等取值助手是 MainActor 隔离的，
+    /// 调用点全部在视图层（hero 条 / 机器卡 / 设置页版本卡），跟着隔离即可。
+    @MainActor
+    static func displayName(overview: [String: Any]) -> String {
+        if FanControl.kextLoaded() {
+            let base = "Intel® NUC 9 Extreme Laptop Kit"
+            // 子型号：四个型号 CPU 一致，只能看出厂独显（A=1660Ti B=2070MQ C=2060 D=2070SMQ）
+            let dgpu = (BackendService.array(overview, "gpus") as? [[String: Any]] ?? [])
+                .first { (BackendService.string($0, "bus") ?? "") == "PCIe" } ?? [:]
+            let name = BackendService.string(dgpu, "name") ?? ""
+            let devID = BackendService.dict(dgpu, "detail")
+                .flatMap { BackendService.string($0, "Device ID") } ?? ""
+            if let letter = Lapqc71Variant.letter(dgpuName: name, dgpuDeviceID: devID) {
+                return "\(base) - LAPQC71\(letter)"
+            }
+            return "\(base) - LAPQC71x"
+        }
+        let model = BackendService.string(overview, "model") ?? "未知机型"
+        return MacModelInfo.marketingName(model) ?? model
+    }
+}
+
+// MARK: - LAPQC71x 子型号识别（2026-11-18 用户要求）
+
+/// Intel NUC 9 Extreme Laptop Kit 家族只有 LAPQC71A/B/C/D 四个型号（Intel ARK，
+/// 无 E）。四个型号 CPU 全部相同（i7-9750H + HM370 + UHD 630，黑果 SMBIOS 又是
+/// 仿冒的，都拿不到），**唯一出厂差异是独显**：
+///   LAPQC71A = GeForce GTX 1660 Ti            （TU116, device-id 0x2182）
+///   LAPQC71B = RTX 2070 with Max-Q            （TU106, device-id 0x1F11）
+///   LAPQC71C = RTX 2060                       （TU106, device-id 0x1F51）
+///   LAPQC71D = RTX 2070 Super with Max-Q      （TU104, device-id 0x1E34）
+/// 判定顺序：卡名匹配优先（装好 NVIDIA 驱动后 IOKit model 是完整卡名），
+/// device-id 兜底（驱动没装上、name 是 unknown 时仍能认出）；
+/// 两样都对不上（纯核显 / 独显被卸载 / 换了非出厂卡）返回 nil → 显示 LAPQC71x。
+private enum Lapqc71Variant {
+    static func letter(dgpuName: String, dgpuDeviceID: String) -> String? {
+        let n = dgpuName.lowercased()
+        let id = dgpuDeviceID.lowercased()
+        // 注意顺序：必须先比 "2070 super" 再比 "2070"，否则 D 会被当成 B
+        if n.contains("2070 super") || id == "0x1e34" { return "D" }
+        if n.contains("2070")        || id == "0x1f11" { return "B" }
+        if n.contains("2060")        || id == "0x1f51" { return "C" }
+        if n.contains("1660")        || id == "0x2182" { return "A" }
+        return nil
+    }
+}
+
 // MARK: - 性能页顶部的 hero 条（原概览页 hero 的精简版）
 
 struct MonitorHeroBar: View {
@@ -88,8 +144,7 @@ struct MonitorHeroBar: View {
     // MARK: 取值（与原概览页同源）
 
     private var machineName: String {
-        let model = BackendService.string(store.overview, "model") ?? "未知机型"
-        return MacModelInfo.marketingName(model) ?? model
+        RealModel.displayName(overview: store.overview)
     }
 
     private var modelID: String {
@@ -207,8 +262,7 @@ struct SystemIdentitySection: View {
     // MARK: 取值
 
     private var machineName: String {
-        let model = BackendService.string(store.overview, "model") ?? "未知机型"
-        return MacModelInfo.marketingName(model) ?? model
+        RealModel.displayName(overview: store.overview)
     }
 
     private var modelID: String {

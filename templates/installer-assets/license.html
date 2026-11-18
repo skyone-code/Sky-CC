@@ -1,0 +1,40 @@
+<html>
+<head><meta charset="utf-8">
+<style>
+    body { font-family: -apple-system, "PingFang SC", sans-serif;
+           font-size: 13px; margin: 0; padding: 0; }
+    h1   { font-size: 20px; font-weight: 700; margin: 0 0 14px 0; }
+    h2   { font-size: 14px; font-weight: 600; margin: 14px 0 4px 0; }
+    .mono { font-family: "SF Mono", Menlo, monospace; font-size: 12px; }
+</style></head>
+<body>
+<h1>软件许可与开源组件声明</h1>
+
+<p>Sky CC（主程序、后台组件与安装器）仅供配套机型内部使用，未经许可不得再分发。
+本页声明其中用到的第三方开源组件及其许可条款。</p>
+
+<h2>GNU General Public License v2.0 组件</h2>
+
+<p><b>TongfangEnhancer</b> — Copyright (C) 2019 kirainmoe (Kai Ren)<br>
+项目地址：<a href="https://github.com/kirainmoe/TongfangEnhancer">github.com/kirainmoe/TongfangEnhancer</a></p>
+
+<p>SkyCCEC.kext（内核扩展，负责 EC / WMI 通道）的通信协议基于
+TongfangEnhancer 项目还原并重新实现：WMI 方法封装（_WDG 解析、WMBC 事务）、
+EC 邮箱读写与风扇档位寄存器均源自该项目的公开源码与接口约定。</p>
+
+<p>依照 GNU General Public License 第 2 版（GPL-2.0）的要求，该内核扩展的
+实现源码已随本项目一并提供（仓库 <span class="mono">Sources/ECDriver/</span>
+目录），任何人可依据 GPL-2.0 条款获取、修改与再分发；本程序不提供任何担保。
+GPL-2.0 协议全文见
+<a href="https://www.gnu.org/licenses/old-licenses/gpl-2.0.html">gnu.org/licenses/old-licenses/gpl-2.0.html</a>。</p>
+
+<h2>其他说明</h2>
+
+<p>其余组成部分（SwiftUI 主程序、硬件后端、命令行助手与安装器视觉素材）
+为本项目原创，不基于第三方开源代码。</p>
+
+<p>本工具为社区作品，与英特尔（Intel）官方无关，亦未获得任何官方认可；
+修改内核扩展与电源管理参数存在一定风险，安装即表示你已了解上述内容
+并自行承担使用后果。</p>
+</body>
+</html>

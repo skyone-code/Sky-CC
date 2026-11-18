@@ -4,7 +4,7 @@
 //
 //  移植自 Vela-X（Xelon233/Vela-X，GPLv3）NvidiaUpdate.swift / DriverInstaller，
 //  适配本项目（LAPQC71x）的差异：
-//    · 版本源不是 NullMoth 上游，而是自维护 fork skyone213/nvidia-macos-driver-LAPQC71
+//    · 版本源不是 NullMoth 上游，而是自维护 fork skyone-code/nvidia-macos-driver-LAPQC71
 //      （release/2.9-telemetry 线，含 NVRMFB phantom HDMI 热插拔修复；
 //       上游 v3.0 会覆盖掉这套自建二进制，所以更新以 fork 为准）。
 //    · 安装包不是上游的 nullmoth-nvidia-<tag>.tar.gz + install.sh，
@@ -94,7 +94,7 @@ enum NvidiaUpdate {
     /// 的 v3.0 是「官方二进制」，一键装它会覆盖自建修复，所以不作为更新源。
     /// 仓库名必须用改名后的全名 LAPQC71：旧名 nvidia-macos-driver 会被 GitHub
     /// 301 重定向到新名，而检测只拦第一跳，拿到 301 就直接报错。
-    static let repo = "skyone213/nvidia-macos-driver-LAPQC71"
+    static let repo = "skyone-code/nvidia-macos-driver-LAPQC71"
     static let releasesURL = "https://github.com/\(repo)/releases"
     private static let latestURL = "https://github.com/\(repo)/releases/latest"
     private static let apiURL = "https://api.github.com/repos/\(repo)/releases/latest"

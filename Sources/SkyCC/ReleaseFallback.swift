@@ -29,7 +29,7 @@ enum ReleaseFallback {
     // MARK: - 静态 latest.json 通道（2026-11-17 新增，最优先）
     //
     // 为什么加：两条 API 通道都可能整体不可用 ——
-    //   · GitHub `skyone213/Sky-CC` 是私有仓，账号又在申诉暂停，匿名请求恒 404；
+    //   · GitHub 匿名 API 未登录配额 60 次/小时/出口 IP，共享出口下容易 403；
     //   · Gitee 未认证 API 按出口 IP 限流，实测连公开仓都返回 403 Rate Limit Exceeded。
     // 结果就是「检查更新」永远失败，日志里只有一句 404。
     // 对策：仓库 main 分支放一个 latest.json，走 raw 直链（不是 API，不受限流），
@@ -37,14 +37,22 @@ enum ReleaseFallback {
     // 文件维护：每次发版把 tag/pkg_url/size/sha256 改成新包的（sha256 用 shasum -a 256 取）。
     static let staticLatestURL = "https://gitee.com/skyone021396/Sky-CC/raw/main/latest.json"
 
-    /// latest.json → GitHub release 同形状（tag_name / assets[]），AppUpdater 不用改解析
+    /// latest.json → GitHub release 同形状（tag_name / assets[]），AppUpdater 不用改解析。
+    /// 2026-11-18：优先取 dmg_url（自研安装器），没有才回落 pkg_url。
     static func normalizeStatic(_ obj: [String: Any]) -> [String: Any]? {
         let rawTag = (obj["tag"] as? String) ?? (obj["version"] as? String)
-        guard let tag = rawTag?.trimmingCharacters(in: .whitespaces), !tag.isEmpty,
-              let pkgURL = obj["pkg_url"] as? String, !pkgURL.isEmpty else { return nil }
+        guard let tag = rawTag?.trimmingCharacters(in: .whitespaces), !tag.isEmpty else { return nil }
+        let dmgURL = (obj["dmg_url"] as? String) ?? ""
+        let pkgURL = (obj["pkg_url"] as? String) ?? ""
+        let useDMG = !dmgURL.isEmpty
+        let url = useDMG ? dmgURL : pkgURL
+        guard !url.isEmpty else { return nil }
+        let name = useDMG
+            ? ((obj["dmg_name"] as? String) ?? "Sky CC-\(tag)-LAPQC71x.dmg")
+            : ((obj["pkg_name"] as? String) ?? "SkyCC-\(tag).pkg")
         var asset: [String: Any] = [
-            "name": (obj["pkg_name"] as? String) ?? "SkyCC-\(tag).pkg",
-            "browser_download_url": pkgURL,
+            "name": name,
+            "browser_download_url": url,
         ]
         if let n = obj["size"] as? NSNumber { asset["size"] = n.intValue }
         var dict: [String: Any] = ["tag_name": tag, "assets": [asset]]

@@ -86,7 +86,7 @@ struct SystemTweakSection: View {
     // 那份 misc 由 /api/fan 生成，非 fresh 路径吃的是 24 小时缓存（NativeAPI.fanState
     // 明确写了「非 fresh 路径不主动读 EC」），而 Fn+Esc 是硬件事件、不会让缓存失效。
     // 结果就是用户按了快捷键、功能真的切了，开关却纹丝不动 —— 也就是「两边状态没绑定」。
-    // 现在改读专用端点 /api/fnlock（每次现读 0x074E / 0x07A4，~130 ms），
+    // 现在改读独立端点 /api/fnlock（每次现读 0x074E / 0x07A4，~130 ms），
     // 页面可见时 1.2 秒轮询一次，硬件怎么切、开关就怎么跟。
     @State private var fnLock: Bool = false
     /// 上次自己写 Fn 锁的时间（写入后 1.6 秒内不让轮询覆盖，避开 EC 过渡态）
@@ -232,7 +232,7 @@ struct SystemTweakSection: View {
             }
         }
         // Fn 锁跟随 Fn+Esc（2026-11-17 用户要求「两边状态必须一致」）：
-        // 快捷键是纯硬件事件、没有通知源，只能轮询专用端点。
+        // 快捷键是纯硬件事件、没有通知源，只能轮询独立端点。
         // 视图消失时 .task 自动取消，不会在别的页面白读 EC。
         //
         // 2026-11-17（CPU 自查）：两处收紧 ——

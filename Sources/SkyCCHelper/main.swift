@@ -83,7 +83,7 @@ final class HelperService: NSObject, MCHelperProtocol {
                 reply: @escaping ([String: Any]) -> Void) {
         // 生命周期动作在 helper 本地处理，不进 NativeAPI（那是硬件/业务路由）
         if path == "/api/helper/shutdown" {
-            // 升级 / 手动重启专用：**必须非零退出**。plist 的 KeepAlive 是
+            // 升级 / 手动重启路径：**必须非零退出**。plist 的 KeepAlive 是
             // SuccessfulExit=false —— 非零才会被 launchd 用新二进制拉起来；
             // 写成 exit(0) 会变成「请求重启结果彻底没进程」。
             hlog("收到 shutdown 请求，退出以便 launchd 拉起新版本")
@@ -94,7 +94,7 @@ final class HelperService: NSObject, MCHelperProtocol {
             }
             return
         }
-        // 「退出控制台」专用（2026-11-13 用户要求）：把机器完整交还，然后正常退出。
+        // 「退出控制台」流程（2026-11-13 用户要求）：把机器完整交还，然后正常退出。
         //   ① 停曲线 / 交还风扇档位 —— helper 一走就没人守散热了，不能留着手动档位；
         //   ② 清 0x741 bit0 —— 原厂语义「退出时清 0」，键盘背光回到固件空闲熄灯策略；
         //   ③ exit(0) —— SuccessfulExit=false 下 launchd **不会**再拉起。

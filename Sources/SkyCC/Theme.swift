@@ -67,10 +67,88 @@ struct PageBackgroundModifier: ViewModifier {
                 }
                 .ignoresSafeArea()
                 skin.bgColor.opacity(maskOpacity).ignoresSafeArea()
+            } else if skin.isGlassActive {
+                // 玻璃皮肤（2026-11-18 新增）：
+                //   底层 = NSVisualEffectView（behindWindow 模糊，透出窗口后面的桌面，
+                //   配合 applyGlassWindowTransparency 把窗口改成透明）；
+                //   上层 = 品牌染色渐变（半透明），把玻璃染成 Sky CC 的蓝紫调。
+                GlassVibrancyView().ignoresSafeArea()
+                glassGradient(for: colorScheme).ignoresSafeArea()
             } else {
                 skin.bgColor.ignoresSafeArea()
             }
             content
+        }
+        // 窗口透明度随皮肤切换（玻璃需要窗口本体透明，见下）
+        // 注：customImage 是 NSImage（非 Equatable），onChange 用 isCustomImage 这个
+        // Bool 标志代替 —— skin 是 @EnvironmentObject，任何变更都会触发 body 重算。
+        .onAppear { applyGlassWindowTransparency(skin) }
+        .onChange(of: skin.preset) { _, _ in applyGlassWindowTransparency(skin) }
+        .onChange(of: skin.isCustomImage) { _, _ in applyGlassWindowTransparency(skin) }
+    }
+
+    /// 玻璃染色渐变：浅色 = 蓝→淡紫→薄荷的柔和三段；深色 = 深空蓝→暗紫。
+    /// 只做低饱和染色，避免喧宾夺主；真正的质感来自底层的窗口 vibrancy。
+    private func glassGradient(for scheme: ColorScheme) -> LinearGradient {
+        LinearGradient(
+            colors: scheme == .light
+                ? [Color(hex: 0xdceaff).opacity(0.66), Color(hex: 0xe9e2ff).opacity(0.60),
+                   Color(hex: 0xdff5ec).opacity(0.66)]
+                : [Color(hex: 0x1c2b52).opacity(0.58), Color(hex: 0x2a1e4d).opacity(0.55),
+                   Color(hex: 0x12333a).opacity(0.58)],
+            startPoint: .topLeading, endPoint: .bottomTrailing)
+    }
+
+    /// 窗口透明开关（2026-11-18 第三版，用户定案「两边标题栏模式必须写一样」）。
+    /// 旧实现玻璃开才插 fullSizeContentView、关就拔掉 —— 两种状态标题栏结构不同
+    /// （系统标题栏 ⇄ 全幅内容），开关玻璃时标题栏跳变。现在统一成：
+    ///   · fullSizeContentView + titlebarAppearsTransparent **恒定**，两种状态
+    ///     同一结构，页面背景都铺到标题栏底下（title 文字与红绿灯照常显示）；
+    ///   · 玻璃只切「窗口本体透明与否」，标题栏结构永不切换。
+    /// 匹配谓词与 AppPolicy.isMainWindow 同款（2026-11-18 修玻璃不生效：
+    /// SwiftUI 的 Window(id: "main") **不会**把 id 写进 NSWindow.identifier，
+    /// 旧谓词靠 identifier / 宽度 ≥1020 都不可靠 —— 用户缩窗后彻底失效）。
+    private func applyGlassWindowTransparency(_ skin: SkinCenter) {
+        GlassWindowStyle.syncAll(skin.isGlassActive)
+    }
+}
+
+// MARK: - 玻璃窗口样式（两态同模，见 PageBackgroundModifier 注释）
+enum GlassWindowStyle {
+    private static func isTarget(_ w: NSWindow) -> Bool {
+        !(w is NSPanel) && w.styleMask.contains(.titled)
+            && w.frame.width > 400 && w.identifier != .init("skycc.about")
+    }
+
+    /// 单窗配置：标题栏模式恒定，只按玻璃态切窗口本体透明度。
+    static func apply(_ glassOn: Bool, to window: NSWindow) {
+        if !window.styleMask.contains(.fullSizeContentView) {
+            window.styleMask.insert(.fullSizeContentView)
+        }
+        window.titlebarAppearsTransparent = true
+        if glassOn {
+            window.isOpaque = false
+            window.backgroundColor = .clear
+        } else {
+            window.isOpaque = true
+            window.backgroundColor = .windowBackgroundColor
+        }
+    }
+
+    static func syncAll(_ glassOn: Bool, attempt: Int = 0) {
+        var matched = false
+        for w in NSApp.windows where isTarget(w) {
+            apply(glassOn, to: w)
+            matched = true
+        }
+        // 启动竞态兜底（2026-11-18 用户反馈「玻璃开着重启 app，标题栏没被盖住」）：
+        // onAppear 那一拍 SwiftUI Window 可能还没进 NSApp.windows，匹配不到且
+        // 之后没有 onChange 就再也不补。有限次重试（0.1s × 20 = 2s 上限），
+        // 命中即停；apply 幂等，重复涂无副作用。
+        if !matched && attempt < 20 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                syncAll(glassOn, attempt: attempt + 1)
+            }
         }
     }
 }
@@ -78,6 +156,22 @@ struct PageBackgroundModifier: ViewModifier {
 extension View {
     /// 页面背景：预设纯色或自定义图片 + 蒙层（皮肤功能入口，见 PageBackgroundModifier）
     func pageBackground() -> some View { modifier(PageBackgroundModifier()) }
+}
+
+// MARK: - 玻璃底座（2026-11-18 玻璃皮肤）
+//
+// NSVisualEffectView（material = underWindowBackground, blending = behindWindow）：
+// 模糊的是**窗口后面**的桌面 / 其他窗口 —— 真玻璃。前提是窗口本体透明
+// （PageBackgroundModifier.applyGlassWindowTransparency 负责开/关）。
+struct GlassVibrancyView: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let v = NSVisualEffectView()
+        v.material = .underWindowBackground
+        v.blendingMode = .behindWindow
+        v.state = .active
+        return v
+    }
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
 }
 
 // MARK: - 侧边栏背景（2026-11-15）
@@ -128,22 +222,43 @@ enum Theme {
     // 用户反馈浅色下卡片、胶囊、侧边栏透明度不够。
     // panel2 / barBg 是**叠在卡片内**的二级表面：必须比卡片那层更透，否则叠成实色。
     // 用 computed var + 外观动态提供器：所有 fill/background(Theme.panel*) 调用点一次性生效。
-    static var panel: Color { surfaceSkin(light: 0xffffff, dark: 0x2a2b2e, alphaLight: 0.62, alphaDark: 0.72) } // 卡片
-    static var panel2: Color { surfaceSkin(light: 0xeef0f4, dark: 0x34353a, alphaLight: 0.28, alphaDark: 0.38) } // 卡片内磁贴 / 控件底
-    static var barBg: Color { surfaceSkin(light: 0xe6e9ee, dark: 0x3a3b40, alphaLight: 0.35, alphaDark: 0.45) }  // 进度条底
+    //
+    // 2026-11-18（极限优化）：这三个是全工程最高频的颜色访问（每张卡 body 每拍
+    // 都要读，一页 6~8 张卡 × 每秒），原先 computed var 每次访问都新建 NSColor
+    // + dynamicProvider 闭包。按「皮肤态」（预设 + 是否自定义图）缓存实例，
+    // 皮肤不变时零分配；玻璃态是前两者的派生值，键已覆盖。
+    private static var surfaceCache: [String: Color] = [:]
+    static var panel: Color { surfaceSkin("panel", light: 0xffffff, dark: 0x2a2b2e, alphaLight: 0.62, alphaDark: 0.72) } // 卡片
+    static var panel2: Color { surfaceSkin("panel2", light: 0xeef0f4, dark: 0x34353a, alphaLight: 0.28, alphaDark: 0.38) } // 卡片内磁贴 / 控件底
+    static var barBg: Color { surfaceSkin("barBg", light: 0xe6e9ee, dark: 0x3a3b40, alphaLight: 0.35, alphaDark: 0.45) }  // 进度条底
     static let line = Theme.dyn(light: 0xe0e3e9, dark: 0x3e3f44)      // 描边
 
-    /// 表面色的皮肤 + 外观开关：默认皮肤返实色；否则按当前外观给不同透明度
-    /// （透明度也要随外观切换，所以不能在 base 上简单 .opacity —— 包一层动态提供器）
-    private static func surfaceSkin(light: UInt32, dark: UInt32,
+    /// 表面色的皮肤 + 外观开关（带缓存，见上面 panel 注释）
+    private static func surfaceSkin(_ id: String, light: UInt32, dark: UInt32,
                                     alphaLight: Double, alphaDark: Double) -> Color {
         let skin = SkinCenter.shared
-        if skin.preset == .ink && !skin.isCustomImage { return Theme.dyn(light: light, dark: dark) }
-        return Color(nsColor: NSColor(name: nil, dynamicProvider: { appearance in
-            let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-            return NSColor(hex: isDark ? dark : light)
-                .withAlphaComponent(isDark ? alphaDark : alphaLight)
-        }))
+        // 缓存键：皮肤预设 + 是否自定义图 —— 玻璃态由这两者派生（isGlassActive），键已覆盖
+        let key = "\(id)|\(skin.preset)|\(skin.isCustomImage)"
+        if let c = surfaceCache[key] { return c }
+        var color: Color
+        if skin.preset == .ink && !skin.isCustomImage {
+            color = Theme.dyn(light: light, dark: dark)
+        } else {
+            let aL: Double, aD: Double
+            if skin.isGlassActive {
+                aL = alphaLight * 0.72   // 如 panel 0.62 → 0.45
+                aD = alphaDark * 0.76    // 如 panel 0.72 → 0.55
+            } else {
+                aL = alphaLight; aD = alphaDark
+            }
+            color = Color(nsColor: NSColor(name: nil, dynamicProvider: { appearance in
+                let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+                return NSColor(hex: isDark ? dark : light)
+                    .withAlphaComponent(isDark ? aD : aL)
+            }))
+        }
+        surfaceCache[key] = color
+        return color
     }
 
     // 文字系（灰阶；深色下整体提亮，不用纯白）
@@ -242,15 +357,29 @@ func styledLabel(_ t: String) -> String {
     t.contains(where: { $0.isLowercase }) ? t : t.uppercased()
 }
 
-/// 圆角卡片容器
-struct Card<Content: View>: View {
+/// 圆角卡片容器。
+///
+/// 2026-11-18（极限优化）：badge / trailing 由 `(() -> AnyView)?` 改为泛型
+/// View（缺省 EmptyView）—— AnyView 擦除类型后 SwiftUI 无法做结构化 diff，
+/// 热路径（性能页每秒重算）每张卡最多 2 个 AnyView 全部退化成反射比较。
+/// 调用点只需去掉 AnyView(...) 包装，不传 badge/trailing 的调用完全不变。
+struct Card<Badge: View, Trailing: View, Content: View>: View {
     var title: String? = nil
     /// 标题文字**紧跟其后**的一个小徽标（2026-11-08 新增，给 GPU 卡的降频提示用）。
     /// 与 `trailing` 的区别：badge 贴着标题排、跟着标题走；trailing 靠右对齐。
-    /// 默认 nil，所有既有 Card 调用不受影响。
-    var badge: (() -> AnyView)? = nil
-    var trailing: (() -> AnyView)? = nil
+    var badge: Badge
+    var trailing: Trailing
     @ViewBuilder var content: Content
+
+    init(title: String? = nil,
+         @ViewBuilder badge: () -> Badge = { EmptyView() },
+         @ViewBuilder trailing: () -> Trailing = { EmptyView() },
+         @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.badge = badge()
+        self.trailing = trailing()
+        self.content = content()
+    }
 
     /// 2.8.9：卡片标题里 " · " 之后都是我写给排障用的寄存器说明（如
     /// 「散热模式 · EC 0X0751 / 0X07AB」）。默认整段隐藏，只留主标题；
@@ -284,9 +413,9 @@ struct Card<Content: View>: View {
                         .font(.system(size: 10.5, weight: .semibold))
                         .foregroundStyle(Theme.dim2)
                         .tracking(1.1)
-                    if let badge { badge() }
+                    badge
                     Spacer()
-                    if let trailing { trailing() }
+                    trailing
                 }
             }
             content
@@ -408,10 +537,20 @@ struct SecondaryButton: View {
 }
 
 /// 页面标题区
-struct PageHeader: View {
+/// 页头（标题 + 副标题 + 右侧附加视图）。
+/// 2026-11-18（极限优化）：trailing 由 AnyView? 改泛型（缺省 EmptyView），
+/// 理由同 Card —— 性能页页头每秒重算，AnyView 白白丢掉结构化 diff。
+struct PageHeader<Trailing: View>: View {
     var title: String
     var sub: String
-    var trailing: AnyView? = nil
+    var trailing: Trailing
+
+    init(title: String, sub: String, @ViewBuilder trailing: () -> Trailing = { EmptyView() }) {
+        self.title = title
+        self.sub = sub
+        self.trailing = trailing()
+    }
+
     var body: some View {
         HStack(alignment: .bottom) {
             VStack(alignment: .leading, spacing: 3) {
@@ -421,7 +560,7 @@ struct PageHeader: View {
                 Text(sub).font(.system(size: 11.5)).foregroundStyle(Theme.dim2)
             }
             Spacer()
-            if let trailing { trailing }
+            trailing
         }
         .padding(.bottom, 6)
     }

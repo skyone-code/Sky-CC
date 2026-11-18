@@ -16,14 +16,20 @@ import AppKit
 
 /// 自身检查更新的确认框数据（有新版本时填入）
 struct AppUpdateInfo {
+    /// 更新包形态：自研安装器（DMG，拉起「Sky CC 安装器.app」）或传统 pkg（installer CLI 静默装）
+    enum Kind {
+        case selfInstaller
+        case pkg
+    }
     let tag: String
-    let pkgURL: String   // release 资产里 .pkg 的 browser_download_url
+    let assetURL: String  // release 资产里 .dmg（优先）或 .pkg 的 browser_download_url
     let sizeMB: Double
+    let kind: Kind
 }
 
-/// 应用内自更新阶段：下载中 / 安装中，供弹窗切换内容
+/// 应用内自更新阶段：下载中 / 启动安装器 / 安装中，供弹窗切换内容
 enum AppUpdatePhase: Equatable {
-    case idle, downloading, installing
+    case idle, downloading, launching, installing
 }
 
 extension AppUpdater {
@@ -33,9 +39,11 @@ extension AppUpdater {
         let size = info.sizeMB > 0
             ? "（安装包 " + String(format: "%.1f", info.sizeMB) + " MB）"
             : ""
+        let how = info.kind == .selfInstaller
+            ? "将在软件内下载全新安装器，打开后点「开始安装」即可完成升级（自动清理旧版残留）。"
+            : "将在软件内下载并自动安装，是否继续？"
         return "检测到新版本 " + info.tag + size
-            + "，当前为 Build " + AppVersion.build
-            + "。将在软件内下载并自动安装，是否继续？"
+            + "，当前为 Build " + AppVersion.build + "。" + how
     }
 }
 
@@ -109,7 +117,7 @@ final class AppUpdater: ObservableObject {
         }
     }
 
-    // MARK: - 检查更新（skyone213/Sky-CC latest release；tag 去 v 后与 CFBundleVersion 纯数字比对）
+    // MARK: - 检查更新（skyone-code/Sky-CC latest release；tag 去 v 后与 CFBundleVersion 纯数字比对）
     /// silent = true：无转圈、无失败 toast，只在有可用新版本时弹确认框
     /// 2026-11-15：GitHub 不通时兜底 Gitee 镜像仓（ReleaseFallback 双通道）
     func check(silent: Bool) {
@@ -117,7 +125,7 @@ final class AppUpdater: ObservableObject {
         checkingUpdate = true
         spinnerVisible = !silent
         ReleaseFallback.fetchLatest(
-            githubAPI: "https://api.github.com/repos/skyone213/Sky-CC/releases/latest",
+            githubAPI: "https://api.github.com/repos/skyone-code/Sky-CC/releases/latest",
             giteeRepo: "Sky-CC",
             userAgent: "SkyCC/\(mcHelperBuildVersion)",
             staticJSON: ReleaseFallback.staticLatestURL,
@@ -142,34 +150,49 @@ final class AppUpdater: ObservableObject {
                     }
                     return
                 }
-                // 在 assets 里找 .pkg 安装包（应用内更新用；命名不限，取第一个 .pkg）
-                // Gitee 的 assets 没有 size 字段 → sizeMB 按 0，确认框里就不显示大小
-                var pkgURL: String?
-                var sizeMB = 0.0
+                // 在 assets 里找安装包：**优先 .dmg（自研安装器，可视升级）**，
+                // 没有才回落 .pkg（installer CLI 静默装）。Gitee 的 assets 没有
+                // size 字段 → sizeMB 按 0，确认框里就不显示大小
+                var dmg: (url: String, size: Int)?
+                var pkg: (url: String, size: Int)?
                 for a in (dict["assets"] as? [[String: Any]]) ?? [] {
-                    if (a["name"] as? String ?? "").lowercased().hasSuffix(".pkg") {
-                        pkgURL = a["browser_download_url"] as? String
-                        sizeMB = Double(a["size"] as? Int ?? 0) / 1_048_576
-                        break
-                    }
+                    let name = (a["name"] as? String ?? "").lowercased()
+                    guard let url = a["browser_download_url"] as? String else { continue }
+                    let size = a["size"] as? Int ?? 0
+                    if name.hasSuffix(".dmg") && dmg == nil { dmg = (url, size) }
+                    if name.hasSuffix(".pkg") && pkg == nil { pkg = (url, size) }
                 }
-                guard let pkgURL else {
+                let chosen: AppUpdateInfo?
+                if let d = dmg {
+                    chosen = AppUpdateInfo(tag: latest, assetURL: d.url,
+                                           sizeMB: Double(d.size) / 1_048_576,
+                                           kind: .selfInstaller)
+                } else if let p = pkg {
+                    chosen = AppUpdateInfo(tag: latest, assetURL: p.url,
+                                           sizeMB: Double(p.size) / 1_048_576,
+                                           kind: .pkg)
+                } else {
+                    chosen = nil
+                }
+                guard let info = chosen else {
                     if !silent {
-                        ToastCenter.shared.show("发现新版本 \(latest)，但发布里没有 .pkg 安装包，无法应用内更新")
+                        ToastCenter.shared.show("发现新版本 \(latest)，但发布里没有 .dmg / .pkg 安装包，无法应用内更新")
                     }
                     return
                 }
-                self.updateInfo = AppUpdateInfo(tag: latest, pkgURL: pkgURL, sizeMB: sizeMB)
+                self.updateInfo = info
                 self.showUpdateAlert = true
             }
         }
     }
 
-    /// 下载 .pkg 到临时目录（0.3s 轮询进度），完成后转安装
+    /// 下载更新包到临时目录（0.3s 轮询进度），完成后按形态分路：
+    /// DMG → 挂载并拉起自研安装器；pkg → 走 installer CLI 静默装
     func startUpdate() {
-        guard let info = updateInfo, let url = URL(string: info.pkgURL) else { return }
+        guard let info = updateInfo, let url = URL(string: info.assetURL) else { return }
         let fm = FileManager.default
-        let dest = fm.temporaryDirectory.appendingPathComponent("SkyCC-update-\(info.tag).pkg")
+        let ext = info.kind == .selfInstaller ? "dmg" : "pkg"
+        let dest = fm.temporaryDirectory.appendingPathComponent("SkyCC-update-\(info.tag).\(ext)")
         try? fm.removeItem(at: dest)
         updatePhase = .downloading
         downloadProgress = 0
@@ -190,8 +213,13 @@ final class AppUpdater: ObservableObject {
                     ToastCenter.shared.show("保存安装包失败：\(error.localizedDescription)")
                     return
                 }
-                self.updatePhase = .installing
-                DispatchQueue.global(qos: .userInitiated).async { self.installDownloadedPkg(at: dest) }
+                if info.kind == .selfInstaller {
+                    self.updatePhase = .launching
+                    DispatchQueue.global(qos: .userInitiated).async { self.mountAndHandOff(dmg: dest, tag: info.tag) }
+                } else {
+                    self.updatePhase = .installing
+                    DispatchQueue.global(qos: .userInitiated).async { self.installDownloadedPkg(at: dest) }
+                }
             }
         }
         task.resume()
@@ -200,6 +228,81 @@ final class AppUpdater: ObservableObject {
                 self?.downloadProgress = min(1, Double(task.countOfBytesReceived) / Double(task.countOfBytesExpectedToReceive))
             }
         }
+    }
+
+    // MARK: - DMG 自研安装器通道（2026-11-18）
+    // 下载的是「Sky CC 安装器.app」的 DMG：挂载 → 找到安装器 app → open 拉起
+    // → 主程序退出。后续的授权、6 步安装、进度展示全部交给安装器 UI，
+    // 与首次安装完全同一套界面（含更新说明页）。
+
+    /// hdiutil attach，返回挂载点路径（解析 plist 输出，不依赖 /Volumes 卷名）
+    private func mountDMG(_ dmg: URL) -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+        p.arguments = ["attach", dmg.path, "-nobrowse", "-readonly", "-plist"]
+        let out = Pipe(); let err = Pipe()
+        p.standardOutput = out; p.standardError = err
+        do { try p.run() } catch { return nil }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0,
+              let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+              let entities = plist["system-entities"] as? [[String: Any]] else { return nil }
+        for e in entities {
+            if let m = e["mount-point"] as? String, !m.isEmpty { return m }
+        }
+        return nil
+    }
+
+    /// 在挂载点里找自研安装器 app（优先固定名，兜底根目录第一个 .app）
+    private func findInstallerApp(in mount: String) -> URL? {
+        let fm = FileManager.default
+        let preferred = URL(fileURLWithPath: mount).appendingPathComponent("Sky CC 安装器.app")
+        if fm.fileExists(atPath: preferred.path) { return preferred }
+        if let names = try? fm.contentsOfDirectory(atPath: mount) {
+            for name in names where name.hasSuffix(".app") {
+                return URL(fileURLWithPath: mount).appendingPathComponent(name)
+            }
+        }
+        return nil
+    }
+
+    /// 挂载 DMG 并拉起安装器；确认安装器跑起来后主程序退出。
+    /// 失败只报错复位，不 degrade 到 pkg（发布资产里两者都在，用户可手选）。
+    private func mountAndHandOff(dmg: URL, tag: String) {
+        let fm = FileManager.default
+        DispatchQueue.main.async { self.updatePhase = .launching }
+        guard let mount = mountDMG(dmg) else {
+            DispatchQueue.main.async {
+                self.updatePhase = .idle
+                ToastCenter.shared.show("更新失败：无法挂载安装器映像（可从 release 页手动下载 DMG）")
+            }
+            return
+        }
+        guard let appURL = findInstallerApp(in: mount) else {
+            DispatchQueue.main.async {
+                self.updatePhase = .idle
+                ToastCenter.shared.show("更新失败：映像里没有找到安装器")
+            }
+            return
+        }
+        let cfg = NSWorkspace.OpenConfiguration()
+        cfg.activates = true
+        NSWorkspace.shared.openApplication(at: appURL, configuration: cfg) { [weak self] _, error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if let error {
+                    self.updatePhase = .idle
+                    ToastCenter.shared.show("更新失败：无法启动安装器（\(error.localizedDescription)）")
+                    return
+                }
+                // 安装器已在前台跑起来，主程序功成身退（安装器的第 1 步也会停旧进程）
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    NSApplication.shared.terminate(nil)
+                }
+            }
+        }
+        _ = fm // 静默 unused 警告
     }
 
     /// 写 runner（installer -pkg，日志重定向）→ 管理员权限执行 → 成功弹重启确认
@@ -277,6 +380,10 @@ struct AppUpdateSheet: View {
                 ProgressView(value: updater.downloadProgress).frame(width: 240)
                 Text("正在下载新版本… \(Int(updater.downloadProgress * 100))%")
                     .font(.system(size: 13)).foregroundStyle(Theme.dim).monospacedDigit()
+            } else if updater.updatePhase == .launching {
+                ProgressView().controlSize(.regular)
+                Text("正在启动全新安装器…")
+                    .font(.system(size: 13)).foregroundStyle(Theme.dim)
             } else if updater.updatePhase == .installing {
                 ProgressView().controlSize(.regular)
                 Text("正在安装更新（请在授权弹窗输入管理员密码）…")

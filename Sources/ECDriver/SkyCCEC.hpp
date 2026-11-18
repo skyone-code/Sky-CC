@@ -18,6 +18,22 @@
 //  所以用户态不改也能直接换过来。另外新增 selector 1 专门吐 MSR 采样，把
 //  原先单独的 SkyCCMSR.kext 并进来，只留一个内核扩展。
 //
+//  ─────────────────────────────────────────────────────────────────────
+//  版权与许可声明
+//
+//  本内核扩展（SkyCCEC.kext）的 WMI/EC 通信协议基于 TongfangEnhancer 还原
+//  实现：
+//
+//      TongfangEnhancer — Copyright (C) 2019 kirainmoe (Kai Ren)
+//      https://github.com/kirainmoe/TongfangEnhancer
+//      授权方式：GNU General Public License v2.0（GPL-2.0）
+//
+//  依 GPL-2.0 条款，本内核扩展同样以 GPL-2.0 发布，实现源码随本仓库
+//  （Sources/ECDriver/ 目录）提供，任何人可按该协议获取、修改与再分发。
+//  本程序不提供任何担保。协议全文：
+//  https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+//  ─────────────────────────────────────────────────────────────────────
+//
 
 #ifndef SKYCC_EC_HPP
 #define SKYCC_EC_HPP

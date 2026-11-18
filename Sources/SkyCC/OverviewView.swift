@@ -58,18 +58,18 @@ struct OverviewView: View {
         PageHeader(
             title: "概览",
             sub: "设备 · 风扇 · 电池 · 存储",
-            trailing: AnyView(
+            trailing: {
                 LiveBadge(connected: store.connected,
                           updatedAt: store.updatedAt,
                           ms: store.snapshotMs)
-            ))
+            })
     }
 
     // MARK: - 存储（自「性能」页整体迁入，代码未改）
 
     private var diskCard: some View {
         Card(title: "存储",
-                    trailing: { AnyView(Chip(text: "\(store.disks.count) 个卷", color: Theme.green)) }) {
+                    trailing: { Chip(text: "\(store.disks.count) 个卷", color: Theme.green) }) {
             VStack(alignment: .leading, spacing: 12) {
                 if store.disks.isEmpty {
                     Text("读取中…").font(.system(size: 12.5)).foregroundStyle(Theme.dim)
@@ -216,7 +216,7 @@ struct OverviewView: View {
         let pct = BackendService.double(store.battery, "percent") ?? 0
         let state = BackendService.string(store.battery, "state") ?? "—"
         return Card(title: "电池",
-                    trailing: { AnyView(Chip(text: state, color: state.contains("充电") ? Theme.green : Theme.blue)) }) {
+                    trailing: { Chip(text: state, color: state.contains("充电") ? Theme.green : Theme.blue) }) {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(alignment: .center, spacing: 18) {
                     // 2.7.2：环跟着右列行数走，把卡片高度撑满（用户要求）；

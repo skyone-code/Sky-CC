@@ -63,12 +63,37 @@ struct LiveBadge: View {
 }
 
 /// 迷你折线（90 秒历史）
+///
+/// 2026-11-18（极限优化）：原实现每帧把 90 个点扫**两遍**（折线一遍、填充一遍）
+/// 且每条曲线每帧新建一个 LinearGradient。现在单趟算好坐标两路共用，
+/// 渐变按颜色缓存（渐变只依赖 color，与数据/尺寸无关）。
 struct Sparkline: View {
     var points: [Double]
     var color: Color
     var maxValue: Double? = nil
     var minValue: Double? = nil
     var fill = true
+
+    /// 填充渐变缓存：全页 4 条曲线 × 每秒一帧，不缓存就是每秒 4 个新渐变
+    private static var gradientCache: [Color: LinearGradient] = [:]
+    private static func fillGradient(_ color: Color) -> LinearGradient {
+        if let g = gradientCache[color] { return g }
+        let g = LinearGradient(colors: [color.opacity(0.28), color.opacity(0.02)],
+                               startPoint: .top, endPoint: .bottom)
+        gradientCache[color] = g
+        return g
+    }
+
+    /// 单趟把坐标算好（ViewBuilder 闭包里不能放副作用循环，抽到静态方法）
+    private static func coords(for vals: [Double], lo: Double, span: Double,
+                               step: CGFloat, height: CGFloat) -> [CGPoint] {
+        var out = [CGPoint](repeating: .zero, count: vals.count)
+        for (i, v) in vals.enumerated() {
+            let ratio = CGFloat(min(max((v - lo) / span, 0), 1))
+            out[i] = CGPoint(x: CGFloat(i) * step, y: height * (1 - ratio))
+        }
+        return out
+    }
 
     var body: some View {
         GeometryReader { geo in
@@ -80,28 +105,23 @@ struct Sparkline: View {
             let span = max(hi - lo, 0.0001)
             let step = vals.count > 1 ? geo.size.width / CGFloat(vals.count - 1) : geo.size.width
 
+            let coords = Self.coords(for: vals, lo: lo, span: span,
+                                     step: step, height: geo.size.height)
+
             let line = Path { p in
-                for (i, v) in vals.enumerated() {
-                    let x = CGFloat(i) * step
-                    let ratio = CGFloat(min(max((v - lo) / span, 0), 1))
-                    let y = geo.size.height * (1 - ratio)
-                    if i == 0 { p.move(to: CGPoint(x: x, y: y)) }
-                    else { p.addLine(to: CGPoint(x: x, y: y)) }
+                for (i, pt) in coords.enumerated() {
+                    if i == 0 { p.move(to: pt) }
+                    else { p.addLine(to: pt) }
                 }
             }
             if fill {
                 Path { p in
                     p.move(to: CGPoint(x: 0, y: geo.size.height))
-                    for (i, v) in vals.enumerated() {
-                        let x = CGFloat(i) * step
-                        let ratio = CGFloat(min(max((v - lo) / span, 0), 1))
-                        p.addLine(to: CGPoint(x: x, y: geo.size.height * (1 - ratio)))
-                    }
+                    for pt in coords { p.addLine(to: pt) }
                     p.addLine(to: CGPoint(x: geo.size.width, y: geo.size.height))
                     p.closeSubpath()
                 }
-                .fill(LinearGradient(colors: [color.opacity(0.28), color.opacity(0.02)],
-                                     startPoint: .top, endPoint: .bottom))
+                .fill(Self.fillGradient(color))
             }
             line.stroke(color, style: StrokeStyle(lineWidth: 1.6, lineCap: .round, lineJoin: .round))
         }
@@ -311,6 +331,29 @@ struct TightRow: View {
 }
 
 // MARK: - 数值格式化（全界面共用一套，避免各页口径不一）
+
+// MARK: - 惰性 tooltip（2026-11-18 极限优化）
+//
+// `.help(长字符串)` 的参数是普通求值参数 —— 哪怕用户从不悬停，每次 body 重算
+// 都会把多行大字符串拼一遍（字典链 + 拼接）。悬停是低频事件，拼接不该是高频的。
+// 用法：`.lazyHelp { dgpuDetailHelp }`（闭包捕获，悬停那一刻才求值）。
+struct LazyHelp: ViewModifier {
+    let make: () -> String
+    @State private var text = ""
+    func body(content: Content) -> some View {
+        content.help(text)
+            .onHover { hovering in
+                if hovering { text = make() }
+            }
+    }
+}
+
+extension View {
+    /// 悬停时才构建 tooltip 文案（替代高频路径上的 `.help(计算属性)`）
+    func lazyHelp(_ make: @escaping () -> String) -> some View {
+        modifier(LazyHelp(make: make))
+    }
+}
 
 enum Fmt {
     static func celsius(_ v: Double?) -> String {

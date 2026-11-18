@@ -51,9 +51,10 @@ PROJ="$BUILD/app-resources"
 [ -d "$PROJ" ] || { echo "错误：找不到资源目录 $PROJ" >&2; exit 1; }
 
 # 版本号（唯一来源：脚本注入 Info.plist 与 helper 的 BuildVersion.swift）
-VERSION="3.1.0"
-# 显示版本（侧边栏/设置页文案）：数字版本 + 专用版标识
-DISPLAY_VERSION="$VERSION LAPQC71x"
+VERSION="3.2.0"
+# 显示版本（侧边栏/设置页文案）：纯数字版本（2026-11-18 用户要求：全 app 去掉
+# 版本号里的机型后缀字样；PKGBASE 文件名里的 LAPQC71x 保留仅作分发区分）
+DISPLAY_VERSION="$VERSION"
 # nvmetemp（NVMe 硬盘温度，SMART）——有现成二进制就用，
 # 源码更新则现场重编。
 # ⚠️ 2026-10-22：该工具的 C 源码全盘已找不到（原先两个外部路径都已失效），
@@ -278,6 +279,10 @@ cp "$BUILD/templates/ensure-agents.sh" "$NATIVE/scripts/ensure-agents.sh"
 cp "$PROJ/restore_rgb.sh" "$NATIVE/restore_rgb.sh"
 chmod 755 "$NATIVE/scripts/"*.sh "$NATIVE/restore_rgb.sh"
 cp "$BUILD/icons/AppIcon.icns" "$RES/AppIcon.icns"
+# 竖版组合标（图标在上、Sky CC 字标在下）——设置页版本卡品牌区（2026-11-18）
+cp "$BUILD/brand/Brand/Wordmark/logo-combo-vertical-transparent.png" "$RES/LogoComboVertical.png"
+# 横版组合标（2026-11-18）：侧边栏头部 / 设置页版本卡 / 关于 Sky CC 窗口用
+cp "$BUILD/brand/Brand/Wordmark/logo-combo-horizontal-transparent.png" "$RES/LogoComboHorizontal.png"
 # 菜单栏主图标：app 图标里的 S 飘带（模板图，MenuBarExtra 用）
 cp "$BUILD/icons/MenuSIconTemplate.png" "$RES/MenuSIconTemplate.png"
 cp "$BUILD/icons/MenuSIconWhite.png" "$RES/MenuSIconWhite.png"
@@ -349,6 +354,52 @@ codesign --force --sign - "$APP/Contents/MacOS/SkyCCHelper"
 codesign --force --deep --sign - "$APP"
 codesign --verify "$APP" && echo "签名校验通过"
 
+echo "==> 6.5/8 编译自研安装器（DMG 载体，取代 pkg 的 Installer 界面）"
+# 3.2.0：macOS 自带 Installer 的窗口布局是死的——侧栏和文字卡直接压在
+# 自定义背景图上（2026-11-18 实测两张截图都是文字卡盖住品牌面板），
+# 没法做完整品牌视觉。改成自研 SwiftUI 安装器 app：
+#   · 内嵌完整的 Sky CC.app（安装器独立成体，不依赖 DMG 里其它文件）
+#   · 「开始安装」→ osascript 一次性提权跑 Resources/install.sh
+#     （清旧残留 → 装主程序 → GPU 路由库 → install-kext.sh，带 STEP 进度标记）
+#   · UI 轮询 /tmp/skycc-install.log 驱动进度；深浅色自适应
+# pkg 仍然照打（发布兜底，见第 7 段），只是 DMG 里不再放 pkg。
+INSTAPP="$STAGE/Sky CC 安装器.app"
+INSTMACOS="$INSTAPP/Contents/MacOS"
+INSTRES="$INSTAPP/Contents/Resources"
+mkdir -p "$INSTMACOS" "$INSTRES"
+swiftc -O -parse-as-library -target x86_64-apple-macosx14.0 \
+  ${MODCACHE_ARGS[@]+"${MODCACHE_ARGS[@]}"} \
+  -o "$INSTMACOS/Sky CC 安装器" \
+  "$SWIFT/Sources/InstallerApp/InstallerApp.swift"
+cp "$BUILD/icons/AppIcon.icns" "$INSTRES/AppIcon.icns"
+# 竖版组合标（图标在上、Sky CC 字标在下）——安装器头部品牌区（2026-11-18 定稿）
+cp "$BUILD/brand/Brand/Wordmark/logo-combo-vertical-transparent.png" "$INSTRES/LogoComboVertical.png"
+cp "$BUILD/templates/installer-install.sh" "$INSTRES/install.sh"
+chmod 755 "$INSTRES/install.sh"
+zsh -n "$INSTRES/install.sh"
+# 更新说明：从 CHANGELOG 抽最新一节（## 标题到下一个 ## / ---），轻量去 Markdown
+# 后注入 Resources/ReleaseNotes.txt —— 安装器首页「本次更新」卡读这份文件
+NOTES_TMP="$(mktemp -t notes)"
+awk '/^## /{n++} n==1 && $0 !~ /^---/' "$BUILD/CHANGELOG.md" \
+  | sed -e 's/^## /「Sky CC」/' -e 's/^### /◆ /' -e 's/^- /· /' -e 's/\*\*//g' -e 's/[<>]//g' \
+  | grep -v '^$' | head -40 > "$NOTES_TMP" || true
+if [[ -s "$NOTES_TMP" ]]; then
+  install -m 644 "$NOTES_TMP" "$INSTRES/ReleaseNotes.txt"
+  echo "    更新说明已注入（$(grep -c '' "$INSTRES/ReleaseNotes.txt") 行）"
+else
+  echo "    !! CHANGELOG 抽取为空，安装器将不显示更新说明"
+fi
+rm -f "$NOTES_TMP"
+# 版本注入（模板里两处 __VERSION__）
+cp "$BUILD/templates/InstallerInfo.plist" "$INSTAPP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" \
+  -c "Set :CFBundleShortVersionString $DISPLAY_VERSION" "$INSTAPP/Contents/Info.plist"
+# 内嵌主程序（安装器必须自包含：用户可能把安装器 app 从 DMG 拷出来单独跑）
+cp -R "$APP" "$INSTRES/Sky CC.app"
+codesign --force --sign - "$INSTAPP"
+codesign --verify "$INSTAPP" \
+  && echo "    安装器就绪：$(basename "$INSTAPP")（内嵌 Sky CC.app）"
+
 echo "==> 7/8 组装 pkg payload（app + gpu-router.dylib）"
 # 为什么改成 pkg：注入库必须落在 /Library/GPUBundles —— App Sandbox 的白名单里
 # 只有 /Library 下的路径可读；放到 /usr/local/lib 会让 QQ、微信这类沙箱 app
@@ -369,14 +420,16 @@ mkdir -p "$PKGSCRIPTS"
 install -m 755 "$BUILD/templates/pkg-preinstall"  "$PKGSCRIPTS/preinstall"
 install -m 755 "$BUILD/templates/pkg-postinstall" "$PKGSCRIPTS/postinstall"
 
-rm -f "$PKGOUT"
+# 先打**组件包**（裸 payload + scripts），再套安装器外壳（第 7.5 步）。
+COMPPKG="$STAGE/SkyCC-component.pkg"
+rm -f "$COMPPKG"
 pkgbuild --root "$PKGROOT" \
          --identifier com.skycc.installer \
          --version "$VERSION" \
          --scripts "$PKGSCRIPTS" \
          --install-location / \
          --ownership recommended \
-         "$PKGOUT" > /dev/null
+         "$COMPPKG" > /dev/null
 
 # ⚠️ 2026-11-17：必须剥离 bundle-version，否则 pkg 只能升不能降、甚至同版本重装也会静默失败。
 # pkgbuild 扫到 payload 里有 .app，会自动在 PackageInfo 里写 <bundle-version> /
@@ -388,6 +441,9 @@ pkgbuild --root "$PKGROOT" \
 # <relocate> 更坑：它让 Installer 把“已装 app”认到别的同名副本上（实测认到过
 # ~/Desktop/…/04-已装应用快照/Sky CC.app），于是 /Applications 里那份永远不被替换。
 # 处理：展开 → 删掉这四个节点 → 压平 → 核对 payload 文件数没变。
+# 3.2.0：剥离在**组件包**上做（外壳 distribution 不携带这些节点），
+# 剥完的组件包再由 productbuild 包进带背景/许可页的外壳。
+STRIPPED="$STAGE/SkyCC-stripped.pkg"
 PKGX="${MC_PKGX:-/tmp/mc-build/pkgx}"
 # pkgutil --expand 的目标目录**必须不存在**（否则 Error 17: File exists），
 # 所以这里只清空、不 mkdir —— 展开动作自己会建。
@@ -396,7 +452,7 @@ if [[ -d "$PKGX" ]]; then
   rmdir "$PKGX" 2>/dev/null || true
 fi
 rm -rf "$PKGX" 2>/dev/null || true
-pkgutil --expand "$PKGOUT" "$PKGX"
+pkgutil --expand "$COMPPKG" "$PKGX"
 PYBIN=$(command -v /usr/bin/python3 || command -v python3)
 "$PYBIN" - "$PKGX/PackageInfo" <<'PYSTRIP'
 import re, sys
@@ -409,31 +465,66 @@ for tag in ("bundle-version", "upgrade-bundle", "relocate", "strict-identifier")
 open(p, "w", encoding="utf-8").write(s)
 print("    PackageInfo 剥离完成" if s != before else "    PackageInfo 无需变更")
 PYSTRIP
-mv "$PKGOUT" "$PKGOUT.pre-strip"
-pkgutil --flatten "$PKGX" "$PKGOUT"
-A=$(pkgutil --payload-files "$PKGOUT.pre-strip" | wc -l | tr -d ' ')
-B=$(pkgutil --payload-files "$PKGOUT" | wc -l | tr -d ' ')
+rm -f "$STRIPPED"
+pkgutil --flatten "$PKGX" "$STRIPPED"
+A=$(pkgutil --payload-files "$COMPPKG" | wc -l | tr -d ' ')
+B=$(pkgutil --payload-files "$STRIPPED" | wc -l | tr -d ' ')
 if [[ "$A" != "$B" ]]; then
-  echo "    !! payload 文件数不一致（$A vs $B），回滚为未剥离版本" >&2
-  mv -f "$PKGOUT.pre-strip" "$PKGOUT"
-else
-  rm -f "$PKGOUT.pre-strip"
-  if pkgutil --payload-files "$PKGOUT" | grep -q "Applications/Sky CC.app/Contents/Info.plist"; then
-    echo "    校验通过：payload $B 项，app 在位，已可覆盖/降级安装"
-  else
-    echo "    !! 压平后 payload 里找不到 app，构建中止" >&2
-    exit 1
-  fi
+  echo "    !! payload 文件数不一致（$A vs $B），中止（外壳不能套在缺文件的包上）" >&2
+  exit 1
 fi
+echo "    组件包剥离完成：payload $B 项"
+
+echo "==> 7.5/8 套安装器外壳（背景图 / 欢迎 / 许可 / 完成页，跟随系统深浅色）"
+# 3.2.0：裸 pkgbuild 的 Installer 窗口是默认灰底、没有任何品牌信息。
+# 用 productbuild 套一层 distribution 外壳：
+#   · background.png / background-dark.png  按系统深浅模式自动切换
+#   · welcome.html / conclusion.html        欢迎 / 完成页（默认文字色随外观）
+#   · license.html                          开源组件声明（GPL-2.0 署名，必须同意）
+# 素材由 Tools/make_installer_assets.swift 生成（已提交仓库，不需要每次重生成）；
+# distribution.xml 里的 __VERSION__ 在这里替换成真实版本号。
+DISTXML="$PKGSCRIPTS/distribution.xml"
+sed "s/__VERSION__/$VERSION/g" "$BUILD/templates/installer-assets/distribution.xml" > "$DISTXML"
+# distribution 里 pkg-ref 引用的组件包名必须与 --package-path 下的文件名一致
+[[ -f "$STAGE/SkyCC-stripped.pkg" ]] || { echo "错误：剥离后的组件包缺失" >&2; exit 1; }
+rm -f "$PKGOUT"
+productbuild --distribution "$DISTXML" \
+             --package-path "$STAGE" \
+             --resources "$BUILD/templates/installer-assets" \
+             "$PKGOUT" > /dev/null
+
+# 终检：payload 文件数与组件包一致、app 在位、外壳里确实带了 license/背景
+FA=$(pkgutil --payload-files "$STRIPPED" | wc -l | tr -d ' ')
+FB=$(pkgutil --payload-files "$PKGOUT" | wc -l | tr -d ' ')
+if [[ "$FA" != "$FB" ]]; then
+  echo "    !! 外壳后 payload 文件数不一致（$FA vs $FB）" >&2
+  exit 1
+fi
+if ! pkgutil --payload-files "$PKGOUT" | grep -q "Applications/Sky CC.app/Contents/Info.plist"; then
+  echo "    !! 外壳 pkg 的 payload 里找不到 app，构建中止" >&2
+  exit 1
+fi
+# pkgutil --expand-full 要求目标目录**不存在**（残留空目录也会报错）
+rm -rf "$PKGX-final"
+if ! pkgutil --expand-full "$PKGOUT" "$PKGX-final" >/dev/null 2>&1 \
+     || [[ ! -f "$PKGX-final/Distribution" ]]; then
+  echo "    !! 外壳 pkg 展开后找不到 Distribution 清单" >&2
+  exit 1
+fi
+# 注意标签名必须是 background-darkAqua（background-dark 无效，深色模式不画背景）
+grep -q "license.html" "$PKGX-final/Distribution" \
+  && grep -q "background-darkAqua" "$PKGX-final/Distribution" \
+  && echo "    校验通过：外壳 $FB 项 payload，app 在位，许可页与深浅色背景已嵌入"
+rm -rf "$PKGX-final"
 
 echo "    pkg: $PKGOUT"
 
 echo "==> 8/8 组装 DMG 内容"
 mkdir -p "$DMGROOT"
-cp "$PKGOUT" "$DMGROOT/$(basename "$PKGOUT")"
-# 权限必须显式给：本机 umask 077 会让 pkg 变成 700，别人挂载这个 DMG 时
-# 可能读不到（Installers 直接失败），分发出去就是废的
-chmod 755 "$DMGROOT/$(basename "$PKGOUT")"
+# 3.2.0：DMG 载体从 pkg 换成自研安装器 app（不依赖 macOS 自带 Installer）。
+# pkg 照打不进 DMG —— 仍是发布渠道的兜底产物（见 7/8 段的 $PKGOUT）。
+cp -R "$INSTAPP" "$DMGROOT/Sky CC 安装器.app"
+chmod -R a+rX,go-w "$DMGROOT/Sky CC 安装器.app"
 # 2.8.12（用户要求）：kext 与「安装散热控制.command」不再放 DMG 顶层 ——
 # kext 本体已经在 app 的 Contents/Resources/native/ 里，缺 kext 时 app 内
 # 点「立即安装」即可，用户不需要在磁盘映像里找文件。
@@ -463,6 +554,6 @@ hdiutil create -volname "Sky CC安装器" -srcfolder "$DMGROOT" -ov -format UDZO
 hdiutil verify "$BUILD/$PKGBASE.dmg" >/dev/null && echo "DMG 校验通过"
 
 echo
-echo "完成：$BUILD/$PKGBASE.dmg"
+echo "完成：$BUILD/$PKGBASE.dmg（自研安装器 app）"
 mckarchive "$PKGOUT" "$BUILD/$PKGBASE.dmg"
 echo "  app 内已无 Python、无 HTTP：硬件后端在 SkyCCHelper（XPC），助手为 mcutil + 三个编译型二进制"

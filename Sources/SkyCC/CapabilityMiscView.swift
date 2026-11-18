@@ -1,5 +1,6 @@
 import SwiftUI
 import ServiceManagement
+import UniformTypeIdentifiers
 
 /// 设置页：外观与通用 / 版本 / 皮肤 / 系统调整 / 系统与启动参数
 /// （2026-11-16 用户要求：卡片顺序调整为 外观+版本 → 皮肤 → 系统调整 → 系统与启动参数；
@@ -29,17 +30,15 @@ struct MiscView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 header
-                // 2026-11-16（用户要求）：卡片顺序 外观+版本 → 皮肤 →（卡外）系统调整 → 系统与启动参数；
-                // 菜单栏监控图标卡已迁出到侧边栏「状态栏显示」页（MenuBarStatusView.swift）
+                // 2026-11-18（用户要求）：皮肤卡拆分 —— 预设配色 + 玻璃开关并入
+                // 外观与通用卡（外观行下方）；背景图两行独立成「自定义背景」卡
                 Grid(horizontalSpacing: 14, verticalSpacing: 14) {
                     GridRow {
-                        generalCard.gridEqual()
-                        aboutCard.gridEqual()
+                        generalCard.gridEqualFull()
+                        aboutCard.gridEqualFull()
                     }
-                    // 皮肤（2026-11-15）：独立通栏卡 —— 不塞进外观卡（会多两行、
-                    // 和旁边版本卡留白失衡），单独全宽一行
                     GridRow {
-                        skinCard.gridEqual().gridCellColumns(2)
+                        customBgCard.gridEqual().gridCellColumns(2)
                     }
                 }
                 // 「系统调整」整卡（显卡路由已拆去控制页，见 SystemTweakCard.swift）
@@ -65,7 +64,7 @@ struct MiscView: View {
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = false
-        panel.allowedFileTypes = ["png", "jpg", "jpeg", "heic", "tiff", "gif", "bmp", "webp"]
+        panel.allowedContentTypes = [.image]
         guard panel.runModal() == .OK, let url = panel.url else { return }
         if skin.setCustomImage(from: url) {
             ToastCenter.shared.show("背景图片已应用")
@@ -81,7 +80,7 @@ struct MiscView: View {
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = false
-        panel.allowedFileTypes = ["png", "jpg", "jpeg", "heic", "tiff", "gif", "bmp", "webp"]
+        panel.allowedContentTypes = [.image]
         guard panel.runModal() == .OK, let url = panel.url else { return }
         if skin.setSidebarImage(from: url) {
             ToastCenter.shared.show("侧边栏背景已应用")
@@ -91,28 +90,52 @@ struct MiscView: View {
     }
 
     private var header: some View {
-        PageHeader(title: "设置", sub: "外观与通用 · 皮肤 · 系统调整 · 系统与启动参数")
+        PageHeader(title: "设置", sub: "外观与通用 · 自定义背景 · 系统调整 · 系统与启动参数")
     }
 
     // MARK: - 版本信息（2026-10-19：版本号搬进系统页，方便核对装的是哪一版）
-    // AppVersion 已提到文件作用域（SkyCCApp.swift），侧边栏头部共用
+    // 2026-11-18（用户定稿）：横版 lockup + 右侧上下摆「版本 Build」/「检查更新」；
+    // 「控制台版本」行与底部 GPL 小字去掉。AppVersion 已提到文件作用域（SkyCCApp.swift）
+    private static var logoComboHorizontal: NSImage? {
+        // 2026-11-18：BrandAssets 多级减半预缩放（44pt @2x = 88px），消除大压缩比锯齿；
+        // 64pt 会把版本卡撑得比外观卡高，导致左侧留白，缩回 44
+        BrandAssets.prescaled("LogoComboHorizontal", targetPixelHeight: 88)
+    }
+
     private var aboutCard: some View {
         let os = BackendService.dict(store.overview, "os")
         return Card(title: "版本") {
             VStack(spacing: 0) {
-                KVRow(key: "控制台版本", value: "Build \(AppVersion.build)",
-                      trailing: AnyView(
-                          Button(updater.checkingUpdate ? "检查中…" : "检查更新") {
-                              updater.check(silent: false)
-                          }
-                          .buttonStyle(.borderedProminent)
-                          .tint(Theme.blue)
-                          .controlSize(.small)
-                          .disabled(updater.checkingUpdate || updater.updatePhase != .idle)
-                      ))
+                // 头部：横版 lockup 在左（44，不撑高版本卡），
+                // 版本号 + 检查更新按钮上下摆右对齐（同一行）
+                HStack(spacing: 12) {
+                    if let logo = Self.logoComboHorizontal {
+                        Image(nsImage: logo)
+                            .resizable()
+                            .interpolation(.high)
+                            .scaledToFit()
+                            .frame(height: 44)
+                    }
+                    Spacer(minLength: 8)
+                    VStack(alignment: .trailing, spacing: 7) {
+                        Text("版本 \(AppVersion.short) (Build \(AppVersion.build))")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(Theme.txt)
+                            .monospacedDigit()
+                        Button(updater.checkingUpdate ? "检查中…" : "检查更新") {
+                            updater.check(silent: false)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(Theme.blue)
+                        .controlSize(.small)
+                        .disabled(updater.checkingUpdate || updater.updatePhase != .idle)
+                    }
+                }
+                .padding(.bottom, 12)
                 KVRow(key: "硬件后端", value: "SkyCC/1.0 · \(AppVersion.backend)")
                 KVRow(key: "运行系统", value: "\(BackendService.string(os, "name") ?? "macOS") \(BackendService.string(os, "version") ?? "—") (\(BackendService.string(os, "build") ?? "—"))")
-                KVRow(key: "机型", value: BackendService.string(store.overview, "model") ?? "—")
+                KVRow(key: "机型", value: RealModel.displayName(overview: store.overview))
+                KVRow(key: "EC 内核扩展", value: FanControl.kextLoaded() ? "SkyCCEC.kext · 已加载" : "未加载")
             }
         }
     }
@@ -137,39 +160,12 @@ private struct MenuBarIconStylePicker: View {
     }
 }
 
-    // MARK: - 开机自启（SMAppService）
-    //
-    // 皮肤卡（2026-11-15）：独立通栏卡。色板选预设配色 / 按钮选自定义图片，
-    // 二者互斥（点色板自动清图片）；只换页面背景，卡片配色不动，切换即时生效。
-    // 2026-11-15 第三轮：背景图片三件套加框（panel2 底圆角，样式同核心温度块），
-    // 下方新增「侧边栏背景」行（样式一致；侧边栏默认跟随页面公共背景层）。
-    private var skinCard: some View {
-        Card(title: "皮肤") {
+    // MARK: - 自定义背景卡（2026-11-18 用户要求：皮肤卡拆分后剩余的图片两项独立成卡）
+    // 2026-11-15 第三轮：图片行加框（panel2 底圆角，样式同核心温度块）
+    private var customBgCard: some View {
+        Card(title: "自定义背景") {
             VStack(alignment: .leading, spacing: 12) {
-                HStack(spacing: 10) {
-                    Text("配色").font(.system(size: 12.5, weight: .medium)).foregroundStyle(Theme.txt)
-                    HStack(spacing: 9) {
-                        ForEach(SkinCenter.Preset.allCases) { p in
-                            // 色板圆点 = 当前外观实际生效的那一档底色
-                            Circle()
-                                .fill(p.swatchColor)
-                                .frame(width: 22, height: 22)
-                                .overlay(Circle().strokeBorder(Theme.line, lineWidth: 1))
-                                .overlay {
-                                    // 当前生效（选了图片时不算任何预设，只亮底色描边）
-                                    if skin.preset == p && !skin.isCustomImage {
-                                        Circle().strokeBorder(Theme.blue, lineWidth: 1.8)
-                                            .padding(-3.5)
-                                    }
-                                }
-                                .contentShape(Circle())
-                                .onTapGesture { withAnimation(.easeOut(duration: 0.18)) { skin.select(p) } }
-                                .help("背景配色：\(p.label)")
-                        }
-                    }
-                    Spacer(minLength: 0)
-                }
-                skinImageRow(label: "背景图片",
+                skinImageRow(label: "自定义背景",
                              hasImage: skin.isCustomImage,
                              imageName: currentImageName(forKey: SkinCenter.imagePathKey, present: skin.isCustomImage),
                              pick: { pickSkinImage() },
@@ -179,7 +175,7 @@ private struct MenuBarIconStylePicker: View {
                              imageName: currentImageName(forKey: SkinCenter.sidebarImagePathKey, present: skin.hasSidebarImage),
                              pick: { pickSidebarImage() },
                              clear: { skin.clearSidebarImage() })
-                Text("色板更换页面背景配色；选图片后整页铺图并压一层底色蒙层。侧边栏不单独选图时跟随页面背景。预设与图片二选一。")
+                Text("选图片后整页铺图并压一层底色蒙层；侧边栏不单独选图时跟随页面背景。选图后玻璃效果暂停生效，恢复默认后自动回到原配色。")
                     .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
                     .fixedSize(horizontal: false, vertical: true)
                     .cardNote()
@@ -244,10 +240,41 @@ private struct MenuBarIconStylePicker: View {
                     new.apply()
                     UserDefaults.standard.set(new.rawValue, forKey: AppAppearance.defaultsKey)
                 }
-                Text("切换浅色 / 深色界面；「随系统」跟随 macOS 的外观设置自动切换。")
-                    .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .cardNote()
+
+                // 2026-11-18（用户要求）：预设配色 + 玻璃效果开关从皮肤卡迁入本卡（外观行下方）。
+                // 开关随时可开可关（像系统设置的透明开关）：开 = 切到玻璃皮肤，关 = 回上一个皮肤。
+                Divider().overlay(Theme.line)
+
+                HStack(spacing: 10) {
+                    Text("配色").font(.system(size: 12.5, weight: .medium)).foregroundStyle(Theme.txt)
+                    HStack(spacing: 9) {
+                        ForEach(SkinCenter.Preset.allCases) { p in
+                            // 色板圆点 = 当前外观实际生效的那一档底色
+                            Circle()
+                                .fill(p.swatchColor)
+                                .frame(width: 22, height: 22)
+                                .overlay(Circle().strokeBorder(Theme.line, lineWidth: 1))
+                                .overlay {
+                                    // 当前生效（选了图片时不算任何预设，只亮底色描边）
+                                    if skin.preset == p && !skin.isCustomImage {
+                                        Circle().strokeBorder(Theme.blue, lineWidth: 1.8)
+                                            .padding(-3.5)
+                                    }
+                                }
+                                .contentShape(Circle())
+                                .onTapGesture { withAnimation(.easeOut(duration: 0.18)) { skin.select(p) } }
+                                .help("背景配色：\(p.label)")
+                        }
+                    }
+                    Spacer(minLength: 0)
+                    // 玻璃效果开关（右对齐；选中玻璃色板时开关同步为开）
+                    Toggle("玻璃效果", isOn: Binding(
+                        get: { skin.glassOn },
+                        set: { skin.setGlassEffect($0) }))
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .help("开启后窗口透出桌面模糊、卡片更透（即玻璃配色）；关闭回到上一个配色。铺了自定义背景图时玻璃暂停生效。")
+                }
 
                 Divider().overlay(Theme.line)
 
@@ -257,9 +284,6 @@ private struct MenuBarIconStylePicker: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("开机自动启动").font(.system(size: 12.5, weight: .medium))
                                 .foregroundStyle(Theme.txt)
-                            Text("登录后自动打开 Sky CC（菜单栏常驻 + 硬件后台服务）")
-                                .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
-                                .cardNote()
                         }
                         Spacer(minLength: 4)
                         Toggle("", isOn: $launchAtLogin)

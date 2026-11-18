@@ -160,7 +160,7 @@ final class BackendService: ObservableObject {
         diag("已断开 helper 连接（helper 继续运行）")
     }
 
-    /// 「退出控制台」专用：连 helper 一起送走（2026-11-13 用户要求）。
+    /// 「退出控制台」流程：连 helper 一起送走（2026-11-13 用户要求）。
     ///
     /// helper 收到请求后自己完成四件事：停风扇曲线 → 交还 `0x751` 档位 →
     /// 清 `0x741` bit0（原厂「退出清 0」语义）→ `exit(0)`。

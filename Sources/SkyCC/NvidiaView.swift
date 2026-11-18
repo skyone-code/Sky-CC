@@ -96,7 +96,9 @@ struct NvidiaView: View {
                     // NVIDIA 绿眼 logo（用户要求，原页面没有图标）
                     if let logo = NvidiaBrandIcon.image {
                         Image(nsImage: logo)
-                            .resizable().scaledToFit()
+                            .resizable()
+                            .interpolation(.high)
+                            .scaledToFit()
                             .frame(width: 46, height: 46)
                             .padding(.top, 2)
                     }

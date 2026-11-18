@@ -14,7 +14,23 @@ import SwiftUI
 // 只是性能页不再渲染这张卡。
 //
 // 数据全部来自 MonitorStore 的同一份 /api/snapshot（1 秒一次、一次 XPC 往返），
-// 页面本身不再发任何请求；曲线由 store.history 里的 90 点环形缓冲直接画。
+// 页面本身不再发任何请求；曲线由 store.hist（HistoryStore）的 90 点环形缓冲直接画。
+
+/// 90 秒曲线子视图（2026-11-18 极限优化）：只订阅 HistoryStore。
+/// 曲线追加点（每秒一次的 objectWillChange）只会重算这一小块，
+/// 不再把 CPU / GPU / 内存 / 网络整卡拖着重算。
+struct HistoryCurve: View {
+    @ObservedObject var hist: HistoryStore
+    var key: String
+    var color: Color
+    var maxValue: Double? = nil
+    var minValue: Double? = nil
+
+    var body: some View {
+        Sparkline(points: hist.history[key] ?? [], color: color,
+                  maxValue: maxValue, minValue: minValue)
+    }
+}
 
 struct MonitorView: View {
     @EnvironmentObject var backend: BackendService
@@ -93,11 +109,11 @@ struct MonitorView: View {
         PageHeader(
             title: "性能",
             sub: "每 1 秒刷新 · 一次快照取全",
-            trailing: AnyView(
+            trailing: {
                 LiveBadge(connected: store.connected,
                           updatedAt: store.updatedAt,
                           ms: store.snapshotMs)
-            ))
+            })
     }
 
     // MARK: - CPU
@@ -106,17 +122,24 @@ struct MonitorView: View {
         let usage = BackendService.double(store.overview, "cpu_usage") ?? 0
         let cores = (store.cpu["cores"] as? [Double]) ?? []
         let load = (BackendService.array(store.overview, "load") as? [Double]) ?? []
+        // 2026-11-18（极限优化）：PCPT 三元组一次取齐（原来 cpuWatts/Stale/AgeMs
+        // 各扫一遍 sensors["power"]，一个 body 扫 3 遍）
+        let pw = store.cpuPower()
         return Card(title: "CPU",
                     // 2026-11-08（用户要求）：核显利用率提到标题行、紧跟「CPU」——
                     // 它原来在卡片最下方那条摘要里，而那条已改成「显存占用」。
-                    badge: { AnyView(igpuBadge) },
+                    badge: { igpuBadge },
                     // 2026-11-07（用户要求）：型号并进右上角胶囊 —— 现在是
                     // 「i7-9750H @ 2.60GHz · 6C / 12T」。原来主数字右侧那格
                     // 腾给了封装温度 / 封装功耗。
                     // 2026-11-08（用户要求）：顺序对调 —— 型号在前、核心数在后，
                     // 读起来先知道「什么 CPU」再知道「几核几线程」。
-                    trailing: { AnyView(Chip(text: "\(cpuBrandClean) · \(coreNote)",
-                                             color: Theme.blue)) }) {
+                    // 2026-11-18（用户要求）：胶囊里的「@ 2.60GHz」由标称基频改为
+                    // 实时运行频率（就是原主行那一格的数据源），随负载与睿频跳动；
+                    // 读数不可用时回落到标称基频。
+                    trailing: { Chip(text: "\(cpuBrandClean) @ \(freqNote) · \(coreNote)",
+                                     color: Theme.blue)
+                            .lazyHelp { freqHelp } }) {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(alignment: .firstTextBaseline, spacing: 4) {
                     Text(String(format: "%.0f", usage))
@@ -132,28 +155,16 @@ struct MonitorView: View {
                         .font(.system(size: 10.5).monospacedDigit())
                         .foregroundStyle(Theme.dim2)
                         .padding(.leading, 2)
-                        .help(loadHelp(load))
+                        .lazyHelp { loadHelp(load) }
                     Spacer(minLength: 8)
                     // 2026-11-07（用户要求）：封装温度 / 封装功耗从底部那行挪上来，
                     // 顶掉原来的型号文字。样式照搬 GPU 卡主数字右侧那个温度
                     // （10.5pt 图标 + 15pt 半粗等宽数字 + 按温度着色）。
                     // 型号改挂到右上角胶囊里（见 Card 的 trailing）。
+                    // 2026-11-18（用户要求）：主行的实时频率格撤掉 —— 型号胶囊
+                    // 里的频率改为实时跳动（原来那格才是活频、胶囊里是标称基频，
+                    // 现在两处合并成一处），温度 / 功耗保持不变。
                     HStack(spacing: 10) {
-                        // 实时频率（APERF/MPERF）。右上角胶囊里的「@ 2.60GHz」
-                        // 是标称基频（型号字符串自带的），这一格才是当前实际
-                        // 运行频率。freq_source 不是 msr 说明 kext 那条通道没拿到
-                        // 读数、这里显示的是回落值，所以压暗并写进 tooltip。
-                        if let mhz = BackendService.double(store.cpu, "freq_cur_mhz"), mhz > 0 {
-                            let liveFreq = BackendService.string(store.cpu, "freq_source") == "msr"
-                            HStack(spacing: 4) {
-                                Image(systemName: "gauge.with.dots.needle.67percent")
-                                    .font(.system(size: 10.5, weight: .semibold))
-                                Text(MenuBarMonitors.compactMHz(mhz))
-                                    .font(.system(size: 15, weight: .semibold).monospacedDigit())
-                            }
-                            .foregroundStyle(liveFreq ? Theme.blue : Theme.dim2.opacity(0.8))
-                            .help(freqHelp(live: liveFreq))
-                        }
                         if store.cpuTemp > 0 {
                             HStack(spacing: 4) {
                                 Image(systemName: "thermometer.medium")
@@ -162,7 +173,7 @@ struct MonitorView: View {
                                     .font(.system(size: 15, weight: .semibold).monospacedDigit())
                             }
                             .foregroundStyle(store.tempColor(store.cpuTemp))
-                            .help(packageTempsHelp)
+                            .lazyHelp { packageTempsHelp }
                         }
                         HStack(spacing: 4) {
                             Image(systemName: "bolt.fill")
@@ -170,17 +181,19 @@ struct MonitorView: View {
                             Text(Fmt.watts(store.cpuWatts))
                                 .font(.system(size: 15, weight: .semibold).monospacedDigit())
                         }
-                        .foregroundStyle(store.cpuWatts == nil
+                        .foregroundStyle(pw.watts == nil
                                          ? Theme.dim2
-                                         : Theme.amber.opacity(store.cpuWattsStale ? 0.6 : 1))
-                        .help(powerHelp)
+                                         : Theme.amber.opacity(pw.stale ? 0.6 : 1))
+                        .lazyHelp { powerHelp(pw) }
                     }
                 }
                 .frame(height: Rhy.hero, alignment: .leading)
                 // 固定 0~100：自适应在空闲时会把 1~2% 的抖动拉成满幅，看着像满载。
                 // 百分比指标本来就该有绝对刻度（内存那条曲线一直是这么画的）。
-                Sparkline(points: store.history["cpu"] ?? [], color: Theme.blue,
-                          maxValue: 100, minValue: 0)
+                // 2026-11-18（极限优化）：HistoryCurve 只订阅 HistoryStore，
+                // 曲线追加点不再触发整卡重算。
+                HistoryCurve(hist: store.hist, key: "cpu", color: Theme.blue,
+                             maxValue: 100, minValue: 0)
                     .frame(height: Rhy.spark)
 
                 if !cores.isEmpty {
@@ -210,7 +223,7 @@ struct MonitorView: View {
                 if !coreTemps.isEmpty {
                     VStack(alignment: .leading, spacing: 6) {
                         GroupTitle(text: "核心温度", sub: "6 个物理核 · TC1C~TC6C")
-                            .help(packageTempsHelp)
+                            .lazyHelp { packageTempsHelp }
                         LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 6),
                                   spacing: 8) {
                             ForEach(Array(coreTemps.enumerated()), id: \.offset) { _, c in
@@ -446,30 +459,26 @@ struct MonitorView: View {
         return "封装 / 接近温度（SMC）：\n" + parts.joined(separator: " · ")
     }
 
-    /// 实时频率的 tooltip。
-    /// 讲清楚「这一格和型号里的 @2.60GHz 不是一回事」，以及为什么有时候是回落的。
-    private func freqHelp(live: Bool) -> String {
+    /// 型号胶囊的 tooltip：说明「@」后面现在是实时频率。
+    private var freqHelp: String {
         let base = BackendService.double(store.cpu, "freq_base_mhz") ?? 0
         let baseText = base > 0 ? String(format: "%.2fGHz", base / 1000) : "—"
-        let head = "CPU 实时运行频率（IA32_APERF / IA32_MPERF）\n"
-            + "公式：基频 \(baseText) × ΔAPERF ÷ ΔMPERF\n"
-            + "型号里的「@」后面是标称基频，不会变；这一格随负载与睿频变化。"
-        if live { return head }
-        return head + "\n\n当前显示的是回落值：内核扩展的 MSR 采样这一拍没成功"
-            + "（跨核或未安装），下方数值等于基频。"
+        return "「@」后面是 CPU 实时运行频率（IA32_PERF_STATUS），随负载与睿频变化；\n"
+            + "读数不可用时回落到标称基频 \(baseText)。"
     }
 
     /// 封装功耗的 tooltip。
     /// PCPT 在 VirtualSMC 里是「能量差 ÷ 时间」，读太密那一拍就是 0（实测 1 秒间隔
     /// 命中率约 65%）。读 0 时用 10 秒内的上一拍真值顶上并打 stale 标记，
     /// 此时数字会降到 60% 不透明度 —— 数据是真的，只是不是这一秒的。
-    private var powerHelp: String {
+    /// 2026-11-18（极限优化）：改为函数 + 三元组入参（cpuCard 一次取齐，见 cpuPower）
+    private func powerHelp(_ p: (watts: Double?, stale: Bool, ageMs: Int)) -> String {
         let base = "CPU 封装功耗（SMC PCPT）"
-        guard store.cpuWattsStale else {
+        guard p.stale else {
             return base + "\nVSM C 的功率键是「能量差 ÷ 时间」算的；"
                 + "这一拍取到了新值。"
         }
-        let age = Double(store.cpuWattsAgeMs) / 1000
+        let age = Double(p.ageMs) / 1000
         return base + "\n这一拍 SMC 没算出新值（1 秒内能量增量为 0），"
             + String(format: "显示的是 %.1f 秒前的实测值。", age)
             + "数字会降为 60% 不透明度以作区分。"
@@ -522,7 +531,7 @@ struct MonitorView: View {
         let other = max(0, total - app - wired - comp)
         let swap = BackendService.dict(d, "swap") ?? [:]
         return Card(title: "内存",
-                    trailing: { AnyView(Chip(text: "\(Fmt.bytes(total)) 总量", color: Theme.purple)) }) {
+                    trailing: { Chip(text: "\(Fmt.bytes(total)) 总量", color: Theme.purple) }) {
             VStack(alignment: .leading, spacing: 11) {
                 HStack(alignment: .firstTextBaseline, spacing: 4) {
                     Text(String(format: "%.1f", pct))
@@ -535,8 +544,8 @@ struct MonitorView: View {
                         .font(.system(size: 11.5).monospacedDigit())
                         .foregroundStyle(Theme.dim)
                 }
-                Sparkline(points: store.history["mem"] ?? [], color: Theme.purple,
-                          maxValue: 100, minValue: 0)
+                HistoryCurve(hist: store.hist, key: "mem", color: Theme.purple,
+                             maxValue: 100, minValue: 0)
                     .frame(height: 40)
 
                 StackedBar(segments: [
@@ -614,8 +623,8 @@ struct MonitorView: View {
                     // 2026-11-08（用户要求）：降频提示从「驱动遥测」网格底部挪到
                     // 标题行、紧跟「GPU」之后 —— 它解释的是整张卡当前的状态，
                     // 挂在遥测网格下面会被误读成「核心频率」那一格的注释。
-                    badge: { AnyView(throttleBadge) },
-                    trailing: { AnyView(Chip(text: dgpuShortName, color: Theme.amber)) }) {
+                    badge: { throttleBadge },
+                    trailing: { Chip(text: dgpuShortName, color: Theme.amber) }) {
             VStack(alignment: .leading, spacing: 12) {
                 // 主数字 + 温度（与 CPU 卡片同一套排版：34pt 圆角数字、右侧温度）
                 HStack(alignment: .firstTextBaseline, spacing: 4) {
@@ -657,17 +666,17 @@ struct MonitorView: View {
                             // 不再按占墙比例分档。两卡同一指标必须同一颜色，否则并排看
                             // 会以为 GPU 那个「白」是某种告警等级。
                             .foregroundStyle(Theme.amber)
-                            .help(gpuPowerHelp)
+                            .lazyHelp { gpuPowerHelp }
                         }
                     }
                 }
-                .help(dgpuDetailHelp)
+                .lazyHelp { dgpuDetailHelp }
                 .frame(height: Rhy.hero, alignment: .leading)
 
                 // 曲线固定 0~100：dGPU 空闲时 GR 只有 0.00~0.02，
                 // 自适应 Y 轴会把这点噪声拉满整卡高度，跟旁边的「0%」自相矛盾。
-                Sparkline(points: store.history["dgpu"] ?? [], color: Theme.amber,
-                          maxValue: 100, minValue: 0)
+                HistoryCurve(hist: store.hist, key: "dgpu", color: Theme.amber,
+                             maxValue: 100, minValue: 0)
                     .frame(height: Rhy.spark)
 
                 // 半列宽下四列排不开（每列只剩 100pt，"ENC 视频编码 0.0%" 会挤成两行），
@@ -890,14 +899,21 @@ struct MonitorView: View {
     /// Max-Q 版本功耗墙 115W，标准版 175W，省掉就没区别了）。
     /// system_profiler 给的是 "with Max-Q Design"，尾巴那个 Design 是苹果加的，
     /// 缩成 "with Max-Q" 更短且与官方命名一致。
+    /// 独显短名（去掉 NVIDIA GeForce / Max-Q 长尾）。
+    /// 2026-11-18（极限优化）：型号串整个生命周期不变，但每秒 body 要跑 3 个
+    /// replacingOccurrences 全串扫描 ×2 处调用 —— 按输入串 memoize。
+    private static var shortNameMemo: (raw: String, out: String)?
     private var dgpuShortName: String {
         let raw = BackendService.string(dgpuInfo, "name") ?? ""
         guard !raw.isEmpty else { return "未识别" }
-        return raw
+        if Self.shortNameMemo?.raw == raw { return Self.shortNameMemo!.out }
+        let out = raw
             .replacingOccurrences(of: "NVIDIA GeForce ", with: "")
             .replacingOccurrences(of: "NVIDIA ", with: "")
             .replacingOccurrences(of: " with Max-Q Design", with: " with Max-Q")
             .trimmingCharacters(in: .whitespaces)
+        Self.shortNameMemo = (raw, out)
+        return out
     }
 
     /// P 级位掩码 → 可读名称（驱动按「越低位越快」定义：0x1=P0 满速 … 0x1000=P12 最低）。
@@ -953,13 +969,13 @@ struct MonitorView: View {
         let active = ifs.filter { (BackendService.bool($0, "up") ?? false)
             && !(BackendService.bool($0, "loopback") ?? false) }
         return Card(title: "网络",
-                    trailing: { AnyView(Chip(text: "\(active.count) 个活动接口", color: Theme.cyan)) }) {
+                    trailing: { Chip(text: "\(active.count) 个活动接口", color: Theme.cyan) }) {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 14) {
                     rateBlock("下行", down, Theme.cyan, "arrow.down")
                     rateBlock("上行", up, Theme.purple, "arrow.up")
                 }
-                Sparkline(points: store.history["down"] ?? [], color: Theme.cyan)
+                HistoryCurve(hist: store.hist, key: "down", color: Theme.cyan)
                     .frame(height: 26)
                 Divider().overlay(Theme.line)
                 FieldGrid(rows: [
@@ -1071,12 +1087,31 @@ struct MonitorView: View {
 
     // MARK: - 取值
 
+    /// CPU 型号净化（去 Intel(R) Core(TM) / CPU / @ 基频尾段）。
+    /// 2026-11-18（极限优化）：同 dgpuShortName —— 输入不变，每秒重复扫描纯浪费，
+    /// memoize 后同输入零分配。
+    private static var brandCleanMemo: (raw: String, out: String)?
     private var cpuBrandClean: String {
         let raw = BackendService.string(store.cpu, "brand") ?? "—"
-        return raw
+        if Self.brandCleanMemo?.raw == raw { return Self.brandCleanMemo!.out }
+        var out = raw
             .replacingOccurrences(of: "Intel(R) Core(TM) ", with: "")
             .replacingOccurrences(of: " CPU", with: "")
             .trimmingCharacters(in: .whitespaces)
+        // 2026-11-18：截掉「@ 2.60GHz」尾段 —— 胶囊里的频率改由实时读数拼装
+        if let r = out.range(of: " @ ") { out = String(out[..<r.lowerBound]) }
+        Self.brandCleanMemo = (raw, out)
+        return out
+    }
+
+    /// 胶囊「@」后面的频率：优先实时读数（freq_cur_mhz），
+    /// 没有就回落到标称基频（freq_base_mhz，再没有才显示 —）。
+    private var freqNote: String {
+        if let mhz = BackendService.double(store.cpu, "freq_cur_mhz"), mhz > 0 {
+            return MenuBarMonitors.compactMHz(mhz)
+        }
+        let base = BackendService.double(store.cpu, "freq_base_mhz") ?? 0
+        return base > 0 ? String(format: "%.2fGHz", base / 1000) : "—"
     }
 
     private var coreNote: String {
@@ -1112,5 +1147,11 @@ extension View {
     /// 现在卡片高度跟着内容走，行内对齐顶部，允许留小空。
     @ViewBuilder func gridEqual() -> some View {
         frame(maxWidth: .infinity, alignment: .top)
+    }
+
+    /// 撑宽 + 撑满行高（2026-11-18 用户要求：设置页「外观与通用」与「版本」卡高度一致）。
+    /// 只给明确要求两卡等高的页面用，不替代 gridEqual（性能页等处仍允许内容少卡留白）。
+    @ViewBuilder func gridEqualFull() -> some View {
+        frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 }

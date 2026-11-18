@@ -112,19 +112,20 @@ struct ControlView: View {
     private var header: some View {
         PageHeader(title: "控制",
                    sub: "显卡路由 / 散热模式 / 系统功耗设置 / 充电阈值 · 所有开关以硬件真实回读为准",
-                   trailing: AnyView(
-                    HStack(spacing: 10) {
-                        if !synced {
-                            Text("读取中…").font(.system(size: 11)).foregroundStyle(Theme.dim2)
-                        } else {
-                            Text("\(thermalLabel) · \(powerLabel)\(benchmark ? " · 基准" : "")")
-                                .font(.system(size: 11.5))
-                                .foregroundStyle(Theme.dim)
-                                .padding(.horizontal, 9).padding(.vertical, 5)
-                                .background(Theme.panel, in: Capsule())
-                                .overlay(Capsule().strokeBorder(Theme.line, lineWidth: 1))
-                        }
-                    }))
+                   trailing: {
+                       HStack(spacing: 10) {
+                           if !synced {
+                               Text("读取中…").font(.system(size: 11)).foregroundStyle(Theme.dim2)
+                           } else {
+                               Text("\(thermalLabel) · \(powerLabel)\(benchmark ? " · 基准" : "")")
+                                   .font(.system(size: 11.5))
+                                   .foregroundStyle(Theme.dim)
+                                   .padding(.horizontal, 9).padding(.vertical, 5)
+                                   .background(Theme.panel, in: Capsule())
+                                   .overlay(Capsule().strokeBorder(Theme.line, lineWidth: 1))
+                           }
+                       }
+                   })
     }
 
     // MARK: - 从后端回读同步本地状态

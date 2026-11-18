@@ -275,9 +275,6 @@ final class MenuBarMonitors: NSObject {
         ensureMonitorItem()
     }
 
-    /// 兼容保留：历史调用点（面板 / 设置页）不用改。
-    func refreshTitles() {}
-
     /// 创建 / 更新监控状态项（S 飘带之外的那个）。没有勾任何监控段时隐藏。
     private func ensureMonitorItem() {
         if monitorItem == nil {
@@ -342,7 +339,10 @@ final class MenuBarMonitors: NSObject {
     private static var enabledSegsCache: [MenuBarSegment] = []
     private static var enabledSegsValid = false
 
-    static func invalidateSegmentCache() { enabledSegsValid = false }
+    static func invalidateSegmentCache() {
+        enabledSegsValid = false
+        diskToggleCache.removeAll()   // 2026-11-18：硬盘段开关缓存一起失效
+    }
 
     private static func enabledSegs() -> [MenuBarSegment] {
         if enabledSegsValid { return enabledSegsCache }
@@ -351,6 +351,19 @@ final class MenuBarMonitors: NSObject {
         }
         enabledSegsValid = true
         return enabledSegsCache
+    }
+
+    /// 硬盘段开关缓存（2026-11-18 极限优化）。
+    /// 静态段有 enabledSegsCache，动态硬盘段漏了同款 —— 每块盘每帧一次
+    /// `UserDefaults.bool`（CFPreferences 锁），两块盘就是每帧两遍。
+    /// 失效点与静态段一致（UserDefaults 变更 / 图标变更通知），见 invalidateSegmentCache。
+    private static var diskToggleCache: [String: Bool] = [:]
+
+    private static func diskEnabled(_ bsd: String) -> Bool {
+        if let on = diskToggleCache[bsd] { return on }
+        let on = UserDefaults.standard.bool(forKey: diskKey(bsd))
+        diskToggleCache[bsd] = on
+        return on
     }
 
     /// 当前拼进菜单栏的段（静态段按声明顺序；动态硬盘段插在网速前）
@@ -368,7 +381,7 @@ final class MenuBarMonitors: NSObject {
         for d in disks {
             let bsd = BackendService.string(d, "bsd") ?? ""
             guard !bsd.isEmpty else { continue }
-            if UserDefaults.standard.bool(forKey: diskKey(bsd)) {
+            if diskEnabled(bsd) {
                 out.append(.disk(bsd: bsd, model: BackendService.string(d, "model") ?? ""))
             }
         }
@@ -564,7 +577,7 @@ final class MenuBarMonitors: NSObject {
         }
     }
 
-    /// 网速：Stats Units.getReadableSpeed 同款（带 /s），Speed 双行小件专用
+    /// 网速：Stats Units.getReadableSpeed 同款（带 /s），Speed 双行小件使用
     static func netSpeedText(_ bytesPerSecond: Double) -> String {
         switch bytesPerSecond {
         case ..<1_000:                          return "0 KB/s"

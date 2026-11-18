@@ -15,7 +15,7 @@ struct FanRPMCard: View {
     var body: some View {
         let avail = BackendService.bool(store.fan, "available") ?? false
         return Card(title: "风扇 · TongfangFan",
-                    trailing: { AnyView(Chip(text: fanModeText, color: Theme.blue)) }) {
+                    trailing: { Chip(text: fanModeText, color: Theme.blue) }) {
             if !avail {
                 HStack(spacing: 8) {
                     Image(systemName: "lock.fill").foregroundStyle(Theme.dim2)

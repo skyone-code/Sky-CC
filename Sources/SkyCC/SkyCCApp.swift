@@ -362,6 +362,12 @@ struct SkyCCApp: App {
         // 默认 .menu 风格把控件强行压成 NSMenuItem——Slider 缩成一截、
         // HStack 间距错乱（2026-10-17 v2.3.1 截图实锤），不可用。
         .menuBarExtraStyle(.window)
+        // 2026-11-18（用户要求）：默认关于面板太简陋 → 替换为自定义关于窗口
+        .commands {
+            CommandGroup(replacing: .appInfo) {
+                Button("关于 Sky CC") { AboutWindowPresenter.show() }
+            }
+        }
 
     }
 
@@ -427,7 +433,14 @@ struct SkyCCApp: App {
                     store.setWindowVisible(shown)
                 }
         }
-        .windowStyle(.titleBar)
+        // 2026-11-18（用户定案「两态标题栏必须同模」+ 修「玻璃开着重启标题栏失效」）：
+        // .titleBar 出生是标准标题栏，玻璃态靠运行时插 fullSizeContentView —— 事后
+        // 插掩模时 SwiftUI 布局/安全区不跟着刷新，重启恢复玻璃时标题带就露底
+        // （手动切换没事是因为窗口已活跃、布局会重算）。改 .hiddenTitleBar：
+        // 窗口从出生起就是 fullSizeContentView + 透明标题栏，两态同一结构，
+        // 玻璃只切窗口本体透明度，无事后补丁、无竞态。.titled 仍在，isMainWindow
+        // 谓词（靠 .titled 区分弹窗）不受影响；标题文字隐藏（侧边栏已有 logo）。
+        .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1180, height: 760)
     }
 }
@@ -998,7 +1011,9 @@ struct RootView: View {
             // NVIDIA 页用品牌 logo（用户提供的绿眼 SVG），其余页仍用 SF Symbols
             if p == .nvidia, let logo = NvidiaBrandIcon.image {
                 Image(nsImage: logo)
-                    .resizable().scaledToFit()
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
                     .frame(width: 24, height: 24)
                     .padding(0)
                     .background(Theme.green.opacity(0.12),
@@ -1026,42 +1041,27 @@ struct RootView: View {
         .padding(.vertical, 2)
     }
 
-    /// 侧边栏顶部行：app 图标 + 「Sky CC」+ 版本号
+    /// 侧边栏顶部：横版 lockup（2026-11-18 定稿：再放大 + 去掉版本号）
     private var appHeaderRow: some View {
-        HStack(spacing: 11) {
-            Image(nsImage: appIcon)
-                .resizable()
-                .frame(width: 38, height: 38)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Sky CC")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(Theme.txt)
-                Text("版本 \(AppVersion.short)")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 5) {
+            if let logo = Self.cachedLogoHorizontal {
+                Image(nsImage: logo)
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
+                    .frame(height: 56)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
-            Spacer(minLength: 0)
         }
         .padding(.vertical, 10)
     }
 
-    /// app 图标：优先 bundle 里的 AppIcon.icns（构建脚本装到 Contents/Resources/），
-    /// 回退系统 NSApplicationIcon（裸跑二进制时也能显示）
-    ///
-    /// 2026-11-17（性能自查）：这里原来是 computed property —— 侧边栏每次 body 求值
-    /// 都要 `Bundle.url` + `NSImage(contentsOf:)` **从磁盘重新解码 ICNS**。
-    /// 采样里 `RootView.sidebar → appHeaderRow → appIcon → -[NSImage initWithContentsOfURL:] →
-    /// NSBitmapImageRep` 是一条稳定的热点链（窗口可见时每拍都走一遍）。
-    /// 图标是常量，首次加载后缓存即可。
-    private static let cachedAppIcon: NSImage = {
-        if let url = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
-           let img = NSImage(contentsOf: url) {
-            return img
-        }
-        return NSImage(named: NSImage.Name("NSApplicationIcon")) ?? NSImage()
-    }()
+    /// 横版组合标（构建时拷到 Resources/LogoComboHorizontal.png）
+    /// 2026-11-18：改走 BrandAssets 多级减半预缩放（1644px 直接缩 56pt 必出锯齿）
+    private static let cachedLogoHorizontal: NSImage? =
+        BrandAssets.prescaled("LogoComboHorizontal", targetPixelHeight: 112)
 
-    private var appIcon: NSImage { Self.cachedAppIcon }
+    // （旧侧边栏 app 图标缓存已删：2026-11-18 侧边栏改用横版 lockup 后无人引用）
 
     @ViewBuilder
     private var detailView: some View {

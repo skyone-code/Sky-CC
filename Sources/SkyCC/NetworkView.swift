@@ -80,7 +80,7 @@ struct NetworkView: View {
                     components[spec.id].map { (spec, $0) }
                 }
                 ForEach(Array(rows.enumerated()), id: \.element.0.id) { index, pair in
-                    let (spec, item) = pair
+                    let (_, item) = pair
                     HStack(spacing: 10) {
                         Circle()
                             .fill(item.loaded ? Theme.green

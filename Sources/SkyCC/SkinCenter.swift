@@ -20,7 +20,7 @@ final class SkinCenter: ObservableObject {
     // MARK: 预设配色
 
     enum Preset: String, CaseIterable, Identifiable {
-        case ink, forest, violet, sand, ocean, rose
+        case ink, forest, violet, sand, ocean, rose, glass
         var id: String { rawValue }
 
         var label: String {
@@ -31,11 +31,13 @@ final class SkinCenter: ObservableObject {
             case .sand:   return "暖沙"
             case .ocean:  return "海青"
             case .rose:   return "玫瑰"
+            case .glass:  return "玻璃"
             }
         }
 
         /// 页面底色（浅色外观 / 深色外观）。默认套 = Theme.bg 原值，
         /// 其余各套在明度上贴着原值的档位微调色相，卡片白/深灰底不变。
+        /// glass 的底色只作兜底（蒙层 / 色板），玻璃本体走窗口 vibrancy + 染色层。
         var lightHex: UInt32 {
             switch self {
             case .ink:    return 0xf6f7f9
@@ -44,6 +46,7 @@ final class SkinCenter: ObservableObject {
             case .sand:   return 0xf7f2ea
             case .ocean:  return 0xeaf3f5
             case .rose:   return 0xf7eef0
+            case .glass:  return 0xf0f3fb
             }
         }
         var darkHex: UInt32 {
@@ -54,8 +57,12 @@ final class SkinCenter: ObservableObject {
             case .sand:   return 0x221f1a
             case .ocean:  return 0x161f23
             case .rose:   return 0x241a1d
+            case .glass:  return 0x1e2126
             }
         }
+
+        /// 是否玻璃皮肤（窗口级 vibrancy + 表面超透，见 Theme.surfaceSkin）
+        var isGlass: Bool { self == .glass }
 
         /// 动态底色（按当前外观自动切浅/深档）
         var bgColor: Color { Theme.dyn(light: lightHex, dark: darkHex) }
@@ -74,14 +81,20 @@ final class SkinCenter: ObservableObject {
     @Published private(set) var customImage: NSImage?
     /// 侧边栏专属背景图（nil = 跟随页面公共背景层，2026-11-15 用户要求）
     @Published private(set) var sidebarImage: NSImage?
+    /// 上一个非玻璃皮肤（2026-11-18：玻璃效果开关「关」时回到这里；持久化）
+    @Published private(set) var lastNonGlass: Preset
 
     static let presetKey = "skin.preset"
     static let imagePathKey = "skin.image.path"
     static let sidebarImagePathKey = "skin.sidebar.image.path"
+    static let lastPresetKey = "skin.last.preset"
 
     private init() {
         let d = UserDefaults.standard
-        preset = Preset(rawValue: d.string(forKey: Self.presetKey) ?? "") ?? .ink
+        // 2026-11-18（用户要求）：玻璃效果默认打开 —— 首次启动（无存储记录）直接进玻璃皮肤
+        preset = Preset(rawValue: d.string(forKey: Self.presetKey) ?? "") ?? .glass
+        lastNonGlass = Preset(rawValue: d.string(forKey: Self.lastPresetKey) ?? "") ?? .ink
+        if lastNonGlass.isGlass { lastNonGlass = .ink }
         if let path = d.string(forKey: Self.imagePathKey),
            let img = NSImage(contentsOfFile: path) {
             customImage = img
@@ -100,6 +113,13 @@ final class SkinCenter: ObservableObject {
     var isCustomImage: Bool { customImage != nil }
     var hasSidebarImage: Bool { sidebarImage != nil }
 
+    /// 玻璃效果开关的当前态（随皮肤自动同步；2026-11-18 改版：开关即选皮肤）
+    var glassOn: Bool { preset.isGlass }
+
+    /// 玻璃效果当前是否真正生效：玻璃皮肤 + 没铺自定义图片。
+    /// Theme 的背景层 / 表面透明度 / 窗口透明都认这一个口径。
+    var isGlassActive: Bool { preset.isGlass && customImage == nil }
+
     /// 当前页面底色（无自定义图片时 pageBackground 用它铺纯色）
     var bgColor: Color { preset.bgColor }
 
@@ -109,7 +129,23 @@ final class SkinCenter: ObservableObject {
     func select(_ p: Preset) {
         preset = p
         UserDefaults.standard.set(p.rawValue, forKey: Self.presetKey)
+        if !p.isGlass {
+            lastNonGlass = p
+            UserDefaults.standard.set(p.rawValue, forKey: Self.lastPresetKey)
+        }
         if isCustomImage { clearCustomImage() }
+    }
+
+    /// 玻璃效果开关（2026-11-18 改版：随时可开可关，像系统设置的透明开关）。
+    /// 开 = 切到玻璃皮肤；关 = 回到上一个非玻璃皮肤。色板选中玻璃时开关自动为开。
+    func setGlassEffect(_ on: Bool) {
+        if on {
+            guard !preset.isGlass else { return }
+            select(.glass)
+        } else {
+            guard preset.isGlass else { return }
+            select(lastNonGlass)
+        }
     }
 
     /// 设置自定义图片：拷贝进 App 支持目录持久化，成功返回 true

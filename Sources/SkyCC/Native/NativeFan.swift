@@ -678,7 +678,7 @@ final class FanControl {
         return ecWriteVerified(EC.ctrl1, target)
     }
 
-    /// 退出控制台专用：**无条件**清 `0x741` bit0，不看 `apPresentHold`。
+    /// 退出控制台流程：**无条件**清 `0x741` bit0，不看 `apPresentHold`。
     ///
     /// 与 `setAPPresent(false)` 的区别：那个会改用户偏好（下次开 app 也不置 1），
     /// 这个只清硬件状态 —— 用户开着心跳正常用，退出时按原厂语义交还硬件，

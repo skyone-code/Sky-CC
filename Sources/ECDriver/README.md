@@ -69,3 +69,15 @@ sudo sh Sources/ECDriver/install-ec-kext.sh  # 装到 /Library/Extensions + 重�
 上游 [kirainmoe/TongfangEnhancer](https://github.com/kirainmoe/TongfangEnhancer)
 （GPL）只有「固定地址写风扇档位」的能力，没有通用 EC 读写；通用通道是前一位
 作者在二进制里加的。所以这里按**对外行为**重写，而不是搬上游代码。
+
+## 版权与许可
+
+本内核扩展的 WMI/EC 通信协议基于
+[TongfangEnhancer](https://github.com/kirainmoe/TongfangEnhancer)（**GPL-2.0**，
+Copyright (C) 2019 kirainmoe / Kai Ren）还原实现——WMI 方法封装、EC 邮箱事务与
+风扇档位寄存器均源自该项目的公开源码与接口约定。依 GPL-2.0 条款，**本内核扩展
+（Sources/ECDriver/ 全部源码与产物 SkyCCEC.kext）同样按 GPL-2.0 发布**，任何人可
+按该协议获取、修改与再分发；本程序不提供任何担保。协议全文见
+[gnu.org/licenses/old-licenses/gpl-2.0.html](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html)。
+
+安装器内也带了一页开源声明（license.html），用户安装时必须同意后才继续。

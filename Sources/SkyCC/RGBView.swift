@@ -245,16 +245,17 @@ struct RGBView: View {
     private var header: some View {
         PageHeader(title: "灯效",
                    sub: "键盘 RGB · ITE 8291 · USB HID 直写 / 海岸灯 · EC 0x0748-0x074B",
-                   trailing: AnyView(
-                    HStack(spacing: 10) {
-                        badge(on: rgbAvailable, onText: "键盘在线", offText: "键盘离线")
-                        badge(on: lightbarAvailable, onText: "海岸灯可用", offText: "海岸灯离线")
-                        if !synced {
-                            Text("读取中…")
-                                .font(.system(size: 11))
-                                .foregroundStyle(Theme.dim2)
-                        }
-                    }))
+                   trailing: {
+                       HStack(spacing: 10) {
+                           badge(on: rgbAvailable, onText: "键盘在线", offText: "键盘离线")
+                           badge(on: lightbarAvailable, onText: "海岸灯可用", offText: "海岸灯离线")
+                           if !synced {
+                               Text("读取中…")
+                                   .font(.system(size: 11))
+                                   .foregroundStyle(Theme.dim2)
+                           }
+                       }
+                   })
     }
 
     private func badge(on: Bool, onText: String, offText: String) -> some View {

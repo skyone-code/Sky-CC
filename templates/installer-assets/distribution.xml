@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  distribution.xml —— 安装器外壳（productbuild 用）
+  __VERSION__ 由 build-swift.sh 在打包时替换成真实版本号。
+
+  说明：
+  · customize="never"：不给用户勾选项（单组件包，勾选页只会造成困惑）
+  · background（浅色）/ background-darkAqua（深色）双背景：Installer 按
+    系统深浅模式自动选；深色标签名必须是 darkAqua，写 background-dark 无效
+    welcome / conclusion / license 用 HTML（WebView 默认文字色随外观自适应，
+    RTF 文字色写死做不到，已弃用）
+  · license：开源组件声明页（用户必须点同意才能继续，满足 GPL-2.0 署名要求）
+  · 各文件由 productbuild 从 resources 目录取
+-->
+<installer-gui-script minSpecVersion="2">
+    <title>Sky CC __VERSION__ 安装器</title>
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <license file="license.html" mime-type="text/html"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+    <options customize="never" rootVolumeOnly="true"/>
+    <domains enable_localSystem="true"/>
+    <background alignment="bottomleft" file="background.png"
+                mime-type="image/png" scaling="proportional"/>
+    <!-- 深色外观的标签名是 background-darkAqua（不是 background-dark，
+         写错的话深色模式下一张背景都不画）；文件名不受影响 -->
+    <background-darkAqua alignment="bottomleft" file="background-dark.png"
+                         mime-type="image/png" scaling="proportional"/>
+    <pkg-ref id="com.skycc.installer">SkyCC-stripped.pkg</pkg-ref>
+    <choices-outline>
+        <line choice="com.skycc.installer"/>
+    </choices-outline>
+    <choice id="com.skycc.installer" visible="false">
+        <pkg-ref id="com.skycc.installer"/>
+    </choice>
+</installer-gui-script>

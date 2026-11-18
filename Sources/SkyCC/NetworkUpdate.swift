@@ -3,7 +3,7 @@
 //  「网卡驱动」页数据层：二合一驱动包（AirportItlwm-Tahoe + BlueToolFixup + 安装脚本）
 //
 //  2026-11-15 用户定案：模式与 NVIDIA 驱动完全一致 ——
-//    · 唯一更新源 skyone213/AirportItlwm-AX200-Airdrop，一个 release 一个包
+//    · 唯一更新源 skyone-code/AirportItlwm-AX200-Airdrop，一个 release 一个包
 //    · tag 纯数字点分（2.4.1 / 2.4.1.1）= 包版本；资产 AirportItlwm-AX200-<tag>.zip
 //    · zip 内：两个 kext + 随包安装脚本（install.command / install.sh 皆认，多层查找）
 //    · App 只负责「下载 → 解压 → 提权执行包内脚本」；备份 / 替换 / 校验全部由脚本负责
@@ -17,7 +17,7 @@ import SwiftUI
 // MARK: - 更新源（单一二合一包）
 
 enum NetworkPackage {
-    static let repo = "skyone213/AirportItlwm-AX200-Airdrop"
+    static let repo = "skyone-code/AirportItlwm-AX200-Airdrop"
     static let title = "网卡驱动包（Wi-Fi + 蓝牙）"
     /// Gitee 镜像仓（GitHub 不通时的兜底，tag 与 GitHub 一致但无 v 前缀）
     static let giteeRepo = "AirportItlwm-AX200-Airdrop"

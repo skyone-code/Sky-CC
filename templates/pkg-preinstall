@@ -1,14 +1,123 @@
 #!/bin/sh
 # ---------------------------------------------------------------------------
-# preinstall —— 升级前先让正在运行的旧版退出
+# preinstall —— 安装**之前**由 Installer（root）调用
 #
-# 不这么做的话，pkg 覆盖 /Applications/Sky CC.app 时旧进程还持有旧二进制，
-# 装完用户点开的是新 app、但菜单栏还挂着旧进程，温度和风扇会显示两份。
-# 退出失败不阻断安装（|| true）。
+# 两件事，顺序刻意安排成「先清旧、payload 再落新」：
+#
+# ① 让正在运行的旧版退出（app + helper，新旧两代进程名都杀）。
+#    不这么做的话，pkg 覆盖 /Applications/Sky CC.app 时旧进程还持有旧二进制，
+#    装完用户点开的是新 app、但菜单栏还挂着旧进程，温度和风扇会显示两份。
+#
+# ② 清掉旧版本遗留、而 payload 又表达不了的东西。pkg 只覆盖自己携带的文件，
+#    不会删除「这个版本不再带、以前版本装过」的文件 —— 不清的话它们就永远
+#    留在系统里（旧 kext、旧守护、旧工具会跟新版抢 EC / 抢登录项）。
+#    每一项都有存在性检查，全新机器上全部跳过，幂等可重复跑。
+#
+#    不清的东西（刻意保留，交给别处处理）：
+#      · 用户数据（~/Library/Application Support、UserDefaults）—— app 内
+#        SkyCCMigrator 首启迁移，这里删了反而丢档；
+#      · /Library/GPUBundles/gpu-router.dylib 与 /usr/local/lib 软链 ——
+#        新版 payload 本来就要覆盖它，postinstall 还要重钉权限。
+#
+# 全程写 /tmp/skycc-preinstall.log，出错不阻断安装（|| true）。
 # ---------------------------------------------------------------------------
+LOG=/tmp/skycc-preinstall.log
+exec >> "$LOG" 2>&1
+echo "===== Sky CC preinstall $(date '+%Y-%m-%d %H:%M:%S') ====="
+
+# 控制台用户（LaunchAgent / 支持库都在他家目录下，root 替他清）
+CONSOLE_UID=$(/usr/bin/stat -f %u /dev/console 2>/dev/null || echo 501)
+CONSOLE_USER=$(/usr/bin/stat -f %Su /dev/console 2>/dev/null || true)
+CONSOLE_HOME=""
+if [ -n "$CONSOLE_USER" ]; then
+  CONSOLE_HOME=$(/usr/bin/dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory 2>/dev/null | /usr/bin/awk '{print $2}')
+fi
+
+# ------------------------------------------------ ① 停正在跑的旧进程
+echo "--- 停止旧版进程 ---"
 /usr/bin/pkill -f "Sky CC.app/Contents/MacOS/Sky CC" 2>/dev/null || true
+/usr/bin/pkill -f "Sky CC.app/Contents/MacOS/SkyCCHelper" 2>/dev/null || true
 # 2026-11-17（MacConsole → SkyCC 更名）：helper 二进制改名，新旧两个名字都要杀 ——
 # 装了多个版本的机器上可能两个都在（旧包留下的 MacConsoleHelper 还会抢 EC）。
-/usr/bin/pkill -f "Sky CC.app/Contents/MacOS/SkyCCHelper" 2>/dev/null || true
 /usr/bin/pkill -f "Sky CC.app/Contents/MacOS/MacConsoleHelper" 2>/dev/null || true
+# 更早的旧版 app（≤3.0.4.4）进程名也不同，一并杀
+/usr/bin/pkill -f "Mac控制台.app/Contents/MacOS/Mac控制台" 2>/dev/null || true
+/usr/bin/pkill -f "MacConsoleHelper" 2>/dev/null || true
+
+# ------------------------------------------------ ② 清旧版本残留
+echo "--- 清理旧版本遗留文件 ---"
+
+# 2.1 旧 app（更名前的 Mac控制台 两个代次；新 app 由 payload 覆盖，这里不用管）
+for OLDAPP in \
+  "/Applications/Mac控制台.app" \
+  "$CONSOLE_HOME/Applications/Mac控制台.app" \
+  "/Applications/Mac控制台开机启动.app" \
+  "$CONSOLE_HOME/Applications/Mac控制台开机启动.app"; do
+  if [ -d "$OLDAPP" ]; then
+    /bin/rm -rf "$OLDAPP" && echo "已删除旧 app：$OLDAPP"
+  fi
+done
+
+# 2.2 旧内核扩展：TongfangFan（第三方二进制时代）、SkyCCMSR（已并入 SkyCCEC）。
+#     若正被内核占用（macOS 26 的 kernel collection），bundle 删掉后驻留到重启为止，
+#     新版不再回落到它，无副作用。当前用的 SkyCCEC.kext 不动（payload 会更新它）。
+for K in /Library/Extensions/TongfangFan.kext /Library/Extensions/SkyCCMSR.kext; do
+  if [ -d "$K" ]; then
+    /usr/bin/kmutil unload -p "$K" >/dev/null 2>&1 || true
+    /bin/rm -rf "$K" && echo "已删除旧内核扩展：$K"
+  fi
+done
+
+# 2.3 旧 LaunchDaemon（kext 开机加载守护，旧命名两代）+ 当前守护的 bootout。
+#     com.skycc.ec.plist 是现役守护，install-kext.sh 装完会重建，这里只 bootout
+#     让它重新被新 plist 拉起；旧命名的 plist 直接摘掉。
+launchctl bootout "system/com.skycc.ec" >/dev/null 2>&1 || true
+for L in com.skycc.TongfangFan com.macconsole.TongfangFan; do
+  launchctl bootout "system/$L" >/dev/null 2>&1 || true
+  launchctl disable "system/$L" >/dev/null 2>&1 || true
+  if [ -f "/Library/LaunchDaemons/$L.plist" ]; then
+    /bin/rm -f "/Library/LaunchDaemons/$L.plist" && echo "已删除旧守护：$L.plist"
+  fi
+done
+
+# 2.4 旧用户级 LaunchAgent（登录项）。launchd 域里已注册的先 bootout，
+#     再删家目录里的 plist（helper / autostart / rgbrestore，新旧两代命名）。
+for L in com.skycc.helper com.skycc.autostart com.skycc.rgbrestore \
+         com.macconsole.helper com.macconsole.autostart com.macconsole.rgbrestore; do
+  if [ "$CONSOLE_UID" -gt 0 ] 2>/dev/null; then
+    launchctl bootout "gui/$CONSOLE_UID/$L" >/dev/null 2>&1 || true
+  fi
+  for F in "$CONSOLE_HOME/Library/LaunchAgents/$L.plist" \
+           "$CONSOLE_HOME/Library/LaunchAgents/$L.plist.disabled"; do
+    if [ -e "$F" ]; then
+      /bin/rm -f "$F" && echo "已删除旧登录项：$F"
+    fi
+  done
+done
+
+# 2.5 旧开机 kext 加载器（2.8.15 时代放在用户支持库，名字已换过一次）
+if [ -n "$CONSOLE_HOME" ]; then
+  for LOADER in \
+    "$CONSOLE_HOME/Library/Application Support/SkyCC/bin/Mac控制台散热扩展" \
+    "$CONSOLE_HOME/Library/Application Support/MacConsole/bin/Mac控制台散热扩展" \
+    "$CONSOLE_HOME/Library/Application Support/MacConsole/bin/Sky CC散热扩展"; do
+    if [ -e "$LOADER" ]; then
+      /bin/rm -f "$LOADER" && echo "已删除旧开机加载器：$LOADER"
+    fi
+  done
+fi
+if [ -e "/Library/PrivilegedHelperTools/Mac控制台散热扩展" ]; then
+  /bin/rm -f "/Library/PrivilegedHelperTools/Mac控制台散热扩展" \
+    && echo "已删除旧开机加载器：/Library/PrivilegedHelperTools/Mac控制台散热扩展"
+fi
+
+# 2.6 历史遗留命令行工具（亮度 / 风扇时代的散件）
+for T in /usr/local/bin/auxbright /usr/local/bin/pwmwake /usr/local/bin/fanctl \
+         /usr/local/bin/rgbkb.py; do
+  if [ -e "$T" ]; then
+    /bin/rm -f "$T" && echo "已删除旧工具：$T"
+  fi
+done
+
+echo "--- preinstall 完成 ---"
 exit 0

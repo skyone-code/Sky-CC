@@ -12,6 +12,26 @@ import SwiftUI
 /// 转速面（EC 0x0464/0x046C：0x464=CPU 主风扇、0x46C=GPU 第二颗）仍由 helper 的后台采样器 2 秒采一次——EC 邮箱硬上限
 /// ~15 次/秒，一次全扫 17 读就是 1.1 秒，1 秒轮询不可能直读（见坑 #55）。
 /// 所以「UI 1 秒刷新、转速值 2 秒更新」，与 Stats 的 1 秒一致，快照本身 <50ms。
+/// 90 秒曲线缓冲（2026-11-18 极限优化，见 MonitorStore.hist 注释）。
+/// 独立 ObservableObject：只有画曲线的 HistoryCurve 订阅它，
+/// 曲线追加点不再拖整棵监控页重算。
+@MainActor
+final class HistoryStore: ObservableObject {
+    @Published var history: [String: [Double]] = [:]
+    static let len = 90
+
+    /// 按键追加一个点，超长截头（CoW 下只是 90 元素数组的追加，微秒级）
+    func add(_ key: String, _ v: Double?) {
+        guard let v, v.isFinite else { return }
+        var h = history
+        var arr = h[key] ?? []
+        arr.append(v)
+        if arr.count > Self.len { arr.removeFirst(arr.count - Self.len) }
+        h[key] = arr
+        history = h
+    }
+}
+
 @MainActor
 final class MonitorStore: ObservableObject {
 
@@ -35,9 +55,12 @@ final class MonitorStore: ObservableObject {
     /// 2026-11-08：不再是 @Published —— 它每秒都变，却没人在界面上读它，
     /// 白白让所有订阅者重建一次视图。
     private(set) var tick: Int = 0
-    /// 最近 90 秒的曲线数据（性能页画折线用，与 Stats 的实时图同思路）
-    @Published var history: [String: [Double]] = [:]
-    static let historyLen = 90
+    /// 最近 90 秒的曲线数据（性能页画折线用，与 Stats 的实时图同思路）。
+    /// 2026-11-18（极限优化）：拆出独立 HistoryStore —— 原来挂在 MonitorStore 上
+    /// 每秒必发一次 objectWillChange，把整棵监控页拖着重算（哪怕温度/占用一拍
+    /// 没变）。拆出去后只有画曲线的 HistoryCurve 订阅它，卡片主体只在真实
+    /// 数据变化时重算，逐字段 diff 优化才真正生效。
+    let hist = HistoryStore()
 
     private weak var backend: BackendService?
     private var loop: Task<Void, Never>?
@@ -177,32 +200,25 @@ final class MonitorStore: ObservableObject {
         !(a as AnyObject).isEqual(b as AnyObject)
     }
 
-    /// 把关心的几个指标压进环形缓冲（1 秒一个点，90 点 = 90 秒）
+    /// 把关心的几个指标压进曲线缓冲（1 秒一个点，90 点 = 90 秒）。
+    /// 2026-11-18（极限优化）：写入拆到 HistoryStore，发布范围只剩曲线子视图；
+    /// 原来的「整字典拷贝 + 900 点深比较」换成 HistoryStore.add 里按键追加
+    /// （90 元素数组 CoW 追加，微秒级）。
     private func pushHistory() {
-        var h = history
-        func add(_ k: String, _ v: Double?) {
-            guard let v, v.isFinite else { return }
-            var arr = h[k] ?? []
-            arr.append(v)
-            if arr.count > Self.historyLen { arr.removeFirst(arr.count - Self.historyLen) }
-            h[k] = arr
-        }
-        add("cpu", BackendService.double(overview, "cpu_usage"))
-        add("mem", BackendService.double(memory, "percent"))
-        add("gpu", BackendService.double(overview, "gpu_usage"))
-        add("cpuTemp", cpuTemp > 0 ? cpuTemp : nil)
-        add("gpuTemp", Double(BackendService.int(live, "temp_gpu") ?? 0))
-        add("rpm", Double(BackendService.int(live, "rpm_cpu") ?? 0))
-        add("power", cpuWatts)
-        add("down", BackendService.double(net, "down_kbs"))
-        add("up", BackendService.double(net, "up_kbs"))
-        add("diskTemp", diskTemp)
+        hist.add("cpu", BackendService.double(overview, "cpu_usage"))
+        hist.add("mem", BackendService.double(memory, "percent"))
+        hist.add("gpu", BackendService.double(overview, "gpu_usage"))
+        hist.add("cpuTemp", cpuTemp > 0 ? cpuTemp : nil)
+        hist.add("gpuTemp", Double(BackendService.int(live, "temp_gpu") ?? 0))
+        hist.add("rpm", Double(BackendService.int(live, "rpm_cpu") ?? 0))
+        hist.add("power", cpuWatts)
+        hist.add("down", BackendService.double(net, "down_kbs"))
+        hist.add("up", BackendService.double(net, "up_kbs"))
+        hist.add("diskTemp", diskTemp)
         // 独显利用率只在驱动真的上报时才进曲线，否则整条 0 线会误导。
         // 用 5 秒均值而不是瞬时值：驱动按整秒发布，瞬时值在 90 点折线上是一格一个台阶，
         // 而均值是本进程在 payload 里算好的本地滑动平均，不多花一次 IORegistry 读。
-        add("dgpu", dgpuReported ? dgpuUtil : nil)
-        // 只有真的加进新点才发布（返回值为 false 说明这一拍全空）
-        if h.count != history.count || h != history { history = h }
+        hist.add("dgpu", dgpuReported ? dgpuUtil : nil)
     }
 
     func refreshSlow() async {
@@ -416,6 +432,12 @@ final class MonitorStore: ObservableObject {
                     BackendService.int(p, "age_ms") ?? 0)
         }
         return nil
+    }
+    /// 一次取齐 PCPT 三元组（2026-11-18 极限优化）：原来 cpuWatts / cpuWattsStale /
+    /// cpuWattsAgeMs 各自线性扫一遍 sensors["power"]，CPU 卡一个 body 要扫 3 遍。
+    func cpuPower() -> (watts: Double?, stale: Bool, ageMs: Int) {
+        guard let e = powerEntry("PCPT") else { return (nil, false, 0) }
+        return (e.v, e.stale, e.ageMs)
     }
     /// 封装功耗（SMC PCPT / PCPR）
     var cpuWatts: Double? { powerEntry("PCPT")?.v }

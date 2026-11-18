@@ -1,5 +1,7 @@
 //
-//  SkyCCEC.cpp —— EC 通道实现（见 SkyCCEC.hpp 顶部的协议说明）
+//  SkyCCEC.cpp —— EC 通道实现（协议说明与许可声明见 SkyCCEC.hpp 顶部：
+//  协议基于 TongfangEnhancer（GPL-2.0，Copyright (C) 2019 kirainmoe）还原
+//  实现，本扩展因此同样按 GPL-2.0 发布）
 //
 
 #include "SkyCCEC.hpp"
