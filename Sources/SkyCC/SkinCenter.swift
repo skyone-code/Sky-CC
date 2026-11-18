@@ -112,6 +112,15 @@ final class SkinCenter: ObservableObject {
         UserDefaults.standard.set(hex, forKey: dark ? Self.colorDarkKey : Self.colorLightKey)
     }
 
+    /// 恢复默认底色（2026-11-18 用户要求）：浅/深两档一起回出厂值，玻璃开关不动
+    func resetColor() {
+        colorLight = Self.defaultLight
+        colorDark = Self.defaultDark
+        let d = UserDefaults.standard
+        d.set(colorLight, forKey: Self.colorLightKey)
+        d.set(colorDark, forKey: Self.colorDarkKey)
+    }
+
     /// 玻璃效果开关：只切材质，与所选颜色无关
     func setGlassEffect(_ on: Bool) {
         glassOn = on

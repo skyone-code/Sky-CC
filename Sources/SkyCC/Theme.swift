@@ -74,7 +74,10 @@ struct PageBackgroundModifier: ViewModifier {
                 //   上层 = 所选颜色的低透明度染色（三版改轻：旧版三层渐变 0.55–0.66
                 //   把桌面盖得几乎看不见，用户观感「不透桌面」）。
                 GlassVibrancyView().ignoresSafeArea()
-                skin.bgColor.opacity(colorScheme == .light ? 0.38 : 0.48).ignoresSafeArea()
+                // 染色透明度（2026-11-18 用户反馈两轮）：浅色 0.38→0.18（近白染色
+                // 把桌面洗掉、观感与纯色无异）；深色 0.48→0.32（用户要求再透一些）。
+                // 磨砂主导、染色只给一点色调倾向。
+                skin.bgColor.opacity(colorScheme == .light ? 0.18 : 0.32).ignoresSafeArea()
             } else {
                 skin.bgColor.ignoresSafeArea()
             }

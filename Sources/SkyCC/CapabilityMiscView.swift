@@ -252,6 +252,10 @@ private struct MenuBarIconStylePicker: View {
                         set: { skin.setColor($0) }), supportsOpacity: false)
                         .labelsHidden()
                         .help("页面底色（浅色/深色外观各记一色）")
+                    // 2026-11-18（用户要求）：色板一键回默认（浅/深两档都恢复，玻璃开关不动）
+                    Button("恢复默认") { skin.resetColor() }
+                        .controlSize(.small)
+                        .help("把浅色/深色两档底色都恢复为默认值")
                     Spacer(minLength: 0)
                     // 玻璃效果开关：只切材质（窗口透明 + 磨砂透桌面），与颜色无关
                     Toggle("玻璃效果", isOn: Binding(
