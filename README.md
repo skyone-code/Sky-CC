@@ -24,7 +24,7 @@
 |---|---|---|
 | 📈 | **性能监测** | 每秒一次快照取全：CPU 实时频率（`IA32_PERF_STATUS`）/ 六核占用 / 封装温度功耗 / dGPU / 内存 / 网络 / NVMe S.M.A.R.T.，90 秒曲线同屏 |
 | 🎛 | **设备控制** | 显卡路由热切换（无需注销）、散热模式（安静 / 均衡 / Boost）、风扇手动档位与温控曲线、电池充电阈值、触摸板 / Fn 锁 —— 每个开关都按 EC 位回读确认 |
-| ⌨ | **灯光矩阵** | 键盘 RGB 四区独立调色（ITE 8291 · USB HID 直写）、海岸灯 Apple Logo 灯板（EC `0x0748-0x074B`）、温度映射灯效 |
+| ⌨ | **灯光矩阵** | 键盘 RGB 四区独立调色、海岸灯 |
 | 🖥 | **NVIDIA 驱动** | 自维护 fork 版本对照、一键下载安装、组件级卸载 |
 | 📶 | **网卡驱动** | AX200 二合一驱动包（Wi-Fi + 蓝牙 + AirDrop 修复），版本对照一键更新 |
 | 🗺 | **状态栏** | 菜单栏逐项监控：频率 / 温度 / 风扇转速 / 网速 / 磁盘健康，逐项开关 |
@@ -53,14 +53,9 @@
 
 ## 📥 安装
 
-> 主通道在 Gitee，GitHub 为镜像兜底；应用内「检查更新」三条通道自动择优。
+> 应用内「检查更新」三条通道自动择优。
 
-| 通道 | 地址 |
-|---|---|
-| 🥇 Gitee（主） | [gitee.com/skyone021396/Sky-CC/releases](https://gitee.com/skyone021396/Sky-CC/releases) |
-| 🥈 GitHub（镜像） | [github.com/skyone-code/Sky-CC/releases](https://github.com/skyone-code/Sky-CC/releases) |
-
-下载 `Sky CC-<版本>-LAPQC71x.dmg`，打开后拉起自研安装器，一键完成主程序 / EC 内核扩展 / GPU 路由库部署。安装包支持覆盖安装与降级安装。
+下载 `Sky CC-<版本>-LAPQC71x.dmg`，打开后拉起自研安装器，一键完成主程序 / EC 内核扩展 / GPU 路由库部署。
 
 <details>
 <summary><b>从 3.0.x 升级（标识换域注意事项）</b></summary>
