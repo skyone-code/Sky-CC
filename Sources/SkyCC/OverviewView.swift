@@ -252,6 +252,7 @@ struct OverviewView: View {
     }
 
     /// 电池环：直径 = min(给定宽度, 行高)，所以右侧列表长多高、环就多高。
+    /// （2026-11-18 用户定案：电池环的尺寸是对的，作为风扇环的对齐基准，不动。）
     private func batteryRing(_ pct: Double) -> some View {
         GeometryReader { geo in
             let side = max(72, min(geo.size.width, geo.size.height))

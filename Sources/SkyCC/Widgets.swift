@@ -370,6 +370,9 @@ enum Fmt {
     }
     static func rate(_ kbs: Double?) -> String {
         guard let kbs else { return "—" }
+        // 2026-11-20（用户反馈「单位不会自己换算」）：补 GB/s 档，
+        // 大值不再卡在 MB 档显示成「4096.00 MB/s」这种。
+        if kbs >= 1_048_576 { return String(format: "%.2f GB/s", kbs / 1_048_576) }
         if kbs >= 1024 { return String(format: "%.2f MB/s", kbs / 1024) }
         return String(format: "%.0f KB/s", kbs)
     }

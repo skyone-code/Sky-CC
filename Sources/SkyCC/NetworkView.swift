@@ -184,6 +184,21 @@ struct NetworkView: View {
                         .disabled(state.isChecking || phase.isBusy)
                     }
 
+                    // 重新安装（2026-11-20 用户要求）：只有通过 App 装过一次
+                    // （installedTag 有记录）才出现；优先装已知最新版，
+                    // release 还没拿到过就先检查一次再装。
+                    if NetworkUpdate.installedTag != nil, !phase.isBusy {
+                        Button("重新安装") {
+                            if let tag = state.latestVersion ?? release_?.tag {
+                                runInstall(tag: tag)
+                            } else {
+                                checkNow()
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(phase.isBusy)
+                    }
+
                     Spacer()
                 }
 

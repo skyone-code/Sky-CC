@@ -23,13 +23,13 @@ struct FanRPMCard: View {
                         .font(.system(size: 12.5)).foregroundStyle(Theme.dim)
                 }
             } else {
-                // 2.7.2：环缩到 158pt 固定直径。上一版铺满整张卡（环比卡片还抢眼）
-                // 被用户否掉——现在环只当背景仪表，尺度回落到「跟正文同量级」。
                 // 2026-11-18（最小宽排查）：双环 158×2 + 34 = 350pt 固定宽，是全 app
                 // 最宽的不可压缩内容 —— 概览页在「窗口最小宽 + 侧边栏」时被挤爆的
-                // 元凶。改为按卡片实际宽度缩放环径（上限仍 158，下限 120）。
+                // 元凶。改为按卡片实际宽度缩放环径，随窗口变窄跟着缩。
+                // 2026-11-18（用户定案）：电池环才是尺寸基准，风扇环跟它对齐 ——
+                // 电池环实际渲染约 140（右列 7 行文字高度钉住），上限从 190 降回 140。
                 GeometryReader { geo in
-                    let side = max(120, min(158, (geo.size.width - 34) / 2))
+                    let side = max(120, min(140, (geo.size.width - 34) / 2))
                     HStack(spacing: 34) {
                         fanBig("CPU", rpm: BackendService.int(store.live, "rpm_cpu") ?? 0,
                                temp: BackendService.int(store.live, "temp_cpu") ?? 0,
@@ -60,8 +60,11 @@ struct FanRPMCard: View {
     /// 进度环（2026-11-18 用户定案）：以 **6000 RPM 为满环**，起点 12 点钟
     /// 方向（顶）**逆时针**扫（12→9→6）；环色按绝对转速分档（<2500 绿 /
     /// 2500–3500 蓝 / 3500–4500 橙 / 4500+ 红），rpm 变化时 0.5s 缓动跟进。
-    private func fanBig(_ name: String, rpm: Int, temp: Int, side: CGFloat = 158) -> some View {
-        let lw: CGFloat = 9.5
+    private func fanBig(_ name: String, rpm: Int, temp: Int, side: CGFloat = 140) -> some View {
+        // 线宽与电池环同一公式：9 × side/110（140 满径时 ≈11.5，缩窗时同比变细）。
+        let lw: CGFloat = 9 * side / 110
+        // 环内文字随环径等比缩放（140 基准：满径时主数字回到 35，与旧版观感一致）。
+        let ts = side / 140
         let progress = min(1.0, max(0.0, Double(rpm) / 6000.0))
         // 环色随转速分档（2026-11-18 用户定案，准数）：绿 → 蓝 → 橙 → 红，
         // 按绝对转速切：<2500 绿、2500–3500 蓝、3500–4500 橙、4500+ 红。
@@ -85,24 +88,24 @@ struct FanRPMCard: View {
             }
             VStack(spacing: 0) {
                 Text(name)
-                    .font(.system(size: 10.5, weight: .semibold))
+                    .font(.system(size: 10.5 * ts, weight: .semibold))
                     .foregroundStyle(Theme.dim2)
                     .tracking(0.4)
                 // 主角：转速。千分位由 Text 的本地化插值自动补（3,358）
                 Text("\(rpm)")
-                    .font(.system(size: 35, weight: .semibold, design: .rounded))
+                    .font(.system(size: 35 * ts, weight: .semibold, design: .rounded))
                     .monospacedDigit()
                     .foregroundStyle(Theme.txt)
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
                     .padding(.top, 1)
                 Text("RPM")
-                    .font(.system(size: 8.5, weight: .semibold))
+                    .font(.system(size: 8.5 * ts, weight: .semibold))
                     .foregroundStyle(Theme.dim2)
                     .tracking(1.1)
                 HStack(spacing: 5) {
                     Text("\(temp)℃")
-                        .font(.system(size: 10.5, weight: .semibold).monospacedDigit())
+                        .font(.system(size: 10.5 * ts, weight: .semibold).monospacedDigit())
                         .foregroundStyle(store.tempColor(Double(temp)))
                 }
                 .padding(.top, 3)

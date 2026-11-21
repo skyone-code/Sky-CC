@@ -953,9 +953,19 @@ enum NativeSystem {
         let now = Date().timeIntervalSince1970
         let dt = netTickTime > 0 ? now - netTickTime : 0
         var up: Double = 0, down: Double = 0
-        if dt > 0, netTickSent > 0 {
-            up = Double(diff(sent, netTickSent)) / dt / 1024
-            down = Double(diff(recv, netTickRecv)) / dt / 1024
+        // 合理性钓制（2026-11-20）：首拍基线跨越接口增删 / VPN utun 进出 /
+        // 32 位计数器回绕时，差分会顶成天文数字（用户实测首启出现过
+        // 66909 KB/s —— 正好是 4 GiB 回绕 ÷ 约 62 秒的典型值）。万兆网卡
+        // 也不到 1.3 GB/s，超过 2 GB/s 一律视为脏样本：本拍丢弃、只重设
+        // 基线，下一拍自然恢复。dt<0.5s 的采样窗太短同样丢弃，防抖动放大。
+        let saneKbs = 2_097_152.0   // 2 GB/s
+        if dt > 0.5, netTickSent > 0 {
+            let dUp = Double(diff(sent, netTickSent)) / dt / 1024
+            let dDown = Double(diff(recv, netTickRecv)) / dt / 1024
+            if dUp < saneKbs, dDown < saneKbs {
+                up = dUp
+                down = dDown
+            }
         }
         netTickTime = now
         netTickSent = sent
@@ -965,9 +975,14 @@ enum NativeSystem {
         var ifList: [[String: Any]] = []
         for (name, v) in perName.sorted(by: { $0.value.1 > $1.value.1 }) {
             var iUp = 0.0, iDown = 0.0
-            if dt > 0, let prev = netPrevPerIf[name] {
-                iUp = Double(diff(v.1, prev.1)) / dt / 1024
-                iDown = Double(diff(v.0, prev.0)) / dt / 1024
+            if dt > 0.5, let prev = netPrevPerIf[name] {
+                let dUp = Double(diff(v.1, prev.1)) / dt / 1024
+                let dDown = Double(diff(v.0, prev.0)) / dt / 1024
+                // 与总速率同一把钓子：接口重建 / 回绕的脏差分直接丢弃
+                if dUp < saneKbs, dDown < saneKbs {
+                    iUp = dUp
+                    iDown = dDown
+                }
             }
             let f = flags[name] ?? 0
             // 逐项算好再组字典：原来这里是一个 10 键的大字面量，混着 UInt32 位运算、

@@ -1,8 +1,9 @@
 import Foundation
-import Carbon.HIToolbox
 import AppKit
+import IOKit
+import IOKit.hid
 
-/// 触控板左上角「双击锁定」手势的接管（2.7.8）
+/// 触控板左上角「双击锁定」手势的接管（2.7.8 → 2026-11-18 改 F13 直捕）
 ///
 /// ## 实测证据（2026-10-22，本机 qc71 + VoodooI2C / VoodooPS2）
 ///
@@ -13,55 +14,44 @@ import AppKit
 ///     12:10:27.893  page=7 usage=224 value=1   ← Left Control 按下
 ///     12:10:27.895  page=7 usage=104 value=1   ← F13 按下
 ///     12:10:27.900  page=7 usage=104 value=0   ← F13 抬起
-///     12:10:27.905  page=7 usage=224 value=0
-///     12:10:27.911  page=7 usage=227 value=0
+///     12:10:27.905  usage=224 value=0
+///     12:10:27.911  usage=227 value=0
 ///
-/// 整组 5 毫秒完成，人手不可能按出这个速度 —— 这是设备合成的事件，不是真按键。
-/// 也就是说：**触控板固件 → EC → PS2 键盘控制器 → VoodooPS2Keyboard → 合成 Ctrl+Cmd+F13**。
+/// 整组 5 毫秒完成，人手不可能按出这个速度 —— 设备合成的事件。
+/// 即：**触控板固件 → EC → PS2 键盘控制器 → VoodooPS2Keyboard → 合成 Ctrl+Cmd+F13**。
 ///
-/// ## 为什么在 macOS 下「没反应」
+/// ## 为什么 2026-11-18 之前用 Carbon 热键、之后改 IOHIDManager 直捕 F13
 ///
-/// Windows 上这个组合由厂商驱动（Control Center）消费掉，转成「关触控板 + 点亮锁定灯」。
-/// macOS 里没有任何组件消费 Ctrl+Cmd+F13，事件就这么掉在地上 —— 所以双击没反应、
-/// 灯也不亮。不是 Voodoo 没映射，恰恰相反：Voodoo 映射得很好，只是没人接。
+/// 旧实现：`RegisterEventHotKey(Ctrl+Cmd+F13)` —— 好处是不需要隐私权限。
+/// 但修饰键匹配有个天然死穴：**用户在系统层重映射修饰键**（系统设置「修饰键」
+/// 面板，或任意 hidutil 通道）会把合成组合里的 Ctrl / Cmd 改写成别的键
+/// （比如 Cmd→无操作 后，固件合成的 Ctrl+Cmd+F13 到系统层就只剩 Ctrl+F13），
+/// Carbon 热键失配，双击就「没反应」。2026-11-18 用户实锤踩中。
 ///
-/// ## 本文件做的事
+/// 新实现：IOHIDManager 监听同一设备的**原始元素事件**，只认 **F13（usage 0x68 /
+/// page 0x07）按下**，完全不看修饰键 —— 修饰键映射怎么改，F13 都原样到达
+/// （重映射表只覆盖 E0–E7 修饰键）。彻底免疫修饰键重映射。
 ///
-/// 用 Carbon `RegisterEventHotKey` 注册 Ctrl+Cmd+F13 全局热键（**不需要任何隐私权限**，
-/// 不同于 CGEventTap / IOHIDManager 那种要「输入监控」的路子），收到就切换触控板锁定，
-/// 与控制页的「触控板」开关走同一个后端接口（`/api/fan` 的 `touchpad_toggle` → HID 独占）。
+/// 权限：IOHIDManager 收键盘原始事件需要「输入监控」授权。旧实现选 Carbon 就是为了
+/// 绕开它，但触控板锁定的真正执行（kIOHIDOptionsTypeSeizeDevice，见 TrackpadAPI）
+/// **本来就必须**有这个权限，app 的 bundle id 也早已在 TCC 名单里 —— 所以这个
+/// 顾虑不再成立，切直捕没有额外成本。授权检查保留在 fire() 里（未授权时引导）。
 ///
-/// 锁定灯本身点不亮 —— 那是 EC `CTRL_4(0x07A6) bit6` 的活，实测该位可写但系统侧无响应
-/// （见 NativeTrackpadLock.swift 头部注释），macOS 下拿不到 LED 控制权。
+/// 另外旧实现的「激活策略切换会打掉 Carbon 热键」的坑（2.7.8 装机版失效的原因）
+/// 在 IOHIDManager 路径上不存在 —— observe 型监听与 WindowServer 无关，
+/// `reregister()` 保留为兼容空操作。
 ///
-/// ## 已验证（2026-10-22 12:16）
+/// ## 其余行为不变
 ///
-/// 用 NSApplication 事件循环 + 7 组候选修饰键同时注册，用户双击后日志：
-///
-///     REG ctrl+cmd status=0            ← 7 组全部注册成功
-///     FIRED id=1                       ← 12:16:35.603，HID 侧同刻 usage=104
-///     FIRED id=1                       ← 12:16:47.044，HID 侧同刻 usage=104
-///
-/// `id=1` 就是 `controlKey | cmdKey`，与固件实际发出的标志位一致。
-/// 注意：验证时**必须**用 NSApplication 跑事件循环，纯 CLI 的 `CFRunLoopRun()`
-/// 收不到 Carbon 热键事件（`RegisterEventHotKey` 照样返回 0，但事件不投递）。
-///
-/// ## 2.7.8 首个装机版失效的原因（已修）
-///
-/// 装机版双击没反应。外部探针证明：热键被测试进程抢到（`FIRED id=1`），
-/// 而 app 没收到 —— 说明 app 的注册没生效。原因是 `NSApp.setActivationPolicy(_:)`
-/// 会重新向 WindowServer 注册进程，**把已经挂上的 Carbon 热键打掉**。
-/// 而 app 的注册顺序恰好是：`didFinishLaunching` 里先注册，随后
-/// `DispatchQueue.main.async { AppPolicy.toAccessory() }` 异步改策略 —— 正好把刚注册的
-/// 热键作废；之后每次开关窗口还会 `toRegular()` / `toAccessory()` 再打掉一次。
-///
-/// 修法：`AppPolicy` 每次改完策略都调 `reregister()` 重挂；另外 app 激活时也补挂一次。
-/// 这些重挂都走 `stop()` + `start()`，不会累积重复的 handler。
+/// 收到 F13 按下 → 切换触控板锁定，与控制页「触控板」开关走同一后端
+/// （`touchpad_toggle` → HID 独占）。锁定灯是 EC 0x07A6 bit6 的活，
+/// macOS 下拿不到 LED 控制权（见 NativeTrackpadLock.swift 头注）。
 final class GestureHotkey {
     static let shared = GestureHotkey()
 
     /// 同一手势的去抖窗口。双击本身是两下轻点（间隔约 150-300ms），
-    /// 固件合成一组事件；留 0.4s 既能合并偶发的双发，又不会吃掉连续两次独立双击。
+    /// 固件合成一组事件；留 0.4s 既能合并偶发的双发（含双设备重复上报），
+    /// 又不会吃掉连续两次独立双击。
     private let debounce: TimeInterval = 0.4
     private var lastFire = Date.distantPast
 
@@ -69,10 +59,7 @@ final class GestureHotkey {
     private var guidanceShown = false
     private var restartHintShown = false
 
-    private var hotKeyRef: EventHotKeyRef?
-    private var handlerRef: EventHandlerRef?
-    private var observers: [NSObjectProtocol] = []
-    private var reregisterScheduled = false
+    private var manager: IOHIDManager?
     private(set) var registered = false
 
     /// 诊断日志（`log show` 在沙箱里读不出来，只能自己落文件）
@@ -93,82 +80,70 @@ final class GestureHotkey {
         }
     }
 
-    // MARK: - 注册
+    // MARK: - 注册（IOHIDManager 直捕 F13）
 
     /// 在 applicationDidFinishLaunching 里调一次。幂等。
     @discardableResult
     func start() -> Bool {
         guard !registered else { return true }
 
-        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
-                                 eventKind: UInt32(kEventHotKeyPressed))
-        // 必须是 @convention(c) 无捕获闭包
-        let hStatus = InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
-            GestureHotkey.shared.handle()
-            return noErr
-        }, 1, &spec, nil, &handlerRef)
-        guard hStatus == noErr else {
-            log("handler 安装失败 status=\(hStatus)")
+        let m = IOHIDManagerCreate(kCFAllocatorDefault, 0)
+        // 只匹配内置 PS2 键盘（VoodooPS2 模拟的假 Apple 键盘），外接键盘不碰
+        let matching: [String: Any] = [
+            kIOHIDVendorIDKey as String: 0x05AC,
+            kIOHIDProductIDKey as String: 0xFFFF,
+            kIOHIDDeviceUsagePageKey as String: kHIDPage_GenericDesktop,
+            kIOHIDDeviceUsageKey as String: kHIDUsage_GD_Keyboard,
+        ]
+        IOHIDManagerSetDeviceMatching(m, matching as CFDictionary)
+        IOHIDManagerRegisterInputValueCallback(m, { _, _, _, value in
+            GestureHotkey.shared.onHIDValue(value)
+        }, Unmanaged.passUnretained(self).toOpaque())
+        // observe 型打开（不 seize）—— 键盘照常给系统用，我们只是旁听
+        let openRes = IOHIDManagerOpen(m, 0)
+        guard openRes == kIOReturnSuccess else {
+            log("IOHIDManagerOpen 失败 \(openRes)（输入监控未授权？）")
             return false
         }
+        IOHIDManagerScheduleWithRunLoop(m, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
 
-        // Ctrl + Command + F13（kVK_F13 = 0x69 = 105）
-        let hkID = EventHotKeyID(signature: OSType(0x4D434753), id: 1)  // 'MCGS'
-        let rStatus = RegisterEventHotKey(UInt32(kVK_F13),
-                                          UInt32(controlKey | cmdKey),
-                                          hkID,
-                                          GetApplicationEventTarget(),
-                                          0,
-                                          &hotKeyRef)
-        guard rStatus == noErr else {
-            log("注册失败 status=\(rStatus)（可能被其他程序占用）")
-            return false
-        }
-
+        manager = m
         registered = true
-        log("已接管 Ctrl+Cmd+F13（policy=\(NSApp.activationPolicy().rawValue)）")
-
-        // 兜底：app 激活时补挂一次（策略切换后可能被系统打掉）
-        if observers.isEmpty {
-            let o = NotificationCenter.default.addObserver(
-                forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
-            ) { [weak self] _ in
-                self?.reregister(reason: "didBecomeActive")
-            }
-            observers.append(o)
-        }
+        log("已接管 F13 原始事件（IOHIDManager 直捕，修饰键免疫）")
         return true
     }
 
-    /// 激活策略变化后重挂（`setActivationPolicy` 会让 Carbon 热键失效）
+    /// 激活策略变化后不再需要重挂（IOHIDManager 与 WindowServer 无关），
+    /// 保留空实现兼容旧调用点（AppPolicy）。
     func reregister(reason: String = "policy") {
-        stop()
-        let ok = start()
-        log("重挂(\(reason)) → \(ok ? "成功" : "失败")")
-
-        // 策略切换本身是异步落地的：立刻重挂有可能撞上过渡期、又被系统清掉。
-        // 这里再补一次（用标志位合并多次调用，避免反复 stop/start 刷屏）。
-        guard !reregisterScheduled else { return }
-        reregisterScheduled = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-            guard let self else { return }
-            self.reregisterScheduled = false
-            self.stop()
-            let ok2 = self.start()
-            self.log("延迟补挂 → \(ok2 ? "成功" : "失败")")
-        }
+        guard registered else { start(); return }
+        log("重挂请求(\(reason)) → IOHIDManager 路径无需重挂，忽略")
     }
 
     func stop() {
-        if let r = hotKeyRef { UnregisterEventHotKey(r); hotKeyRef = nil }
-        if let h = handlerRef { RemoveEventHandler(h); handlerRef = nil }
+        if let m = manager {
+            IOHIDManagerClose(m, 0)
+            IOHIDManagerUnscheduleFromRunLoop(m, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+        }
+        manager = nil
         registered = false
+    }
+
+    // MARK: - 原始事件过滤
+
+    /// 只认 F13 按下（page 0x07 键盘页 / usage 0x68 = F13），修饰键一律不参与判断
+    private func onHIDValue(_ value: IOHIDValue) {
+        let element = IOHIDValueGetElement(value)
+        let page = IOHIDElementGetUsagePage(element)
+        let usage = IOHIDElementGetUsage(element)
+        guard UInt32(page) == UInt32(kHIDPage_KeyboardOrKeypad), usage == 0x68,  // 0x68 = F13
+              IOHIDValueGetIntegerValue(value) == 1 else { return }
+        fire()
     }
 
     // MARK: - 触发
 
-    /// 手势触发：切换触控板锁定状态
-    private func handle() {
+    private func fire() {
         let now = Date()
         guard now.timeIntervalSince(lastFire) > debounce else {
             log("去抖忽略（距上次 \(String(format: "%.2f", now.timeIntervalSince(lastFire)))s）")

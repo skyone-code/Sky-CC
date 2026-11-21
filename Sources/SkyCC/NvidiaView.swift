@@ -179,6 +179,17 @@ struct NvidiaView: View {
                         .disabled(state.isChecking || installPhase.isBusy)
                     }
 
+                    // 重新安装（2026-11-20 用户要求）：本机装过驱动（installedVersion
+                    // 有记录）才出现——没更新时也能重装，走 beginInstall
+                    // （有缓存 tag 直接装最新版，没有就先查一次）
+                    if state.installedVersion != nil, !installPhase.isBusy {
+                        Button("重新安装") {
+                            beginInstall()
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(state.isChecking)
+                    }
+
                     // 卸载：只有本机确实装了驱动才出现
                     if state.installedVersion != nil, !installPhase.isBusy {
                         Button("卸载驱动…", role: .destructive) {
