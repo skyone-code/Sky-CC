@@ -120,7 +120,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 卸载器的命令行模式要在「app 正开着」的时候也能跑，既不能抢锁退场，
         // 更不能顺手把正在跑的实例窗口叫出来。
         if args.contains("--unregister-all") || args.contains("--unregister-helper") { return }
-        // --ui-shots 时 InstanceLock 内部会自动跳过
+        // --ui-shots 时 InstanceLock 内部会自动跳过（UIShot 见 Tools/UIShot.swift）
         InstanceLock.claimOrHandOff()
     }
 
@@ -162,8 +162,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             exit(0)
         }
-        // 开发用：--ui-shots <dir> 离屏渲染各页后退出（见 UIShot.swift）
-        if UIShot.handleIfRequested() { return }
         // 2.8.11：登录项自愈（避免开机拉起两个实例）
         if #available(macOS 13.0, *) { AutostartHeal.run() }
         // v2.4.3：恢复用户选的外观（浅色/深色/随系统，默认随系统）

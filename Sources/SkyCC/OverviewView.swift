@@ -44,13 +44,13 @@ struct OverviewView: View {
 
         .onAppear {
             // 风扇卡在本页：声明实时转速租约（helper 才按 1 秒读 EC），离开即收回
-            store.demandLiveFan(true)
+            store.demandLiveFan(true, page: "overview")
             // 本页有转速 / 电池等实时量，同样登记 1 秒快速轮询
-            store.demandFast(true)
+            store.demandFast(true, page: "overview")
         }
         .onDisappear {
-            store.demandLiveFan(false)
-            store.demandFast(false)
+            store.demandLiveFan(false, page: "overview")
+            store.demandFast(false, page: "overview")
         }
     }
 

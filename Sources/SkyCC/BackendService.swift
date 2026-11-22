@@ -62,6 +62,8 @@ final class BackendService: ObservableObject {
         guard let bid = Bundle.main.bundleIdentifier else { return }
         // 开发用 --ui-shots 时跳过：离屏截图要跟正在运行的实例并存，
         // 否则必须先杀掉用户手上的窗口才能出图（helper 是 XPC 单例，多开无碍）。
+        // 2026-11-21：UIShot 已挪到 Tools/（不进二进制），此处旁路保留，
+        // 将来按 Tools/UIShot.swift 头部说明临时启用时直接可用。
         if CommandLine.arguments.contains("--ui-shots") { return }
         let others = NSRunningApplication.runningApplications(withBundleIdentifier: bid)
             .filter { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
@@ -393,6 +395,7 @@ enum InstanceLock {
         // 再 open 一次同一个文件去加 LOCK_EX|LOCK_NB 会失败。
         if held { return true }
         // 开发用 --ui-shots 时跳过：离屏截图要跟正在运行的实例并存
+        // （UIShot 见 Tools/UIShot.swift，默认不编入 app）
         if CommandLine.arguments.contains("--ui-shots") { return true }
 
         let dir = FileManager.default.homeDirectoryForCurrentUser

@@ -330,7 +330,11 @@ final class MenuBarMonitors: NSObject {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.widthSyncPending = false
-                guard let item = self.monitorItem, let host = self.monitorHost else { return }
+                // 2026-11-21（性能优化）：状态项没勾任何段时它是隐藏的，
+                // 每拍仍做两次主线程跳转 + 一次 fittingSize 布局测量纯属白烧
+                // （hub 每 5 秒一拍，一次测量会牵动整条 SwiftUI 布局）。
+                guard let item = self.monitorItem, item.isVisible,
+                      let host = self.monitorHost else { return }
                 let w = host.fittingSize.width
                 // variableLength 初始为 -2，跳过无意义值；0.5pt 抖动不回写（防每拍微动）
                 guard w > 1, abs(item.length - w) > 0.5 else { return }
@@ -342,13 +346,22 @@ final class MenuBarMonitors: NSObject {
     /// 有勾段才显示状态项；盘列表变化时也会被调到
     func syncVisibility() {
         guard let item = monitorItem else { return }
-        item.isVisible = !Self.currentSegments(overview: MetricsHub.shared.overview).isEmpty
+        setVisible(!Self.currentSegments(overview: MetricsHub.shared.overview).isEmpty, on: item)
     }
 
     /// 带快照的版本（MenuBarMonitorBar 每秒随 hub 调，避免读旧快照）
     func syncVisibility(with overview: [String: Any]) {
         guard let item = monitorItem else { return }
-        item.isVisible = !Self.currentSegments(overview: overview).isEmpty
+        setVisible(!Self.currentSegments(overview: overview).isEmpty, on: item)
+    }
+
+    /// 幂等显隐（2026-11-21）：原来每拍无条件给 isVisible 赋值，AppKit 侧虽同值
+    /// no-op，但每 5 秒仍要走一次属性设置与状态栏重排登记。值没变就直接返回；
+    /// 从隐藏切回显示时强制重设 rootView，保证内容立刻回来（不用等下一拍 hub）。
+    private func setVisible(_ want: Bool, on item: NSStatusItem) {
+        guard item.isVisible != want else { return }
+        item.isVisible = want
+        if want { monitorHost?.rootView = MenuBarMonitorBar() }
     }
 
     // MARK: 段清单

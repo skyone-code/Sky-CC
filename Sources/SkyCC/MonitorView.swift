@@ -29,6 +29,11 @@ struct HistoryCurve: View {
     var body: some View {
         Sparkline(points: hist.history[key] ?? [], color: color,
                   maxValue: maxValue, minValue: minValue)
+            // 2026-11-21（性能优化）：记账「有人在画曲线」—— 无人观看时 HistoryStore
+            // 只写私有缓冲、不再每秒发 @Published；回到本页时 attach 会把离开期间
+            // 攒下的点补进来，曲线不断档。
+            .onAppear { hist.attach() }
+            .onDisappear { hist.detach() }
     }
 }
 
@@ -89,13 +94,13 @@ struct MonitorView: View {
             // 2026-11-08（性能）：本页需要 1 秒逐拍刷新，在这里登记「快速轮询」需求；
             // 切到别的页面后自动降到 3 秒。
             // （3.0.4.5：实时转速租约随风扇卡搬到「概览」页，本页不再声明。）
-            store.demandFast(true)
+            store.demandFast(true, page: "performance")
             // 2026-11-14（用户反馈）：Wi-Fi SSID 被 macOS 14 的定位服务门控，
             // 系统设置里不会主动出现本 app 的条目 —— 进页申请一次，系统弹授权框。
             LocationPermission.shared.requestIfNeeded()
         }
         .onDisappear {
-            store.demandFast(false)
+            store.demandFast(false, page: "performance")
         }
         // 授权刚批下来：立即拉一拍快照，SSID 下一秒就出现在网络卡里
         .onReceive(NotificationCenter.default.publisher(for: .locationAuthChanged)) { _ in

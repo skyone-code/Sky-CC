@@ -1,15 +1,15 @@
 {
-  "tag": "3.2.3",
-  "version": "3.2.3",
-  "dmg_name": "Sky CC-3.2.3-LAPQC71x.dmg",
-  "dmg_url": "https://gitee.com/skyone021396/Sky-CC/releases/download/3.2.3/Sky%20CC-3.2.3-LAPQC71x.dmg",
-  "pkg_name": "Sky CC-3.2.3-LAPQC71x.pkg",
-  "pkg_url": "https://gitee.com/skyone021396/Sky-CC/releases/download/3.2.3/Sky%20CC-3.2.3-LAPQC71x.pkg",
-  "size": 8903032,
-  "sha256": "14897821517112ae2dd788f46e562119f3f76d4672bee258411603bbb758a361",
+  "tag": "3.2.4",
+  "version": "3.2.4",
+  "dmg_name": "Sky CC-3.2.4-LAPQC71x.dmg",
+  "dmg_url": "https://gitee.com/skyone021396/Sky-CC/releases/download/3.2.4/Sky%20CC-3.2.4-LAPQC71x.dmg",
+  "pkg_name": "Sky CC-3.2.4-LAPQC71x.pkg",
+  "pkg_url": "https://gitee.com/skyone021396/Sky-CC/releases/download/3.2.4/Sky%20CC-3.2.4-LAPQC71x.pkg",
+  "size": 8909692,
+  "sha256": "5276cbe817aaee2c031b1ff4670f78d5cbe2cf6959a8c9f0fb066c472d94ccd5",
   "published_at": "2026-11-18T20:00:00+08:00",
   "notes": "3.2.2：快捷指令 / 命令行控制（mcutil 新增 13 条硬件控制命令，手机快捷指令可经 SSH 调用）；皮肤系统重构（预设配色改为色板自选任意颜色，玻璃效果改为真正独立开关，玻璃态染色跟随所选颜色）；修复键盘灯效卡展开后大片空白",
-  "pkg_size": 7014101,
-  "pkg_sha256": "c31ab00c75fc68824d23f6aaf564094c2a18b2ac68376a4a747c88dfc710178c",
-  "date": "2026-11-21"
+  "pkg_size": 7018269,
+  "pkg_sha256": "5b0e625ef9fd4627b317856dce93aecf7ded5425eb124c585c235e12d7d57951",
+  "date": "2026-11-22"
 }

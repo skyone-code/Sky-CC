@@ -20,15 +20,31 @@ final class HistoryStore: ObservableObject {
     @Published var history: [String: [Double]] = [:]
     static let len = 90
 
+    /// 真正在画曲线的视图数量（HistoryCurve 在 onAppear / onDisappear 记账）。
+    /// 2026-11-21（性能优化）：没人画曲线时（离开监测页）add 只写私有缓冲、
+    /// 不再给 @Published 赋值 —— 每秒省掉一次对象广播。
+    private var painters = 0
+    /// 完整缓冲（与 history 分离，让「无人观看期」也能继续攒点，回到页面时曲线不断档）
+    private var storage: [String: [Double]] = [:]
+
+    func attach() {
+        painters += 1
+        // 补上离开期间攒的点（第一次有人订阅时同步一次）
+        if painters == 1, history != storage { history = storage }
+    }
+
+    func detach() {
+        painters = max(0, painters - 1)
+    }
+
     /// 按键追加一个点，超长截头（CoW 下只是 90 元素数组的追加，微秒级）
     func add(_ key: String, _ v: Double?) {
         guard let v, v.isFinite else { return }
-        var h = history
-        var arr = h[key] ?? []
+        var arr = storage[key] ?? []
         arr.append(v)
         if arr.count > Self.len { arr.removeFirst(arr.count - Self.len) }
-        h[key] = arr
-        history = h
+        storage[key] = arr
+        if painters > 0 { history = storage }
     }
 }
 
@@ -69,13 +85,19 @@ final class MonitorStore: ObservableObject {
     /// 基础间隔。真正生效的间隔见 `effectiveInterval`。
     var refreshInterval: TimeInterval = 1.0
 
-    /// 「有页面要 1 秒实时看」的需求计数（性能页这类逐秒变化的页面）。
-    private var fastDemand = 0
+    /// 「要 1 秒实时看」的页面集合（性能页 / 概览页）。
+    ///
+    /// 2026-11-21（性能优化）：原来是 Int 计数（onAppear +1 / onDisappear −1）。
+    /// 计数语义在 SwiftUI 里不安全 —— NavigationSplitView 切页时偶发漏触发一次
+    /// onDisappear，计数就只增不减，**永久卡在 1 秒轮询**：用户明明已经离开监测页，
+    /// 数据仍在每秒赋值、整窗仍每秒合成（透明窗口下最贵）。改成按页面身份记账：
+    /// onAppear 插入、onDisappear 移除，天然幂等，漏一次也不会泄漏。
+    private var fastPages: Set<String> = []
     /// 主窗口是否可见（关窗 / 最小化后自动降频，常驻菜单栏不该一直全速跑）
     private var windowVisible = true
 
-    func demandFast(_ on: Bool) {
-        fastDemand = max(0, fastDemand + (on ? 1 : -1))
+    func demandFast(_ on: Bool, page: String) {
+        if on { fastPages.insert(page) } else { fastPages.remove(page) }
     }
 
     func setWindowVisible(_ visible: Bool) {
@@ -89,25 +111,30 @@ final class MonitorStore: ObservableObject {
     /// 实际轮询间隔：
     /// * 有页面要实时 → 1 秒
     /// * 主窗口不在（只剩菜单栏图标）→ 5 秒
-    /// * 其它页面（控制 / 灯效 / 设置，本来就是静态的）→ 3 秒
+    /// * 其它页面（控制 / 灯效 / 设置，本来就是静态的）→ 5 秒
+    ///
+    /// 2026-11-21（性能优化）：非监测页从 3 秒放宽到 5 秒。这几页根本不吃逐秒
+    /// 数据，但每拍仍会给 overview / sensors / updatedAt 赋值 → 页面 body 重算 →
+    /// 透明窗口整窗重新合成。菜单栏要的数据 5 秒一档也够用。
     var effectiveInterval: TimeInterval {
-        if fastDemand > 0 { return refreshInterval }
-        return windowVisible ? 3.0 : 5.0
+        if !fastPages.isEmpty { return refreshInterval }
+        return 5.0
     }
 
-    /// 2.8.15「按需读 EC」的两个需求计数：
+    /// 2.8.15「按需读 EC」的两个需求集合：
     /// * liveFan   —— 有页面正在显示实时转速（性能页 / 风扇曲线页）
     /// * lighting  —— 灯效页可见（海岸灯状态要从 EC 读）
-    /// 计数归零后 helper 侧的租约 10 秒内自然过期，EC 读取彻底停下。
-    private var liveFanDemand = 0
-    private var lightingDemand = 0
+    /// 集合归空后 helper 侧的租约 10 秒内自然过期，EC 读取彻底停下。
+    /// 2026-11-21：同样从计数改为按页面身份记账（理由见 fastPages）。
+    private var liveFanPages: Set<String> = []
+    private var lightingPages: Set<String> = []
 
-    func demandLiveFan(_ on: Bool) {
-        liveFanDemand = max(0, liveFanDemand + (on ? 1 : -1))
+    func demandLiveFan(_ on: Bool, page: String) {
+        if on { liveFanPages.insert(page) } else { liveFanPages.remove(page) }
     }
 
-    func demandLighting(_ on: Bool) {
-        lightingDemand = max(0, lightingDemand + (on ? 1 : -1))
+    func demandLighting(_ on: Bool, page: String) {
+        if on { lightingPages.insert(page) } else { lightingPages.remove(page) }
     }
 
     func attach(_ backend: BackendService) {
@@ -144,7 +171,7 @@ final class MonitorStore: ObservableObject {
         // 有页面在看实时转速：额外打一次 /api/fan/live —— 既是取值也是「续租」。
         // 没有页面在看时这一整块不执行，helper 端也不会去读 EC。
         var freshFan = snapFan ?? [:]
-        if liveFanDemand > 0, let lf = try? await backend.getJSON("/api/fan/live") as? [String: Any],
+        if !liveFanPages.isEmpty, let lf = try? await backend.getJSON("/api/fan/live") as? [String: Any],
            !lf.isEmpty {
             freshFan = lf
         }
@@ -185,7 +212,9 @@ final class MonitorStore: ObservableObject {
             volume = v
         }
         let ms = BackendService.int(snap, "elapsed_ms") ?? 0
-        if snapshotMs != ms { snapshotMs = ms }
+        // 2026-11-21：诊断数字加死区（±2ms 内不刷新）—— 后端每拍耗时都在抖，
+        // 逐毫秒赋值等于每拍多一次 objectWillChange，而 1~2ms 的差别没人看得出来。
+        if abs(snapshotMs - ms) > 2 { snapshotMs = ms }
         if !connected { connected = true }
         // updatedAt 只在「需要显示时间」的页面用得上，1 秒一次足够，但也做 diff
         let now = Date()
@@ -225,7 +254,7 @@ final class MonitorStore: ObservableObject {
         guard let backend else { return }
         // 2.8.15：灯效面（RGB 控制器 + 海岸灯）读的是 HID 与 EC，
         // 只有「灯效」页可见时才轮询；其它页面一律不碰。
-        guard lightingDemand > 0 else { return }
+        guard !lightingPages.isEmpty else { return }
         await refreshLightingOnce(backend)
     }
 

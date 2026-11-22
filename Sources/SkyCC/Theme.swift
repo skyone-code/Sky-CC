@@ -156,13 +156,64 @@ extension View {
 // （PageBackgroundModifier.applyGlassWindowTransparency 负责开/关）。
 struct GlassVibrancyView: NSViewRepresentable {
     func makeNSView(context: Context) -> NSVisualEffectView {
-        let v = NSVisualEffectView()
+        let v = OcclusionAwareVibrancy()
         v.material = .underWindowBackground
         v.blendingMode = .behindWindow
         v.state = .active
         return v
     }
     func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
+}
+
+/// 遮挡感知的磨砂层（2026-11-21 性能优化）。
+///
+/// behindWindow 模糊是全窗最贵的一层（Intel 核显上尤其明显）：窗口内容每变一次，
+/// 这层就要重算一次窗口后面的模糊。窗口被完全遮挡 / 最小化 / app 隐藏时，
+/// 屏幕上根本看不到它，却仍在参与合成。这里直接把这些状态下的磨砂层 `isHidden`，
+/// 可见性恢复时自动变回来 —— **不改变任何观感**（看不见的时候才关）。
+///
+/// 注：这里不用 `.followsWindowActiveState`，那会让窗口失焦时玻璃变淡，
+/// 与用户定案的观感不符。
+final class OcclusionAwareVibrancy: NSVisualEffectView {
+    private var observers: [NSObjectProtocol] = []
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        uninstallObservers()
+        guard let w = window else { return }
+
+        let nc = NotificationCenter.default
+        // occlusionState 只关心「有没有一个像素真正露在屏幕上」：完全被盖住、
+        // 切到别的 Space、最小化都算不可见。
+        let refresh: (Notification) -> Void = { [weak self, weak w] _ in
+            guard let self, let w else { return }
+            let visible = w.occlusionState.contains(.visible) && !w.isMiniaturized
+            let shouldHide = !visible
+            if self.isHidden != shouldHide { self.isHidden = shouldHide }
+        }
+        observers.append(nc.addObserver(forName: NSWindow.didChangeOcclusionStateNotification,
+                                       object: w, queue: .main, using: refresh))
+        observers.append(nc.addObserver(forName: NSWindow.didMiniaturizeNotification,
+                                       object: w, queue: .main, using: refresh))
+        observers.append(nc.addObserver(forName: NSWindow.didDeminiaturizeNotification,
+                                       object: w, queue: .main, using: refresh))
+        observers.append(nc.addObserver(forName: NSApplication.didHideNotification,
+                                       object: nil, queue: .main, using: refresh))
+        observers.append(nc.addObserver(forName: NSApplication.didUnhideNotification,
+                                       object: nil, queue: .main, using: refresh))
+        // 不在挂载时主动判一次可见性：刚上窗口时视图还没布局完，occlusionState
+        // 往往是空的，此时若判「不可见」会把玻璃层直接藏掉（首启无磨砂）。
+        // 只由系统通知驱动 —— 多等一次通知的代价是白跑一拍，安全得多。
+    }
+
+    private func uninstallObservers() {
+        for o in observers { NotificationCenter.default.removeObserver(o) }
+        observers.removeAll()
+    }
+
+    deinit {
+        for o in observers { NotificationCenter.default.removeObserver(o) }
+    }
 }
 
 // MARK: - 侧边栏背景（2026-11-15）

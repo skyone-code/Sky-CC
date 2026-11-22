@@ -233,15 +233,15 @@ struct RGBView: View {
 
         .onAppear {
             // 2.8.15：海岸灯没有软件记忆，状态只能从 EC 读。进灯效页读一次，
-            // 切走即停（lightingDemand 门控 slowLoop）。键盘灯效仍读存档。
-            store.demandLighting(true)
+            // 切走即停（lightingPages 门控 slowLoop）。键盘灯效仍读存档。
+            store.demandLighting(true, page: "lighting")
             syncFromBackend()
             Task { await store.refreshLightingOnce(backend) }
             // AP 心跳只有一次 EC 读（~65ms），进页读一把，之后以本地状态为准
             Task { await refreshAPBeat() }
         }
         .onDisappear {
-            store.demandLighting(false)
+            store.demandLighting(false, page: "lighting")
         }
         .onChange(of: store.updatedAt) { _, _ in syncFromBackend() }
         .toastOverlay()

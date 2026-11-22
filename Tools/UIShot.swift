@@ -7,7 +7,14 @@ import AppKit
 /// 落在别的 Space 上的窗口；ImageRenderer 直接把 SwiftUI 视图树画进位图，
 /// 不依赖窗口服务器，改版式时能立刻看到结果。
 ///
-/// 只在显式带参数时触发，正常启动完全不受影响。
+/// **2026-11-21 起不再编入正式 app**：本文件从 `Sources/SkyCC/` 挪到 `Tools/`，
+/// 只作存档。构建脚本用 `Sources/SkyCC/*.swift` 通配收源，所以它不会进二进制。
+/// 需要用它出图时临时启用（两步，用完记得撤回）：
+///   1. `cp Tools/UIShot.swift Sources/SkyCC/`
+///   2. 在 SkyCCApp.swift 的 didFinishLaunching 里加回：
+///      `if UIShot.handleIfRequested() { return }`
+/// 不能独立编译成命令行工具——它依赖主程序里的 BackendService / MonitorStore /
+/// SkinCenter 与各页视图类型。
 @MainActor
 enum UIShot {
 

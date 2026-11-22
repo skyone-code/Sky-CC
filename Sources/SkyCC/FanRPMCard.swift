@@ -84,7 +84,11 @@ struct FanRPMCard: View {
                     .stroke(accent, style: StrokeStyle(lineWidth: lw, lineCap: .round))
                     .rotationEffect(.degrees(-90))
                     .scaleEffect(x: -1)   // 镜像翻转：起点保持 12 点钟（顶），扫向改逆时针（12→9→6）
-                    .animation(.easeInOut(duration: 0.5), value: rpm)
+                    // 2026-11-21（性能优化）：动画依赖改成 20 转一档，而不是每一转。
+                    // 原先 rpm 每秒抖几转就重启动画，监测页开着时环几乎一直在动 ——
+                    // 持续给合成器提交动画帧。现在小抖动直接跳（肉眼只看到数字变化），
+                    // 真正提速/降速时才缓动。
+                    .animation(.easeInOut(duration: 0.5), value: rpm / 20)
             }
             VStack(spacing: 0) {
                 Text(name)
