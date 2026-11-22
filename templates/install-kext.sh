@@ -41,9 +41,14 @@ OLD_LABELS=(
 
 # 2.8.15：开机加载器用我们自己的二进制，不再让守护直接 exec /usr/bin/kmutil
 # （那样「系统设置 → 登录项」里会显示成一条来路不明的 "kmutil"）。
-# 放 app 自己的支持库：/Library/PrivilegedHelperTools 与 /usr/local/bin 在本机
-# 被 SIP 挡住（root 都 EACCES），只有支持库可写。
-# 注意：本脚本以 root 运行，$HOME 是 /var/root，必须从控制台用户反查真实家目录。
+#
+# 2026-11-22（安装器大 bug 修正）：加载器原先放控制台用户的
+# ~/Library/Application Support/SkyCC/bin，本脚本以 root 跑，
+# `mkdir -p` 把该目录建成了 root:staff —— 而 helper 是用户身份跑的，
+# 进去建 helper.lock 直接 EACCES，于是每 2 秒重启一次，全量功能离线。
+# 现在改放系统级 /Library/Application Support/SkyCC/bin（root:wheel，
+# 用户不可写——加载器会被 root 守护执行，绝不能给用户写入权），
+# 顺便解决 FileVault 开启时开机读不到 home 下加载器的老问题。
 LOADER_SRC="$HERE/bin/Sky CC散热扩展"
 CONSOLE_USER="$(stat -f %Su /dev/console 2>/dev/null)"
 USER_HOME=""
@@ -52,7 +57,11 @@ if [[ -n "$CONSOLE_USER" && -d "/Users/$CONSOLE_USER" ]]; then
 else
   USER_HOME="${HOME:-/var/root}"
 fi
-LOADER_DST="$USER_HOME/Library/Application Support/SkyCC/bin/Sky CC散热扩展"
+LOADER_DIR="/Library/Application Support/SkyCC/bin"
+LOADER_DST="$LOADER_DIR/Sky CC散热扩展"
+# 旧位置（≤3.2.4）：加载器曾经放在用户支持库，升级时清走
+LOADER_OLD_USER="$USER_HOME/Library/Application Support/SkyCC/bin/Sky CC散热扩展"
+USER_SUPPORT="$USER_HOME/Library/Application Support/SkyCC"
 LOG="/tmp/skycc-kext-install.log"
 
 # 既写日志又把输出留给调用方（osascript 只回传 stdout，全导进日志的话
@@ -70,14 +79,34 @@ kext_running() { ioreg -r -c "$SERVICE_CLASS" 2>/dev/null | grep -q "$SERVICE_CL
 SUDO=""
 [[ "$(id -u)" -ne 0 ]] && SUDO="sudo"
 
-# 已加载且磁盘上那份标识正确 → 什么都不做（幂等）
+# 升级兼容（≤3.2.4 → 3.2.5）——必须在**幂等提前退出之前**执行：
+#   ① 清掉旧位置（用户支持库）里的开机加载器，否则两份并存容易跑错版本
+#   ② 把用户支持库目录属主修回控制台用户——≤3.2.4 的安装器以 root 建了这个
+#      目录，存量用户升级后也还是 root，helper 照样建不了锁。
+# 这个函数会被单独调用（不仅 5/5），因为 app 内「立即安装」只跑本脚本。
+fix_user_support_owner() {
+  if [[ -e "$LOADER_OLD_USER" ]]; then
+    $SUDO rm -f "$LOADER_OLD_USER" && echo "    已清旧位置加载器（用户支持库）"
+  fi
+  if [[ -d "$USER_SUPPORT" && -n "$CONSOLE_USER" ]]; then
+    local owner
+    owner="$(stat -f %Su "$USER_SUPPORT" 2>/dev/null)"
+    if [[ "$owner" != "$CONSOLE_USER" ]]; then
+      $SUDO chown -R "$CONSOLE_USER:staff" "$USER_SUPPORT" 2>/dev/null \
+        && echo "    已修正用户支持库属主（$owner → $CONSOLE_USER）"
+    fi
+  fi
+}
+
+# 已加载且磁盘上那份标识正确 → 剩下的只做属主修正（幂等）
 CURRENT_ID=""
 if [[ -d "$KEXT_DST" ]]; then
   CURRENT_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
                   "$KEXT_DST/Contents/Info.plist" 2>/dev/null || true)"
 fi
 if kext_running && [[ "$CURRENT_ID" == "$KEXT_ID" ]]; then
-  echo "✓ $SERVICE_CLASS 已在内核运行（$KEXT_ID），无需安装"
+  fix_user_support_owner
+  echo "✓ $SERVICE_CLASS 已在内核运行（$KEXT_ID），无需重装"
   exit 0
 fi
 
@@ -128,24 +157,24 @@ for label in "${OLD_LABELS[@]}"; do
 done
 
 echo "→ 5/5 安装开机自动加载（LaunchDaemon + 自有加载器）"
-# 2.8.15：先把自己这一份加载器放到控制台的支持库，再让守护指向它。
-# 这样「登录项」里显示的是「Sky CC散热扩展」而不是来路不明的 kmutil。
 if [[ -x "$LOADER_SRC" ]]; then
-  $SUDO mkdir -p "$(dirname "$LOADER_DST")"
+  $SUDO mkdir -p "$LOADER_DIR"
+  # 目录必须 root:wheel 755：加载器由 root 守护执行，用户不能有写权（防替换提权）
+  $SUDO chown root:wheel "$LOADER_DIR" 2>/dev/null
+  $SUDO chmod 755 "$LOADER_DIR" 2>/dev/null
   $SUDO cp "$LOADER_SRC" "$LOADER_DST" 2>/dev/null
   $SUDO chown root:wheel "$LOADER_DST" 2>/dev/null
   $SUDO chmod 755 "$LOADER_DST" 2>/dev/null
 fi
 
+# 升级兼容（≤3.2.4 → 3.2.5）：
+#   → 见上方 fix_user_support_owner：清旧位置加载器 + 把用户支持库属主修回用户
+fix_user_support_owner
+
 if [[ -x "$LOADER_DST" ]]; then
   echo "    加载器 → $LOADER_DST"
   DAEMON_PROG="$LOADER_DST"
   DAEMON_ARGS=""
-  # 加载器放在用户 home 里：FileVault 开启时开机阶段 home 未解锁，守护读不到它。
-  if fdesetup status 2>/dev/null | grep -q "FileVault is On"; then
-    echo "    ⚠️ 检测到 FileVault 已开启：开机时 home 未解锁，kext 可能不会自动加载。"
-    echo "       如遇重启后散热失效，请关闭 FileVault 或在控制台里重新点「立即安装」。"
-  fi
 else
   # 兜底：加载器缺失/拷贝失败时退回 kmutil（功能正常，只是登录项里显示 kmutil）
   echo "    ⚠️ 加载器不可用（缺失或拷贝失败），退回 kmutil 方式"

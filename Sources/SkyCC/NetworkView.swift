@@ -71,6 +71,28 @@ struct NetworkView: View {
         }
     }
 
+    /// 点「安装驱动 / 下载并安装」：有版本号直接装，没有就先查一次最新版再装
+    /// （2026-11-22：全新机器没有安装记录、release 也可能还没拿到过）
+    private func beginInstall() {
+        guard !phase.isBusy else { return }
+        if let tag = state.latestVersion ?? release?.tag {
+            runInstall(tag: tag)
+            return
+        }
+        state = .checking
+        NetworkUpdate.fetchLatest { result in
+            switch result {
+            case .success(let rel):
+                release = rel
+                state = NetworkUpdate.stateFromCache()
+                runInstall(tag: rel.tag)
+            case .failure(let error):
+                state = .failed(installed: NetworkUpdate.installedTag ?? "未记录",
+                                message: error.localizedDescription)
+            }
+        }
+    }
+
     // MARK: - 组件卡
 
     private var componentsCard: some View {
@@ -161,17 +183,24 @@ struct NetworkView: View {
                 }
 
                 HStack(spacing: 8) {
-                    if state.hasUpdate {
+                    if state.hasUpdate || NetworkUpdate.installedTag == nil {
+                        // 2026-11-22（用户报 bug）：原来只有 hasUpdate 才给主按钮，
+                        // 从没通过 App 装过的机器界面上只剩「检查更新」，没有安装入口。
+                        // 未记录安装时主按钮就是「安装驱动」（没有版本号会先查一次）。
                         Button {
-                            runInstall(tag: state.latestVersion ?? release_?.tag ?? "")
+                            beginInstall()
                         } label: {
-                            Text(phase.isBusy ? phase.label : "下载并安装 \(state.latestVersion ?? "")")
+                            Text(phase.isBusy
+                                 ? phase.label
+                                 : (state.hasUpdate
+                                    ? "下载并安装 \(state.latestVersion ?? "")"
+                                    : (state.latestVersion.map { "安装驱动 \($0)" } ?? "安装驱动")))
                         }
                         .buttonStyle(.borderedProminent)
                         .tint(Theme.amber)
                         .disabled(phase.isBusy)
 
-                        Button(state.isChecking ? "检查中…" : "重新检查") {
+                        Button(state.isChecking ? "检查中…" : (state.hasUpdate ? "重新检查" : "检查更新")) {
                             checkNow()
                         }
                         .buttonStyle(.bordered)

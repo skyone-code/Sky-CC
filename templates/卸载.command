@@ -54,8 +54,10 @@ KEXT_LEGACY=(
   "/Library/Extensions/TongfangFan.kext"
   "/Library/Extensions/SkyCCMSR.kext"
 )
-# 2.8.15：开机加载器放在控制台支持库里（/Library/PrivilegedHelperTools 被 SIP 挡住）
-LOADER_DST="$SUPPORT/bin/Sky CC散热扩展"
+# 开机加载器：2026-11-22 起放系统级 /Library/Application Support/SkyCC/bin
+# （root:wheel，用户不可写）。旧位置在控制台支持库（≤3.2.4），一并清。
+LOADER_DST="/Library/Application Support/SkyCC/bin/Sky CC散热扩展"
+LOADER_USER_OLD="$SUPPORT/bin/Sky CC散热扩展"
 # 旧版本（≤3.0.4.4）加载器的名字，一并清
 LOADER_LEGACY="$SUPPORT/bin/Mac控制台散热扩展"
 # 早期试验版曾想把它放到这里，一并清掉
@@ -171,8 +173,8 @@ sudo rm -f "/Library/LaunchDaemons/com.macconsole.TongfangFan.plist" 2>/dev/null
 echo "→ 3/9 卸载内核扩展（需要管理员密码）"
 LEGACY_PRESENT=false
 for K in "${KEXT_LEGACY[@]}"; do [[ -d "$K" ]] && LEGACY_PRESENT=true; done
-if [[ -d "$KEXT_DST" || -f "$DAEMON_PLIST" || -e "$LOADER_DST" || -e "$LOADER_OLD" \
-      || "$LEGACY_PRESENT" == "true" ]]; then
+if [[ -d "$KEXT_DST" || -f "$DAEMON_PLIST" || -e "$LOADER_DST" || -e "$LOADER_USER_OLD" \
+      || -e "$LOADER_OLD" || "$LEGACY_PRESENT" == "true" ]]; then
   sudo -v || echo "    ⚠️ 没拿到管理员权限，kext 部分跳过（其余继续）"
   for LABEL in "$DAEMON_PLIST" system/com.skycc.ec; do
     sudo launchctl bootout "$LABEL" >/dev/null 2>&1 || true
@@ -195,7 +197,10 @@ if [[ -d "$KEXT_DST" || -f "$DAEMON_PLIST" || -e "$LOADER_DST" || -e "$LOADER_OL
   # 2.8.15：开机加载器（我们自己的二进制）——先卸守护再删文件，
   # 否则 launchd 会在 KeepAlive/RunAtLoad 下拿不到程序反复失败。
   if [[ -e "$LOADER_DST" ]]; then
-    sudo rm -f "$LOADER_DST" && echo "    已删除开机加载器（支持库）"
+    sudo rm -f "$LOADER_DST" && echo "    已删除开机加载器（系统支持库）"
+  fi
+  if [[ -e "$LOADER_USER_OLD" ]]; then
+    sudo rm -f "$LOADER_USER_OLD" && echo "    已删除开机加载器（旧位置·用户支持库）"
   fi
   if [[ -e "$LOADER_LEGACY" ]]; then
     sudo rm -f "$LOADER_LEGACY" && echo "    已删除开机加载器（旧版名残留）"
@@ -312,6 +317,7 @@ check "$SUPPORT"
 check "$KEXT_DST"
 check "$DAEMON_PLIST"
 check "$LOADER_DST"
+check "$LOADER_USER_OLD"
 check "$LOADER_LEGACY"
 check "$LOADER_OLD"
 check "$GPU_DYLIB"

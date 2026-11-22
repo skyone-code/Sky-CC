@@ -51,7 +51,7 @@ PROJ="$BUILD/app-resources"
 [ -d "$PROJ" ] || { echo "错误：找不到资源目录 $PROJ" >&2; exit 1; }
 
 # 版本号（唯一来源：脚本注入 Info.plist 与 helper 的 BuildVersion.swift）
-VERSION="3.2.4"
+VERSION="3.2.5"
 # 显示版本（侧边栏/设置页文案）：纯数字版本（2026-11-18 用户要求：全 app 去掉
 # 版本号里的机型后缀字样；PKGBASE 文件名里的 LAPQC71x 保留仅作分发区分）
 DISPLAY_VERSION="$VERSION"
@@ -268,8 +268,10 @@ if [[ -x "$PROJ/bin/nvmesmart" ]]; then
   cp "$PROJ/bin/nvmesmart" "$NATIVE/bin/nvmesmart"
   chmod 755 "$NATIVE/bin/nvmesmart"
 fi
-# 开机 kext 加载器：install-kext.sh 会把它装到控制台用户的支持库，
-# 由 LaunchDaemon com.skycc.ec 以 root 调用
+# 开机 kext 加载器：install-kext.sh 会把它装到 /Library/Application Support/SkyCC/bin
+# （root:wheel，用户不可写），由 LaunchDaemon com.skycc.ec 以 root 调用。
+# 2026-11-22：旧版曾装进 ~/Library/Application Support/SkyCC/bin —— 安装器以 root
+# 建目录会把属主留成 root:staff，导致用户身份的 helper 建不了 helper.lock。
 if [[ -x "$PROJ/bin/Sky CC散热扩展" ]]; then
   cp "$PROJ/bin/Sky CC散热扩展" "$NATIVE/bin/Sky CC散热扩展"
   chmod 755 "$NATIVE/bin/Sky CC散热扩展"

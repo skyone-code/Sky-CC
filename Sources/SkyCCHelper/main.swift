@@ -48,22 +48,67 @@ func hlog(_ s: String) {
 
 private var lockFD: Int32 = -1
 
-func acquireSingleInstanceLock() -> Bool {
-    let dir = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/SkyCC", isDirectory: true)
-    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    let path = dir.appendingPathComponent("helper.lock").path
-    lockFD = open(path, O_CREAT | O_RDWR, 0o644)
-    guard lockFD >= 0 else { return false }
-    if flock(lockFD, LOCK_EX | LOCK_NB) != 0 {
-        close(lockFD)
-        lockFD = -1
-        return false
+/// 尝试在指定路径拿独占锁的结果。
+/// 2026-11-22（安装器大 bug 修正）：原来 open 失败和 flock 失败共用一句
+/// 「已有实例持有硬件锁」，导致排查时全被误导——实际是目录属主被 root 占着、
+/// 文件根本建不出来。现在两种失败分开记，并把 errno 打进日志。
+private enum LockAttempt {
+    case ok(Int32)
+    case locked            // 真的被另一个实例持着
+    case unwritable(Int32) // 路径打不开（权限/目录不存在等）
+}
+
+private func tryLock(at path: String) -> LockAttempt {
+    let dir = (path as NSString).deletingLastPathComponent
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    let fd = open(path, O_CREAT | O_RDWR, 0o644)
+    guard fd >= 0 else {
+        let e = errno
+        return .unwritable(e)
+    }
+    if flock(fd, LOCK_EX | LOCK_NB) != 0 {
+        let e = errno
+        close(fd)
+        return e == EWOULDBLOCK ? .locked : .unwritable(e)
     }
     let pidText = "\(getpid())\n"
-    ftruncate(lockFD, 0)
-    _ = pidText.withCString { write(lockFD, $0, strlen($0)) }
-    return true
+    ftruncate(fd, 0)
+    _ = pidText.withCString { write(fd, $0, strlen($0)) }
+    return .ok(fd)
+}
+
+func acquireSingleInstanceLock() -> Bool {
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    let primary = home
+        .appendingPathComponent("Library/Application Support/SkyCC/helper.lock").path
+    switch tryLock(at: primary) {
+    case .ok(let fd):
+        lockFD = fd
+        return true
+    case .locked:
+        hlog("已有实例持有硬件锁（主路径），本进程退出")
+        return false
+    case .unwritable(let e):
+        // 目录不可写（典型原因：旧安装器以 root 建了这个目录，属主 root:staff）。
+        // 锁的作用只是防手点二进制双开，不该因路径权限打死整个后台服务：
+        // 退到缓存目录再试一次，同时在日志里写明真实原因，方便定位安装器问题。
+        hlog("锁文件不可写（errno=\(e)：\(String(cString: strerror(e)))）：\(primary)，回退缓存目录")
+        let fallback = home
+            .appendingPathComponent("Library/Caches/com.skycc.console/helper.lock").path
+        switch tryLock(at: fallback) {
+        case .ok(let fd):
+            lockFD = fd
+            hlog("已改用回退锁：\(fallback)")
+            return true
+        case .locked:
+            hlog("已有实例持有硬件锁（回退路径），本进程退出")
+            return false
+        case .unwritable(let e2):
+            hlog("回退锁也不可用（errno=\(e2)）：\(fallback)，放弃单实例保护继续启动")
+            // 宁可没有单实例保护也要让硬件服务活着（launchd 本身已保证同 label 单实例）
+            return true
+        }
+    }
 }
 
 // MARK: - XPC 服务
@@ -154,7 +199,7 @@ final class ListenerDelegate: NSObject, NSXPCListenerDelegate {
 let bootEpoch = Int(Date().timeIntervalSince1970)
 
 guard acquireSingleInstanceLock() else {
-    hlog("已有实例持有硬件锁，本进程退出")
+    // 具体原因（被占用 / 不可写 / 回退）已由 acquireSingleInstanceLock 自己记进日志
     exit(0)
 }
 

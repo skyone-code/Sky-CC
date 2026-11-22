@@ -153,20 +153,24 @@ struct NvidiaView: View {
                         Text("卸载完成，重启后独显将回到纯核显状态")
                             .font(.system(size: 11.5, weight: .semibold))
                             .foregroundStyle(Theme.amber)
-                    } else if state.hasUpdate {
-                        // 有更新时主按钮直接就是「下载并安装」——免得看到新版本还要再点一次
+                    } else if state.hasUpdate || state.installedVersion == nil {
+                        // 2026-11-22（用户报 bug）：原来只有 hasUpdate 才给主按钮，
+                        // 全新机器（没装过驱动、又没检测到新版本）界面上只剩
+                        // 「检查更新」，根本找不到安装入口。未安装时主按钮就是「安装」。
                         Button {
                             beginInstall()
                         } label: {
                             Text(installPhase.isBusy && !isUninstall
                                  ? installPhase.label
-                                 : "下载并安装 \(state.latestVersion ?? "")")
+                                 : (state.hasUpdate
+                                    ? "下载并安装 \(state.latestVersion ?? "")"
+                                    : (state.latestVersion.map { "安装驱动 \($0)" } ?? "安装驱动")))
                         }
                         .buttonStyle(.borderedProminent)
                         .tint(Theme.amber)
                         .disabled(installPhase.isBusy)
 
-                        Button(state.isChecking ? "检查中…" : "重新检查") {
+                        Button(state.isChecking ? "检查中…" : (state.hasUpdate ? "重新检查" : "检查更新")) {
                             checkNow()
                         }
                         .buttonStyle(.bordered)

@@ -136,6 +136,22 @@ echo "    内核扩展就绪（macOS 26 需重启一次加载）"
 
 # ---------------------------------------------------------------- 6 收尾
 step 6 "收尾"
+# 2026-11-22（安装器大 bug 兜底）：≤3.2.4 的 install-kext.sh 以 root 建了
+# ~/Library/Application Support/SkyCC（root:staff），导致用户身份的 helper
+# 无法在其中创建 helper.lock，helper 每 2 秒重启、全量功能离线。
+# install-kext.sh 里已经会纠正，这里再兜一层（install-kext 可能提前 exit 0
+# 走幂等分支而不碰目录）。目录不存在就不建——交给 helper 首次运行时自建。
+USER_SUPPORT="$USER_HOME/Library/Application Support/SkyCC"
+if [[ -d "$USER_SUPPORT" && -n "$CONSOLE_USER" ]]; then
+  OWNER_NOW="$(/usr/bin/stat -f %Su "$USER_SUPPORT" 2>/dev/null)"
+  if [[ "$OWNER_NOW" != "$CONSOLE_USER" ]]; then
+    /usr/sbin/chown -R "${CONSOLE_USER}:staff" "$USER_SUPPORT" 2>/dev/null && \
+      echo "    已修正用户数据目录属主（$OWNER_NOW → $CONSOLE_USER）"
+  fi
+  # 目录里可能残留旧位置的开机加载器（现在改放 /Library/Application Support）
+  OLD_LOADER="$USER_SUPPORT/bin/Sky CC散热扩展"
+  [[ -e "$OLD_LOADER" ]] && /bin/rm -f "$OLD_LOADER" && echo "    已清旧位置开机加载器"
+fi
 {
   echo "== 安装摘要 $(/bin/date '+%Y-%m-%d %H:%M:%S') =="
   /bin/ls -d "$DST_APP" "$LIBDIR/gpu-router.dylib" /Library/Extensions/SkyCCEC.kext 2>&1
