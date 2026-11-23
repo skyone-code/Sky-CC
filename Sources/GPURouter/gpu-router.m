@@ -78,6 +78,20 @@ static void loadPolicy(void) {
 
     if (isExcluded(bundleID)) { g_mode = 0; g_have_policy = 1; return; }
 
+    /* 后台进程过滤：被路由的每个进程首次摸 Metal 都要付 ~390ms 的 Mesa 带起
+       （dlopen libvulkan_nouveau，实测 287-407ms，静态初始化器主导）。LaunchAgents、
+       XPC 服务、各种系统辅助进程也走独显的话，系统每次孵化它们整屏就顿一下，
+       而它们根本不做需要独显的工作。用户应用住在 /Applications（或 ~/Applications）
+       下的 .app 包里（Electron 的 Helper.app 也算）；其余一律保持 Apple 默认（核显）。
+       OPTIMUS_ALLOW_ANY_PATH=1 可关掉这个过滤。 */
+    if (!getenv("OPTIMUS_ALLOW_ANY_PATH")) {
+        NSString *bp = [[NSBundle mainBundle] bundlePath];
+        BOOL userApp = ([bp hasPrefix:@"/Applications/"] ||
+                        [bp hasPrefix:[NSHomeDirectory() stringByAppendingPathComponent:@"Applications/"]]) &&
+                       [bp hasSuffix:@".app"];
+        if (!userApp) { g_mode = 0; g_have_policy = 1; return; }
+    }
+
     g_mode = 1;                       /* 文件读不到时的默认：结构上「注入了就是要独显」 */
     NSString *p = policyPath();
     if (!p) { g_have_policy = 1; return; }
@@ -94,10 +108,34 @@ static void loadPolicy(void) {
     g_have_policy = 1;
 }
 
+/* 设备列表缓存：进程的 Metal 设备来自 IOAccelDevice 注册，一旦注册齐全就不再变化。
+   MTLCopyAllDevices 持 Metal 全局锁（dispatch barrier sync），且枚举快照会拷贝设备数组——
+   如果任何进程的 NVMTLDevice 还在初始化中，枚举会撞上半成品对象直接 SIGSEGV
+   （实测 QQLive 2026-11-23 两次崩溃都是这个栈），同时全局锁会让 WindowServer
+   合成停顿，表现为整屏冻结 <1s。所以：每次调用都枚举是错误的，缓存起来。
+   空结果不缓存——驱动可能还没注册完，下一次调用再试。 */
+static NSArray<id<MTLDevice>> *g_devices;
+static pthread_mutex_t g_dev_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static NSArray<id<MTLDevice>> *deviceList(void) {
+    pthread_mutex_lock(&g_dev_lock);
+    NSArray *cached = g_devices;
+    pthread_mutex_unlock(&g_dev_lock);
+    if (cached.count > 0) return cached;
+
+    NSArray *fresh = MTLCopyAllDevices();
+    if (fresh.count > 0) {
+        pthread_mutex_lock(&g_dev_lock);
+        if (g_devices.count == 0) g_devices = fresh;
+        pthread_mutex_unlock(&g_dev_lock);
+        return g_devices.count > 0 ? g_devices : fresh;
+    }
+    return fresh;                                     /* 空：下次调用再试 */
+}
+
 static id<MTLDevice> pickNvidia(void) {
-    NSArray<id<MTLDevice>> *all = MTLCopyAllDevices();
     id<MTLDevice> best = nil;
-    for (id<MTLDevice> d in all) {
+    for (id<MTLDevice> d in deviceList()) {
         if (d.isLowPower) continue;                       /* 核显 */
         if (!best || d.registryID != best.registryID) best = d;
     }
@@ -105,9 +143,10 @@ static id<MTLDevice> pickNvidia(void) {
 }
 
 static id<MTLDevice> pickIgpu(void) {
-    for (id<MTLDevice> d in MTLCopyAllDevices())
+    NSArray *all = deviceList();
+    for (id<MTLDevice> d in all)
         if (d.isLowPower) return d;
-    return MTLCopyAllDevices().firstObject;
+    return all.firstObject;
 }
 
 /* 注意：interpose 是全局的，在本函数里再调 MTLCreateSystemDefaultDevice 会递归，
