@@ -171,25 +171,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 开机时会在 Dock 里挂一个图标、还把主窗口顶到前面 —— 用户要的是无感后台。
         // 现在启动一律 .accessory（无 Dock、无应用菜单），主窗口只在被显式打开时出现。
         DispatchQueue.main.async { AppPolicy.toAccessory() }
-        // 区分「登录项拉起」与「用户双击打开」：
-        //
-        // 2026-11-14（用户反馈，第二次修）：之前靠 NSApp.isActive —— 0.2s 内没激活
-        // 就认定是登录项启动、收窗。但本 app 是 LSUIElement（accessory 策略），
-        // **双击打开也常常不会把 isActive 置真**，轮询等到天荒地老都是 false，
-        // 结果双击也收窗 →「被迫闪退」。isActive 这条路彻底放弃。
-        //
-        // 现在的判定（不依赖激活事件）：
-        //   登录项拉起 = launchd 以服务方式拉起（XPC_SERVICE_NAME == 本 bundle id）
-        //   且开机自启已开启。此时静默进后台，不弹窗；
-        //   其余一切情况（双击、菜单栏唤起、spotlight 等）都亮主窗口。
-        //   双击/退出重开在重启后 3 分钟内也一样亮窗 —— 判据与运行时间无关。
-        var isLoginLaunch = (ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"]
-                             == Bundle.main.bundleIdentifier)
-        if #available(macOS 13.0, *) {
-            isLoginLaunch = isLoginLaunch && (SMAppService.mainApp.status == .enabled)
-        }
+        // 2026-11-23（用户定案）：静默启动恒定生效、不做设置项（用户原话
+        // 「不要开关 就只需要一个开机自启动就行」）。行为：
+        //   · 登录项启动连窗口都不建（.defaultLaunchBehavior(.suppressed)，见 body）
+        //   · 双击 / Spotlight 属于显式打开，系统会呈现窗口 —— 判据是 0.2s 时
+        //     主窗口已存在且可见（不依赖 NSApp.isActive：LSUIElement 下双击常常
+        //     不激活，2026-11-14 踩过），这种就保留；其余情况收掉（对登录项启动
+        //     是不存在的窗，空操作）。主入口是菜单栏图标的「打开控制台」。
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            if NSApp.isActive || !isLoginLaunch {
+            let presented = NSApp.windows.contains {
+                $0.canBecomeMain && $0.isVisible && !$0.isMiniaturized
+            }
+            if presented {
                 NotificationCenter.default.post(name: .skyCCShowMain, object: nil)
             } else {
                 AppPolicy.closeMainWindows()
@@ -343,10 +336,14 @@ struct SkyCCApp: App {
         // 主窗口：关闭后 app 不退出，继续在菜单栏后台运行；
         // 重新打开走菜单栏图标的「打开控制台」（openWindow id: main）
         //
-        // 2026-10-25：登录项启动不应该弹窗。SwiftUI 的 SceneBuilder 不支持 if，
-        // 没法按系统版本套 defaultLaunchBehavior(.suppressed)，所以统一在
-        // AppDelegate 里用「启动 0.2s 后收窗」兜底（窗口还没画出来就关掉了）。
+        // 2026-11-23（用户要求，Clash Plus 同款静默启动）：登录项拉起时**连窗口都不建**，
+        // 消灭「先画出来、0.2s 后收掉」的那一下闪现。`.defaultLaunchBehavior(.suppressed)`
+        // 需要 macOS 15+（部署目标已随之从 14.0 上调到 15.0，见 build-swift.sh 注释）：
+        // 系统后台拉起（登录项）不呈现窗口；用户显式打开（双击/Spotlight）照常亮窗。
+        // AppDelegate 里 0.2s 的判定保留：macOS 15+ 上登录项启动它收的是一个不存在的窗（空操作），
+        // 双击等显式启动场景仍然走 .skyCCShowMain 补亮。
         mainWindow
+            .defaultLaunchBehavior(.suppressed)
         // 菜单栏常驻图标：窗口关掉后控制台仍在后台运行，硬件状态实时可见
         MenuBarExtra {
             MenuBarView()
@@ -1050,6 +1047,11 @@ struct RootView: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 0)
+            // 驱动页在别的页面后台跑安装/下载时，这一行给个转圈
+            // （2026-11-22 用户报 bug：切页后看不出还在跑，以为断掉了）
+            if p == .nvidia || p == .network {
+                DriverBusyDot(kind: p == .nvidia ? .nvidia : .network)
+            }
         }
         .padding(.vertical, 2)
     }
@@ -1093,6 +1095,26 @@ struct RootView: View {
 }
 
 // MARK: - 侧边栏底部状态条
+
+/// 驱动页在后台忙时，侧边栏那一行右侧的小转圈。
+///
+/// 2026-11-22（用户报 bug）：安装/下载中人切到别的页面，看不出还在跑，
+/// 以为断掉了。这里只订阅 DriverInstallCenter 一个单例 —— 和 SidebarFooter 同理，
+/// 把重新计算的范围收敛到这个小视图，不带着整个 List 一起重算。
+private struct DriverBusyDot: View {
+    let kind: DriverInstallCenter.Kind
+    @ObservedObject private var center = DriverInstallCenter.shared
+
+    var body: some View {
+        Group {
+            if center.slot(kind).phase.isBusy {
+                ProgressView()
+                    .controlSize(.mini)
+                    .help(center.slot(kind).phase.label)
+            }
+        }
+    }
+}
 
 /// 侧边栏左下角：后台服务状态 + 退出按钮。
 ///

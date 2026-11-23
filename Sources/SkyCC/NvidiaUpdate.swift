@@ -523,7 +523,10 @@ enum NvidiaUpdate {
 /// 安装流程的阶段，供 UI 展示进度
 enum DriverInstallPhase: Equatable {
     case idle
+    case preparing                     // 正在取版本信息 / 建临时目录，还没开始下字节
     case downloading(progress: Double)
+    /// 首次安装 GPU 固件包（约 550 MB）：total 为 0 表示服务器没给长度，界面只显示已下载量
+    case downloadingFirmware(progress: Double, received: Int64, total: Int64)
     case extracting
     case authorizing                    // 已经弹出管理员密码框，等用户输入
     case installing(elapsed: Int)       // 后台以 root 跑安装脚本，秒数用于显示耗时
@@ -533,7 +536,13 @@ enum DriverInstallPhase: Equatable {
     var label: String {
         switch self {
         case .idle:               return "未开始"
+        case .preparing:          return "准备中…"
         case .downloading(let p): return "下载中 \(Int(p * 100))%"
+        case .downloadingFirmware(let p, let got, let total):
+            if total > 0 {
+                return "下载 GPU 固件包 \(Int(p * 100))%（\(DriverInstallPhase.mbText(got)) / \(DriverInstallPhase.mbText(total)) MB）"
+            }
+            return "下载 GPU 固件包 \(DriverInstallPhase.mbText(got)) MB…"
         case .extracting:         return "解压中…"
         case .authorizing:        return "等待管理员授权…"
         case .installing(let s):  return "安装中… 已用 \(DriverInstallPhase.timeText(s))"
@@ -547,6 +556,38 @@ enum DriverInstallPhase: Equatable {
         return "\(seconds / 60) 分 \(String(format: "%02d", seconds % 60)) 秒"
     }
 
+    /// 十进制的 MB（549727763 → 550），跟文案里的「约 550 MB」一致；用 MiB 会显示成 524 让人对不上
+    static func mbText(_ bytes: Int64) -> String {
+        String(format: "%.0f", Double(max(0, bytes)) / 1_000_000)
+    }
+
+    /// 确定进度（0…1）。nil = 还不知道总量，或者根本不是下载阶段
+    var progress: Double? {
+        switch self {
+        case .downloading(let p):                    return p
+        case .downloadingFirmware(let p, _, let t):  return t > 0 ? p : nil
+        default:                                     return nil
+        }
+    }
+
+    /// 正在下载（进度可能未知，界面用不确定进度的条）
+    var isDownloading: Bool {
+        switch self {
+        case .downloading, .downloadingFirmware: return true
+        default:                                 return false
+        }
+    }
+
+    /// 按钮上用的短文案（带 MB 的长文案留给状态行，否则按钮会被撑开）
+    var shortLabel: String {
+        switch self {
+        case .downloadingFirmware(let p, _, let total):
+            return total > 0 ? "下载固件包 \(Int(p * 100))%" : "下载固件包…"
+        default:
+            return label
+        }
+    }
+
     var isFailed: Bool {
         if case .failed = self { return true }
         return false
@@ -558,6 +599,298 @@ enum DriverInstallPhase: Equatable {
         case .idle, .succeeded, .failed: return false
         default: return true
         }
+    }
+}
+
+// MARK: - 首次安装的 GPU 固件包（约 550 MB）
+
+/// 离线包自己不带 GPU 固件：`pkgroot/fw_fetch.sh` 从 NVIDIA 官方 Linux 驱动包里读出来（约 550 MB），
+/// 三条来源依次尝试——① 早先装过、四个文件仍符合 pin；② 手边已有的 `.run`；③ `curl -sS` 现场下载。
+///
+/// 第三条是静默的：550 MB 一段空白，用户只会以为卡死。而 `install.sh` 支持 `NULLMOTH_FW_RUN=<file>`
+/// 把「手边已有的 .run」直接喂进去（走②，不再 curl），所以这里由 App 负责带进度下载 + 校验 SHA-256，
+/// 安装脚本拿到的就是本地文件。
+///
+/// 版本号 / URL / SHA / 四个文件名都从包内 `fw_fetch.sh` 读，App 不写死——将来包换成新内核版本，
+/// 这里自动跟着走；读不到（包结构变了）就退回脚本自己下载，没有进度但装得上。
+enum DriverFirmware {
+    struct Pins: Equatable {
+        let version: String          // 620.73.04
+        let url: String              // https://download.nvidia.com/.../NVIDIA-Linux-x86_64-<ver>.run
+        let sha256: String
+        let members: [String]        // 只要文件名：gsp_tu10x.bin …
+    }
+
+    /// 已装固件的位置，与 fw_fetch.sh 的 --installed 默认值一致；四个文件都在就直接复用，不联网
+    static let installedRoot = "/Library/NullMoth/nvfw/nvidia"
+
+    // MARK: 从离线包里读 pin
+
+    /// 在离线包目录里找 `.tar.gz`，抽出其中的 `pkgroot/fw_fetch.sh` 并解析
+    static func pins(inOfflinePackage dir: URL) -> Pins? {
+        for tarball in tarballs(in: dir) {
+            guard let text = member("pkgroot/fw_fetch.sh", of: tarball) else { continue }
+            guard let ver = value("VER", in: text),
+                  let rawURL = value("URL_RUN", in: text),
+                  let sha = value("SHA_RUN", in: text),
+                  let list = value("FW_MEMBERS", in: text) else { continue }
+            // 脚本里写的是 URL_RUN=".../$VER/NVIDIA-Linux-x86_64-$VER.run"，$VER 要自己展开
+            let url = rawURL
+                .replacingOccurrences(of: "${VER}", with: ver)
+                .replacingOccurrences(of: "$VER", with: ver)
+            guard url.hasPrefix("https://"), sha.count == 64 else { continue }
+            let members = list.split(separator: " ").map { ($0 as NSString).lastPathComponent }.filter { !$0.isEmpty }
+            guard !members.isEmpty else { continue }
+            return Pins(version: ver, url: url, sha256: sha.lowercased(), members: members)
+        }
+        return nil
+    }
+
+    /// 离线包顶层的 tar 包（`nullmoth-nvidia-<x>.tar.gz`）
+    private static func tarballs(in dir: URL) -> [URL] {
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return [] }
+        return items.filter { $0.lastPathComponent.hasSuffix(".tar.gz") }
+    }
+
+    /// 包里自带固件时（`pkgroot/Users/Shared/nvfw` 下有真文件），`install.sh` 直接 ditto 那一份，
+    /// 根本不会调 `fw_fetch.sh` —— 这时候 App 再下 550 MB 纯属浪费。
+    /// 布局不猜：把 `pkgroot/Users` 整个抽到临时目录里看有没有像样的文件
+    /// （空目录不算，当前包就是空的，此时 install.sh 才去调 fw_fetch.sh）。
+    static func packageCarriesFirmware(inOfflinePackage dir: URL) -> Bool {
+        let fm = FileManager.default
+        for tarball in tarballs(in: dir) {
+            let tmp = fm.temporaryDirectory.appendingPathComponent("mc-fwchk-\(UUID().uuidString)")
+            guard (try? fm.createDirectory(at: tmp, withIntermediateDirectories: true)) != nil else { continue }
+            defer { try? fm.removeItem(at: tmp) }
+
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+            p.arguments = ["-xzf", tarball.path, "-C", tmp.path, "pkgroot/Users"]
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
+            guard (try? p.run()) != nil else { continue }
+            p.waitUntilExit()
+
+            let nvfw = tmp.appendingPathComponent("pkgroot/Users/Shared/nvfw")
+            guard let walker = fm.enumerator(at: nvfw, includingPropertiesForKeys: [.fileSizeKey]) else { continue }
+            for case let f as URL in walker {
+                let size = (try? f.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+                if size > 1_000_000 { return true }
+            }
+        }
+        return false
+    }
+
+    /// `tar -xzOf` 只取一个成员，不落盘
+    private static func member(_ path: String, of tarball: URL) -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        p.arguments = ["-xzOf", tarball.path, path]
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return nil }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0, !data.isEmpty else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    /// 取脚本里的 `KEY=value`（值可能带引号）
+    private static func value(_ key: String, in script: String) -> String? {
+        for raw in script.split(separator: "\n") {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard line.hasPrefix(key + "=") else { continue }
+            let v = line.dropFirst(key.count + 1)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\"'").union(.whitespaces))
+            if !v.isEmpty { return v }
+        }
+        return nil
+    }
+
+    // MARK: 已装 / 缓存 / 下载
+
+    /// 四个固件文件都在（大小合理）→ 安装脚本会直接复用，不用下 550 MB
+    static func isInstalled(_ pins: Pins) -> Bool {
+        let dir = URL(fileURLWithPath: installedRoot).appendingPathComponent(pins.version)
+        for name in pins.members {
+            let f = dir.appendingPathComponent(name)
+            guard let attrs = try? FileManager.default.attributesOfItem(atPath: f.path),
+                  let size = attrs[.size] as? Int64, size > 1_000_000 else { return false }
+        }
+        return true
+    }
+
+    /// 缓存位置：升级重装时不必再下一次 550 MB（卸载会清 /Library/NullMoth）
+    static func cacheURL(_ pins: Pins) -> URL {
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory() + "/Library/Caches")
+        let name = URL(string: pins.url)?.lastPathComponent
+            ?? "NVIDIA-Linux-x86_64-\(pins.version).run"
+        return base
+            .appendingPathComponent("com.skycc.console/nvfw/\(pins.version)")
+            .appendingPathComponent(name)
+    }
+
+    /// 拿一份校验过的 `.run`：缓存命中直接用，否则带进度下载。
+    /// 返回 nil 表示这一步没做成（网络/校验/解析），调用方退回让脚本自己下载，不阻断安装。
+    /// 固件包下载失败的原因（带人话，直接显示给用户）
+    struct DownloadProblem: Error, CustomStringConvertible {
+        let message: String
+        var description: String { message }
+    }
+
+    static func localRun(_ pins: Pins,
+                         onPhase: @escaping (DriverInstallPhase) -> Void) -> Result<URL, DownloadProblem> {
+        let fm = FileManager.default
+        let dest = cacheURL(pins)
+
+        if fm.fileExists(atPath: dest.path) {
+            if sha256(of: dest) == pins.sha256 {
+                note("缓存命中：\(dest.path)")
+                return .success(dest)
+            }
+            note("缓存 SHA 不符，删掉重下：\(dest.path)")
+            try? fm.removeItem(at: dest)      // 上次下坏了，重来
+        }
+        guard let url = URL(string: pins.url) else {
+            return .failure(DownloadProblem(message: "固件包地址无效：\(pins.url)"))
+        }
+        do {
+            try fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+        } catch {
+            return .failure(DownloadProblem(message: "无法创建缓存目录：\(error.localizedDescription)"))
+        }
+
+        let part = dest.appendingPathExtension("part")
+        // 2026-11-23 用户定案：一次连接失败就静默跳过、丢给脚本那趟没进度的下载，这是错的。
+        // 550 MB 归 App 管：重试 3 次（间隔 2s / 5s），三次都不成就停下报错，安装脚本一个字节都不碰。
+        let attempts = 3
+        var lastError = "未开始"
+        for attempt in 1...attempts {
+            try? fm.removeItem(at: part)       // 每次从头下（不用续传数据：会话失效后它并不可靠）
+            if let error = transfer(url, to: part, onPhase: onPhase) {
+                lastError = error
+                note("第 \(attempt)/\(attempts) 次失败：\(error)")
+                if attempt < attempts {
+                    onPhase(.downloadingFirmware(progress: 0, received: 0, total: 0))   // 别停在旧百分比
+                    Thread.sleep(forTimeInterval: attempt == 1 ? 2 : 5)
+                }
+                continue
+            }
+            let size = (try? fm.attributesOfItem(atPath: part.path))?[.size] as? Int64 ?? 0
+            if sha256(of: part) == pins.sha256 {
+                try? fm.removeItem(at: dest)
+                guard (try? fm.moveItem(at: part, to: dest)) != nil else {
+                    note("SHA 一致但挪进缓存失败：\(part.path) → \(dest.path)")
+                    return .failure(DownloadProblem(message: "固件包无法存入缓存目录"))
+                }
+                note("第 \(attempt) 次成功：\(size) 字节，SHA 一致")
+                return .success(dest)
+            }
+            lastError = "下载完成但校验不符（收到 \(size) 字节）"
+            note("第 \(attempt)/\(attempts) 次\(lastError)，从头再来")
+            try? fm.removeItem(at: part)
+        }
+        return .failure(DownloadProblem(message: "\(lastError)（已尝试 \(attempts) 次）"))
+    }
+
+    /// 一次传输：成功返回 nil，失败返回原因
+    private static func transfer(_ url: URL, to part: URL,
+                                 onPhase: @escaping (DriverInstallPhase) -> Void) -> String? {
+        // 用代理而不是 task.progress：后者在 macOS 上 fractionCompleted 会走，
+        // 但 completedUnitCount/totalUnitCount 一直停在 5/100 这种假值（实测），
+        // 拿不到「已下载多少 MB / 共多少 MB」。
+        let receiver = Receiver(part: part)
+        var lastEmit = Date.distantPast
+        var lastPercent = -1
+        receiver.onProgress = { wrote, expected in
+            // 550 MB 会切出上万次回调，全丢主线程会把 UI 卡住 —— 百分比变了（或过了 1 秒）才报
+            let total = max(0, expected)      // -1 = 服务器没给长度
+            let frac = total > 0 ? min(1, Double(wrote) / Double(total)) : 0
+            let percent = Int(frac * 100)
+            let due = percent != lastPercent || Date().timeIntervalSince(lastEmit) >= 1
+            guard due else { return }
+            lastPercent = percent
+            lastEmit = Date()
+            onPhase(.downloadingFirmware(progress: frac, received: wrote, total: total))
+        }
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 60          // 只算「两包之间的空档」
+        config.timeoutIntervalForResource = 3 * 3600   // 550 MB 慢网也别掐
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        let session = URLSession(configuration: config, delegate: receiver, delegateQueue: nil)
+        session.downloadTask(with: url).resume()
+        receiver.done.wait()
+        session.finishTasksAndInvalidate()
+        return receiver.failure
+    }
+
+    /// 下载代理：把字节数报出去、把文件挪到 .part、结束时放行
+    private final class Receiver: NSObject, URLSessionDownloadDelegate {
+        let part: URL
+        var onProgress: ((Int64, Int64) -> Void)?
+        var failure: String?
+        let done = DispatchSemaphore(value: 0)
+
+        init(part: URL) { self.part = part }
+
+        func urlSession(_ s: URLSession, downloadTask: URLSessionDownloadTask,
+                        didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
+                        totalBytesExpectedToWrite: Int64) {
+            onProgress?(totalBytesWritten, totalBytesExpectedToWrite)
+        }
+
+        func urlSession(_ s: URLSession, downloadTask: URLSessionDownloadTask,
+                        didFinishDownloadingTo location: URL) {
+            if let code = (downloadTask.response as? HTTPURLResponse)?.statusCode, code != 200 {
+                failure = "HTTP \(code)"; return
+            }
+            do {
+                try? FileManager.default.removeItem(at: part)
+                try FileManager.default.moveItem(at: location, to: part)
+            } catch { failure = "落盘失败：\(error.localizedDescription)" }
+        }
+
+        func urlSession(_ s: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            if let error {
+                // 网络中断（-1005 连接丢失 / -1001 超时 / -1009 断网…）带上系统原因与错误码
+                let ns = error as NSError
+                failure = "\(ns.localizedDescription)（\(ns.domain) \(ns.code)）"
+            }
+            done.signal()
+        }
+    }
+
+    /// 诊断落盘：下载失败的真实原因（系统错误码 / HTTP 码 / 校验结果）记一行，
+    /// 免得再出现「知道它跳过了、不知道为什么」这种只能猜的局面
+    static func note(_ message: String) {
+        let line = "[\(Date())] \(message)\n"
+        let path = "/tmp/mc-nvidia-fw.log"
+        if let handle = FileHandle(forWritingAtPath: path) {
+            handle.seekToEndOfFile()
+            handle.write(line.data(using: .utf8) ?? Data())
+            try? handle.close()
+        } else {
+            try? line.write(toFile: path, atomically: true, encoding: .utf8)
+        }
+    }
+
+    /// 550 MB 不进内存：交给系统的 shasum
+    static func sha256(of file: URL) -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/shasum")
+        p.arguments = ["-a", "256", file.path]
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return nil }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0 else { return nil }
+        return String(data: data, encoding: .utf8)?
+            .split(separator: " ").first.map { $0.lowercased() }
     }
 }
 
@@ -642,14 +975,45 @@ struct DriverInstaller {
             let payload = script.deletingLastPathComponent()
             try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
 
+            // 3.5) 首次安装要先拿到 GPU 固件（约 550 MB）。包内脚本自己 curl 是静默的，
+            //      所以由这里带进度下好、校验 SHA-256，再用 NULLMOTH_FW_RUN 交给 install.sh。
+            //      已装过（/Library/NullMoth/nvfw 四个文件都在）就什么都不做，脚本会复用。
+            var firmwareRun: String?
+            if let pins = DriverFirmware.pins(inOfflinePackage: payload) {
+                if DriverFirmware.isInstalled(pins) {
+                    emitLog("已装的 GPU 固件 \(pins.version) 可复用，跳过 550 MB 下载")
+                } else if DriverFirmware.packageCarriesFirmware(inOfflinePackage: payload) {
+                    // 这种包里 install.sh 会直接 ditto 自带固件，fw_fetch.sh 根本不会被调用
+                    emitLog("离线包自带 GPU 固件，安装脚本会直接使用，无需下载")
+                } else {
+                    switch DriverFirmware.localRun(pins, onPhase: emit) {
+                    case .success(let local):
+                        firmwareRun = local.path
+                        emitLog("GPU 固件包已就绪（\(pins.version)，SHA-256 已校验）")
+                    case .failure(let why):
+                        // 2026-11-23 用户定案：重试过还失败就停下来报错，不许悄悄丢给脚本那趟没进度的下载。
+                        // 此时安装脚本还没启动、系统一个字节都没改，重试一次不会有副作用。
+                        DriverFirmware.note("放弃：\(why)")
+                        emitLog("GPU 固件包下载失败：\(why)")
+                        emit(.failed("GPU 固件包下载失败：\(why)。系统未做任何改动，联网后重试即可（详情：/tmp/mc-nvidia-fw.log）"))
+                        return
+                    }
+                }
+            } else {
+                emitLog("没有读到包内 fw_fetch.sh 的固件来源，交给安装脚本自行下载（此段没有进度）")
+            }
+
             // 4) 写 runner：cd 进离线包目录后 exec install.command，输出全部进日志。
             //    用 exec 而不是后台 &：Do shell script 结束时会收掉同进程组子进程，
             //    所以安装必须在前台跑完。
             let logURL = URL(fileURLWithPath: logPath)
             let runner = work.appendingPathComponent("run-install.sh")
+            let fwLine = firmwareRun.map { "export NULLMOTH_FW_RUN=\(sh($0))" }
+                ?? "# 没有本地固件包：fw_fetch.sh 走自己的下载路径"
             let runnerBody = """
             #!/bin/bash
             export LOG=\(sh(logURL.path))
+            \(fwLine)
             cd \(sh(payload.path)) || {
               printf '   STOP: 无法进入安装目录\\n' > "$LOG"
               exit 2

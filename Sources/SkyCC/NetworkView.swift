@@ -17,11 +17,15 @@ import SwiftUI
 import AppKit
 
 struct NetworkView: View {
+    /// 安装进度放窗口级单例（2026-11-22 用户报 bug：切页后视图销毁，进度回到 .idle，
+    /// 看起来像下载断了，其实后台还在跑；回来只剩「安装」按钮）
+    @ObservedObject private var center = DriverInstallCenter.shared
     @State private var components: [String: NvidiaUpdate.Component] = [:]
     @State private var state: NetworkUpdateState = .unknown
     @State private var release: NetworkUpdate.NetworkRelease?
-    @State private var phase: DriverInstallPhase = .idle
-    @State private var log: String = ""
+
+    private var phase: DriverInstallPhase { center.network.phase }
+    private var log: String { center.network.log }
 
     var body: some View {
         ScrollView {
@@ -35,6 +39,10 @@ struct NetworkView: View {
         }
 
         .onAppear(perform: refresh)
+        // 装完在同一页收尾；如果当时人在别的页面，回来时 onAppear 会重新读盘，一样能对上
+        .onChange(of: phase) { _, new in
+            if case .succeeded = new { refresh() }
+        }
     }
 
     // MARK: - 数据
@@ -62,12 +70,11 @@ struct NetworkView: View {
     }
 
     private func runInstall(tag: String) {
-        log = ""
+        center.network = DriverInstallCenter.fresh(phase: .downloading(progress: 0))
         NetworkInstaller.install(tag: tag) { p in
-            phase = p
-            if case .succeeded = p { refresh() }
+            center.network.phase = p
         } onLog: { line in
-            log = line
+            center.network.log = line
         }
     }
 
@@ -80,6 +87,7 @@ struct NetworkView: View {
             return
         }
         state = .checking
+        center.network = DriverInstallCenter.fresh()   // 先占住「忙」，连点不会跑两份
         NetworkUpdate.fetchLatest { result in
             switch result {
             case .success(let rel):
@@ -87,6 +95,7 @@ struct NetworkView: View {
                 state = NetworkUpdate.stateFromCache()
                 runInstall(tag: rel.tag)
             case .failure(let error):
+                center.network.phase = .idle
                 state = .failed(installed: NetworkUpdate.installedTag ?? "未记录",
                                 message: error.localizedDescription)
             }
@@ -190,11 +199,14 @@ struct NetworkView: View {
                         Button {
                             beginInstall()
                         } label: {
+                            // 失败后就地变成「重试」（网卡包没有 550 MB 固件，走同一个 phase 而已）
                             Text(phase.isBusy
-                                 ? phase.label
-                                 : (state.hasUpdate
-                                    ? "下载并安装 \(state.latestVersion ?? "")"
-                                    : (state.latestVersion.map { "安装驱动 \($0)" } ?? "安装驱动")))
+                                 ? phase.shortLabel
+                                 : (phase.isFailed
+                                    ? "重试"
+                                    : (state.hasUpdate
+                                       ? "下载并安装 \(state.latestVersion ?? "")"
+                                       : (state.latestVersion.map { "安装驱动 \($0)" } ?? "安装驱动"))))
                         }
                         .buttonStyle(.borderedProminent)
                         .tint(Theme.amber)
@@ -239,8 +251,12 @@ struct NetworkView: View {
                                 .font(.system(size: 10.5))
                                 .foregroundStyle(isFailed(phase) ? Theme.red : Theme.dim)
                         }
-                        if case .downloading(let p) = phase {
+                        if let p = phase.progress {
                             ProgressView(value: p)
+                                .progressViewStyle(.linear)
+                                .tint(Theme.blue)
+                        } else if phase.isDownloading {
+                            ProgressView()
                                 .progressViewStyle(.linear)
                                 .tint(Theme.blue)
                         }

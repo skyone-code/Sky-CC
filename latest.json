@@ -1,15 +1,15 @@
 {
-  "tag": "3.2.5",
-  "version": "3.2.5",
-  "dmg_name": "Sky CC-3.2.5-LAPQC71x.dmg",
-  "dmg_url": "https://gitee.com/skyone021396/Sky-CC/releases/download/3.2.5/Sky%20CC-3.2.5-LAPQC71x.dmg",
-  "pkg_name": "Sky CC-3.2.5-LAPQC71x.pkg",
-  "pkg_url": "https://gitee.com/skyone021396/Sky-CC/releases/download/3.2.5/Sky%20CC-3.2.5-LAPQC71x.pkg",
-  "size": 8899720,
-  "sha256": "2c8a599269a874ce7bcb0120027a8ed78baf202c3366d0790129236266936501",
-  "published_at": "2026-11-18T20:00:00+08:00",
-  "notes": "3.2.2：快捷指令 / 命令行控制（mcutil 新增 13 条硬件控制命令，手机快捷指令可经 SSH 调用）；皮肤系统重构（预设配色改为色板自选任意颜色，玻璃效果改为真正独立开关，玻璃态染色跟随所选颜色）；修复键盘灯效卡展开后大片空白",
-  "pkg_size": 7011583,
-  "pkg_sha256": "46cc7f45d20455a642cc9f64d8de0879d88663a3d74b9aa134e3406c07e4ff65",
-  "date": "2026-11-22"
+  "tag": "3.2.6",
+  "version": "3.2.6",
+  "dmg_name": "Sky CC-3.2.6-LAPQC71x.dmg",
+  "dmg_url": "https://gitee.com/skyone021396/Sky-CC/releases/download/3.2.6/Sky%20CC-3.2.6-LAPQC71x.dmg",
+  "pkg_name": "Sky CC-3.2.6-LAPQC71x.pkg",
+  "pkg_url": "https://gitee.com/skyone021396/Sky-CC/releases/download/3.2.6/Sky%20CC-3.2.6-LAPQC71x.pkg",
+  "size": 8928224,
+  "sha256": "84fbff7c767ccefb2757cf517a8c650c858dc6208e24c8f6e44a3a014fcd8d5f",
+  "published_at": "2026-11-23T17:00:00+08:00",
+  "notes": "3.2.6：首次安装 N 卡驱动时 550 MB GPU 固件包改为 App 内带进度下载并逐字节校验（失败自动重试、失败即中断且系统零改动，原因落盘可查）；驱动安装进度切换页面不再丢失，侧边栏驱动行忙时显示转圈；登录项静默启动（开机自启拉起不弹主窗口）；最低系统要求升为 macOS 15",
+  "pkg_size": 7034612,
+  "pkg_sha256": "a763e9caa80940d00a890f12802e8e807dfcfa4ef677c6ae0980fee00f2a407d",
+  "date": "2026-11-23"
 }

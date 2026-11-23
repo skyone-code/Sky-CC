@@ -51,7 +51,7 @@ PROJ="$BUILD/app-resources"
 [ -d "$PROJ" ] || { echo "错误：找不到资源目录 $PROJ" >&2; exit 1; }
 
 # 版本号（唯一来源：脚本注入 Info.plist 与 helper 的 BuildVersion.swift）
-VERSION="3.2.5"
+VERSION="3.2.6"
 # 显示版本（侧边栏/设置页文案）：纯数字版本（2026-11-18 用户要求：全 app 去掉
 # 版本号里的机型后缀字样；PKGBASE 文件名里的 LAPQC71x 保留仅作分发区分）
 DISPLAY_VERSION="$VERSION"
@@ -170,9 +170,12 @@ done
 mkdir -p "$APP/Contents/MacOS" "$NATIVE/bin" "$NATIVE/scripts"
 
 echo "==> 2/8 编译 Swift（release，swiftc 直编）"
-# 显式锁定部署目标为 14.0：本机 SDK/构建工具链是 macOS 26，swiftc 默认会把
-# 二进制 minos 写成 26.0，导致在 macOS 15（及更低）上打开被拒（"当前版本不适用"）。
-# 代码仅用到 macOS 14 起的 onChange(of:initial:_:)，故最低可落到 14.0，15 自然可跑。
+# 显式锁定部署目标为 15.0（2026-11-23 用户拍板，从 14.0 上调）：本机 SDK/构建工具链是
+# macOS 26，swiftc 默认会把二进制 minos 写成 26.0，导致在 macOS 15（及更低）上打开被拒
+# （"当前版本不适用"）。上调的原因：登录项静默启动要用 `.defaultLaunchBehavior(.suppressed)`
+# （macOS 15+），而 SceneBuilder 连 if 都不支持（SDK 里只有 buildBlock/buildExpression，
+# 实测核实过），没法按系统分支套用——想要 Clash Plus 同款的「拉起不建窗」只能抬下限。
+# 代码里 `if #available(macOS 13/14/15…)` 的旧分支在 15+ 上全为真，不受影响。
 # 注意：Native/ 子目录要显式列（shell 的 * 不递归子目录）。
 # Swift 表达式类型检查器偶发超时（约束求解超过时间预算），会在无关文件上甩出
 # 虚假的「cannot find X in scope」导致整编失败；这与源码正确性无关，重试通常即可
@@ -192,7 +195,7 @@ if [[ -n "${MC_MODCACHE:-}" ]]; then
   mkdir -p "$MC_MODCACHE"
   MODCACHE_ARGS=(-module-cache-path "$MC_MODCACHE")
 fi
-SWIFTC_MAIN=(swiftc -O -parse-as-library -target x86_64-apple-macosx14.0 \
+SWIFTC_MAIN=(swiftc -O -parse-as-library -target x86_64-apple-macosx15.0 \
   ${MODCACHE_ARGS[@]+"${MODCACHE_ARGS[@]}"} \
   -o "$APP/Contents/MacOS/Sky CC" \
   "$SWIFT"/Sources/Shared/*.swift \
@@ -217,7 +220,7 @@ done
 echo "==> 3/8 编译 mcutil（硬件命令行助手，复用 Native 层）"
 # 不加 -parse-as-library：main.swift 需要顶层代码（否则
 # "expressions are not allowed at the top level"）。
-swiftc -O -target x86_64-apple-macosx14.0 ${MODCACHE_ARGS[@]+"${MODCACHE_ARGS[@]}"} \
+swiftc -O -target x86_64-apple-macosx15.0 ${MODCACHE_ARGS[@]+"${MODCACHE_ARGS[@]}"} \
   -o "$APP/Contents/MacOS/mcutil" \
   "$SWIFT"/Sources/Shared/*.swift \
   "$SWIFT"/Sources/mcutil/main.swift "$SWIFT"/Sources/SkyCC/Native/*.swift "$SWIFT"/Sources/SkyCC/FanCurve.swift
@@ -225,7 +228,7 @@ swiftc -O -target x86_64-apple-macosx14.0 ${MODCACHE_ARGS[@]+"${MODCACHE_ARGS[@]
 echo "==> 3.5/8 编译 SkyCCHelper（唯一持有 EC/SMC/HID 的后台进程）"
 # 与主程序同一套 Native 层源码，但自己带 main.swift：它是 launchd 拉起的
 # LaunchAgent，不是 app 的子进程，所以不能依赖 NSApplication。
-swiftc -O -target x86_64-apple-macosx14.0 ${MODCACHE_ARGS[@]+"${MODCACHE_ARGS[@]}"} \
+swiftc -O -target x86_64-apple-macosx15.0 ${MODCACHE_ARGS[@]+"${MODCACHE_ARGS[@]}"} \
   -o "$APP/Contents/MacOS/SkyCCHelper" \
   "$SWIFT"/Sources/Shared/*.swift \
   "$SWIFT"/Sources/SkyCCHelper/main.swift \
@@ -234,7 +237,7 @@ swiftc -O -target x86_64-apple-macosx14.0 ${MODCACHE_ARGS[@]+"${MODCACHE_ARGS[@]
 echo "==> 3.6/8 编译 gpu-router.dylib（GPU 路由：把 Metal 默认设备重定向到独显）"
 # 「控制 → 显卡」那个开关就是靠它。缺了它 /api/gpu 会报 dylibPresent=false，
 # 开关点不亮 —— 所以这里失败必须让整个构建失败，不能静默跳过。
-clang -dynamiclib -O2 -fobjc-arc -target x86_64-apple-macosx14.0 \
+clang -dynamiclib -O2 -fobjc-arc -target x86_64-apple-macosx15.0 \
   -framework Foundation -framework Metal \
   -o "$RES/gpu-router.dylib" "$SWIFT"/Sources/GPURouter/gpu-router.m
 codesign --force --sign - "$RES/gpu-router.dylib"
@@ -369,7 +372,7 @@ INSTAPP="$STAGE/Sky CC 安装器.app"
 INSTMACOS="$INSTAPP/Contents/MacOS"
 INSTRES="$INSTAPP/Contents/Resources"
 mkdir -p "$INSTMACOS" "$INSTRES"
-swiftc -O -parse-as-library -target x86_64-apple-macosx14.0 \
+swiftc -O -parse-as-library -target x86_64-apple-macosx15.0 \
   ${MODCACHE_ARGS[@]+"${MODCACHE_ARGS[@]}"} \
   -o "$INSTMACOS/Sky CC 安装器" \
   "$SWIFT/Sources/InstallerApp/InstallerApp.swift"

@@ -25,15 +25,19 @@ enum NvidiaBrandIcon {
 
 struct NvidiaView: View {
     @EnvironmentObject var store: MonitorStore
+    /// 安装进度放窗口级单例（2026-11-22 用户报 bug：切页后视图销毁，进度回到 .idle，
+    /// 看起来像下载断了，其实后台还在跑；回来只剩「安装」按钮）
+    @ObservedObject private var center = DriverInstallCenter.shared
     @State private var components: [NvidiaUpdate.Component] = []
     @State private var state: NvidiaUpdateState = NvidiaUpdate.stateFromCache()
     @State private var release: NvidiaRelease? = NvidiaUpdate.cachedRelease
-    @State private var installPhase: DriverInstallPhase = .idle
-    /// 安装/卸载过程中回显的最后一行日志
-    @State private var installLog: String = ""
     @State private var showUninstallConfirm = false
-    @State private var isUninstall = false   // 当前 installPhase 是卸载流程产生的（文案区分用）
-    @State private var uninstallDone = false // 卸载成功后置位，hero 卡切到「已卸载」展示
+
+    private var installPhase: DriverInstallPhase { center.nvidia.phase }
+    /// 安装/卸载过程中回显的最后一行日志
+    private var installLog: String { center.nvidia.log }
+    private var isUninstall: Bool { center.nvidia.isUninstall }   // 卸载流程产出的 phase（文案区分用）
+    private var uninstallDone: Bool { center.nvidia.uninstallDone } // 卸载成功后置位，hero 卡切到「已卸载」展示
 
     var body: some View {
         ScrollView {
@@ -48,6 +52,12 @@ struct NvidiaView: View {
         }
 
         .onAppear(perform: refresh)
+        // 装完在同一页收尾；如果当时人在别的页面，回来时 onAppear 会重新读盘，一样能对上
+        .onChange(of: installPhase) { _, new in
+            guard case .succeeded = new else { return }
+            components = NvidiaUpdate.components()
+            state = NvidiaUpdate.stateFromCache()      // 卸载干净时它自己会给 .notInstalled
+        }
         .confirmationDialog("确认卸载 NVIDIA 驱动？", isPresented: $showUninstallConfirm,
                             titleVisibility: .visible) {
             Button("卸载驱动（重启后生效）", role: .destructive) { runUninstall() }
@@ -160,11 +170,14 @@ struct NvidiaView: View {
                         Button {
                             beginInstall()
                         } label: {
+                            // 失败后就地变成「重试」：安装流程已经停住、系统一个字节都没改，点一下重来
                             Text(installPhase.isBusy && !isUninstall
-                                 ? installPhase.label
-                                 : (state.hasUpdate
-                                    ? "下载并安装 \(state.latestVersion ?? "")"
-                                    : (state.latestVersion.map { "安装驱动 \($0)" } ?? "安装驱动")))
+                                 ? installPhase.shortLabel
+                                 : (installPhase.isFailed && !isUninstall
+                                    ? "重试"
+                                    : (state.hasUpdate
+                                       ? "下载并安装 \(state.latestVersion ?? "")"
+                                       : (state.latestVersion.map { "安装驱动 \($0)" } ?? "安装驱动"))))
                         }
                         .buttonStyle(.borderedProminent)
                         .tint(Theme.amber)
@@ -214,11 +227,21 @@ struct NvidiaView: View {
                                 .font(.system(size: 10.5))
                                 .foregroundStyle(installPhase.isFailed ? Theme.red : Theme.dim)
                         }
-                        // 下载进度条（212 MB 的离线包，光看百分比不够）
-                        if case .downloading(let p) = installPhase {
+                        // 下载进度条（212 MB 离线包 / 首次安装 550 MB 固件包，光看百分比不够）
+                        if let p = installPhase.progress {
                             ProgressView(value: p)
                                 .progressViewStyle(.linear)
                                 .tint(Theme.blue)
+                        } else if installPhase.isDownloading {
+                            ProgressView()      // 服务器没给长度时用不确定进度的条
+                                .progressViewStyle(.linear)
+                                .tint(Theme.blue)
+                        }
+                        if case .downloadingFirmware = installPhase {
+                            Text("首次安装要从 NVIDIA 官方驱动包里取 GPU 固件（约 550 MB），下完逐个文件校验 SHA-256，只保留 4 个固件文件；已装过的固件会直接复用，不再下载。")
+                                .font(.system(size: 9.5))
+                                .foregroundStyle(Theme.dim2)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                         if !installLog.isEmpty {
                             Text(installLog)
@@ -380,6 +403,7 @@ struct NvidiaView: View {
         if let tag = release?.tag {
             runInstall(tag: tag)
         } else {
+            center.nvidia = DriverInstallCenter.fresh()   // 先占住「忙」，连点不会跑两份
             NvidiaUpdate.fetchLatest { result in
                 switch result {
                 case .success(let rel):
@@ -387,40 +411,31 @@ struct NvidiaView: View {
                     state = NvidiaUpdate.stateFromCache()
                     runInstall(tag: rel.tag)
                 case .failure(let error):
-                    installPhase = .failed("获取最新版本号失败：\(error.localizedDescription)")
+                    center.nvidia.phase = .failed("获取最新版本号失败：\(error.localizedDescription)")
                 }
             }
         }
     }
 
     private func runInstall(tag: String) {
-        installLog = ""
+        // 起始就是 0%，既让按钮立刻不可点，也如实反映「马上下离线包」
+        center.nvidia = DriverInstallCenter.fresh(phase: .downloading(progress: 0))
         DriverInstaller.install(tag: tag) { phase in
-            installPhase = phase
-            if case .succeeded = phase {
-                // 装完刷新一次状态，版本号立即更新
-                components = NvidiaUpdate.components()
-                state = NvidiaUpdate.stateFromCache()
-            }
+            center.nvidia.phase = phase
         } onLog: { line in
-            installLog = line
+            center.nvidia.log = line
         }
     }
 
     private func runUninstall() {
-        isUninstall = true
-        installLog = ""
-        uninstallDone = false
+        center.nvidia = DriverInstallCenter.fresh(phase: .authorizing, isUninstall: true)
         DriverInstaller.uninstall { phase in
-            installPhase = phase
+            center.nvidia.phase = phase
             if case .succeeded = phase {
-                uninstallDone = true
-                components = NvidiaUpdate.components()
-                state = NvidiaUpdate.installedVersion() == nil
-                    ? .notInstalled : NvidiaUpdate.stateFromCache()
+                center.nvidia.uninstallDone = true
             }
         } onLog: { line in
-            installLog = line
+            center.nvidia.log = line
         }
     }
 }

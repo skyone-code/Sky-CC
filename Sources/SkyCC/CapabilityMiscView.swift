@@ -296,6 +296,8 @@ private struct MenuBarIconStylePicker: View {
                         .font(.system(size: 10.5)).foregroundStyle(Theme.dim2)
                         .fixedSize(horizontal: false, vertical: true)
                         .cardNote()
+                    // 2026-11-23（用户定案）：静默启动恒定生效、不做设置项——
+                    // 登录项拉起不弹窗、显式打开照常亮窗，这里只留「开机自动启动」。
                 } else {
                     Text("开机自动启动需要 macOS 13 或更高版本。")
                         .font(.system(size: 11)).foregroundStyle(Theme.dim)
