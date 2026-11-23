@@ -1,15 +1,15 @@
 {
-  "tag": "3.2.6",
-  "version": "3.2.6",
-  "dmg_name": "Sky CC-3.2.6-LAPQC71x.dmg",
-  "dmg_url": "https://gitee.com/skyone021396/Sky-CC/releases/download/3.2.6/Sky%20CC-3.2.6-LAPQC71x.dmg",
-  "pkg_name": "Sky CC-3.2.6-LAPQC71x.pkg",
-  "pkg_url": "https://gitee.com/skyone021396/Sky-CC/releases/download/3.2.6/Sky%20CC-3.2.6-LAPQC71x.pkg",
-  "size": 8928224,
-  "sha256": "84fbff7c767ccefb2757cf517a8c650c858dc6208e24c8f6e44a3a014fcd8d5f",
-  "published_at": "2026-11-23T17:00:00+08:00",
-  "notes": "3.2.6：首次安装 N 卡驱动时 550 MB GPU 固件包改为 App 内带进度下载并逐字节校验（失败自动重试、失败即中断且系统零改动，原因落盘可查）；驱动安装进度切换页面不再丢失，侧边栏驱动行忙时显示转圈；登录项静默启动（开机自启拉起不弹主窗口）；最低系统要求升为 macOS 15",
-  "pkg_size": 7034612,
-  "pkg_sha256": "a763e9caa80940d00a890f12802e8e807dfcfa4ef677c6ae0980fee00f2a407d",
-  "date": "2026-11-23"
+  "tag": "3.2.7",
+  "version": "3.2.7",
+  "dmg_name": "Sky CC-3.2.7-LAPQC71x.dmg",
+  "dmg_url": "https://gitee.com/skyone021396/Sky-CC/releases/download/3.2.7/Sky%20CC-3.2.7-LAPQC71x.dmg",
+  "pkg_name": "Sky CC-3.2.7-LAPQC71x.pkg",
+  "pkg_url": "https://gitee.com/skyone021396/Sky-CC/releases/download/3.2.7/Sky%20CC-3.2.7-LAPQC71x.pkg",
+  "size": 8926882,
+  "sha256": "0435d9bf1a5d1773fa2bda462821ecba1da9d6d3fcb874d2e425794be5dcfdac",
+  "published_at": "2026-11-24T01:00:00+08:00",
+  "notes": "3.2.7：显卡路由修复——Metal 设备枚举加缓存，修复个别应用（如 QQLive）崩溃与整屏短暂冻结；跳过系统后台进程，只有用户应用走独显，减少后台孵化卡顿。建议开启显卡路由的用户升级",
+  "pkg_size": 7035355,
+  "pkg_sha256": "dca8faa99fb8bf358d8ac0378eb51b18b3c421b0b3c45e0ebc73cbf61644f927",
+  "date": "2026-11-24"
 }
