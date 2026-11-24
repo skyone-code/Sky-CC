@@ -4,6 +4,23 @@ Sky CC 的版本变更、升级注意事项与产物校验值。发布渠道：<
 
 ---
 
+## 3.2.8 — 2026-11-24
+
+### 变更
+
+- **显卡路由改为白名单模式**（用户拍板，本版主改动）：
+  - 开关语义变更：「默认使用独显」→「启用显卡路由」，只管注入总闸。关闭 = 完全不注入（`launchctl unsetenv`，真零状态）；开启后也只有白名单里的 app 默认拿独显，其余一律跟随系统（核显）。原「使用核显的 App」例外名单废弃，改为「使用独显的 App」白名单；旧策略文件（`mode=dgpu` + `exclude`）读到即废弃，**升级后所有 app 回到系统默认，需重新把常用 app 加入白名单**
+  - 动机：全局模式下 /Applications 里每个 app 都被注入、都要付约 390 ms 的 Mesa 带起，而真正需要独显的就那几个；白名单把注入的兼容面收敛到用户主动选择的范围（QQLive 类崩溃今后只会发生在名单内）。Windows NVIDIA 面板的 per-app 模型本就是如此
+  - `gpu-router.dylib` 策略格式改为 `{"mode":"whitelist","include":[…]}`；3.2.7 的「跳过非应用包进程」路径过滤随之退役（白名单已覆盖其职责），`OPTIMUS_ALLOW_ANY_PATH` 排查变量一并移除；`OPTIMUS_LAUNCH=0` 仍可单次禁用
+  - 开关保留的理由：「关闭」的唯一真实现就是 unsetenv——白名单为空时 dylib 仍会被加载进每个进程，排障时需要一键回到完全干净的状态
+
+### 修复
+
+- **开机加载器路径错误（真功能 bug）**：开机守护的加载器（`Sky CC散热扩展`，`Tools/mckextload.c`）里硬编码的还是旧 kext 路径 `/Library/Extensions/TongfangFan.kext`——而安装脚本装的是 `SkyCCEC.kext` 且会删掉旧件，导致**开机自动加载 kext 从未生效过**（实机 macOS 15 支持热加载所以未暴露；macOS 26 起第三方 kext 必须重启后由守护加载，该路径必踩）。已指向 `SkyCCEC.kext`
+- **界面提示全面更名**：kext 门控提示（「需要 TongfangFan.kext 才能调整」等 3 处）、Win 键锁定 / 海岸灯 / 风扇卡标题、API 错误返回串、安装中提示等残留的旧 kext 名统一改为 `SkyCCEC.kext`（3.1.0 更名时的漏网之鱼）；`NativeFan.swift` 里指向已不存在的 `com.skycc.TongfangFan` 的死常量同步修正为现役 `com.skycc.EC`
+
+---
+
 ## 3.2.7 — 2026-11-24
 
 ### 修复

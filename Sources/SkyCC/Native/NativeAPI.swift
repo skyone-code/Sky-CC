@@ -221,13 +221,13 @@ enum NativeAPI {
             && (action == "volume_get")
         if !readOnlyAction { invalidateFanCache() }
         switch path {
-        // GPU 路由：mode = "dgpu" 开 / "off" 关；exclude 增删 per-app 例外。
-        // 只改 launchd 环境变量与策略文件，不碰 kext，也不需要 root。
+        // GPU 路由：mode = "dgpu" 开（注入 + 白名单模式）/ "off" 关（完全不注入）；
+        // include 增删独显白名单。只改 launchd 环境变量与策略文件，不碰 kext，也不需要 root。
         case "/api/gpu/mode":             return NativeGPU.setMode(params["mode"] as? String ?? "")
-        case "/api/gpu/exclude":
+        case "/api/gpu/include":
             let on = (params["on"] as? NSNumber)?.boolValue
                 ?? (params["on"] as? Bool) ?? false
-            return NativeGPU.setExclude(params["bundle"] as? String ?? "", on: on)
+            return NativeGPU.setInclude(params["bundle"] as? String ?? "", on: on)
         case "/api/control":              return doControl(params["action"] as? String ?? "", params)
         case "/api/fan":                  return doFan(params)
         case "/api/lightbar":             return doLightbar(params)
@@ -244,7 +244,7 @@ enum NativeAPI {
         case "/api/ec/read":
             // 2.8.8：实验性页的 EC 寄存器探针（**只读**，不提供写入）
             guard FanControl.kextLoaded() else {
-                return ["ok": false, "error": "TongfangFan.kext 未加载"]
+                return ["ok": false, "error": "SkyCCEC.kext 未加载"]
             }
             // JSON 传过来可能是 Int 也可能是 Double（XPC 桥接），两种都收
             let rawAddr: Int? = (params["addr"] as? Int) ?? (params["addr"] as? Double).map { Int($0) }
@@ -886,7 +886,7 @@ enum NativeAPI {
                 "temp_gpu": TempSources.gpuCelsius(),
                 "temp_gpu_edge": TempSources.gpuEdgeCelsius(),
             ]
-            out["hint"] = ("TongfangFan.kext 未加载 —— 到「控制」或「实验性」页点「立即安装」"
+            out["hint"] = ("SkyCCEC.kext 未加载 —— 到「控制」或「实验性」页点「立即安装」"
                 + "（kext 已内嵌在 app 里，只需输入一次管理员密码）")
         }
         return out
@@ -894,7 +894,7 @@ enum NativeAPI {
 
     static func doFan(_ params: [String: Any]) -> [String: Any] {
         guard FanControl.kextLoaded() else {
-            return ["ok": false, "error": "TongfangFan.kext 未加载",
+            return ["ok": false, "error": "SkyCCEC.kext 未加载",
                     "hint": "到「控制」或「实验性」页点「立即安装」（kext 内嵌在 app 里）后重试"]
         }
         let fc = FanControl.shared
@@ -1132,7 +1132,7 @@ enum NativeAPI {
     static func lightbarState() -> [String: Any] {
         guard FanControl.kextLoaded() else {
             return ["available": false, "reason": "kext",
-                    "note": "TongfangFan.kext 未加载，EC 不可达"]
+                    "note": "SkyCCEC.kext 未加载，EC 不可达"]
         }
         if let st = FanControl.shared.lightbarStatus() {
             var out = st
@@ -1154,7 +1154,7 @@ enum NativeAPI {
 
     static func doLightbar(_ params: [String: Any]) -> [String: Any] {
         guard FanControl.kextLoaded() else {
-            return ["ok": false, "error": "TongfangFan.kext 未加载"]
+            return ["ok": false, "error": "SkyCCEC.kext 未加载"]
         }
         // 2.7.6：hex 变成可选。切「轮换 / 关闭」时不再把颜色写成 000000，
         // 这样用户上次挑的固定色会被保留，来回切不会丢。

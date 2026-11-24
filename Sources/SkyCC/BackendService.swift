@@ -240,7 +240,7 @@ final class BackendService: ObservableObject {
     }
 
     /// 一键安装：调用 app bundle 内的 install-kext.sh（kext 本体也内嵌在
-    /// Contents/Resources/native/TongfangFan.kext，DMG 不再单独放 kext）。
+    /// Contents/Resources/native/SkyCCEC.kext，DMG 不再单独放 kext）。
     /// 需要管理员权限，脚本由 osascript 提权运行，用户会看到系统密码框。
     @discardableResult
     func installKextIfNeeded() async -> Bool {

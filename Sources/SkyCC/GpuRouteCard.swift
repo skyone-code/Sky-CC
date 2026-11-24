@@ -1,16 +1,18 @@
 import SwiftUI
 
-/// 显卡路由段：「默认使用独显 / 跟随系统」+ per-app 例外名单。
+/// 显卡路由段：「启用显卡路由」总开关 + 独显白名单。
 ///
 /// 2026-11-05 引入，当时是「控制」页右列最下方的一张独立卡；2026-11-07（用户要求）
 /// 搬进「设置」页的「外观与通用」卡里；2026-11-14 并入「设置 → 系统调整」卡尾部。
 /// **2026-11-17（用户要求）：从设置页拆回「设备控制」页，独立成卡放在「散热模式」上方**
 /// —— 它调的是实时生效的 GPU 注入行为，与设置页那批「设一次就不动」的持久项不同类。
+/// **2026-11-24（用户拍板）白名单化**：开关只管注入总闸；只有名单里的 app 默认拿独显，
+/// 其余跟随系统。原「使用核显的 App」例外名单废弃（旧 exclude 字段不再读取）。
 ///
 /// 这里只提供**段落**（不带 Card 外壳），由 ControlView 用 `Card(title:)` 包起来，
-/// 卡片标题即原来的分组标题「显卡 · 默认使用哪块 GPU」。
+/// 卡片标题即「显卡 · 独显白名单」。
 /// 真正干活的是注入进目标进程的 gpu-router.dylib，这段只控制「注不注入」+
-/// per-app 例外名单。自带 @State：进页面读一次当前状态（`/api/gpu`），不轮询。
+/// 独显白名单。自带 @State：进页面读一次当前状态（`/api/gpu`），不轮询。
 struct GpuRouteSection: View {
     @EnvironmentObject var backend: BackendService
     @Environment(\.hideCardSubs) private var hideCardSubs
@@ -19,8 +21,8 @@ struct GpuRouteSection: View {
     @State private var gpuInfo: [String: Any] = [:]
     @State private var gpuBusy = false
     @State private var gpuMsg: String?
-    /// 名单里当前选中的 bundle id（− 按钮的作用对象；刷新后如果没了自动清空）
-    @State private var selectedExclude: String?
+    /// 白名单里当前选中的 bundle id（− 按钮的作用对象；刷新后如果没了自动清空）
+    @State private var selectedInclude: String?
 
     // 2026-11-14（首帧记忆）：构造时同步读镜像，首帧即上次选择；
     // /api/gpu 异步回读对不上时再校正。
@@ -28,15 +30,19 @@ struct GpuRouteSection: View {
         _gpuOn = State(initialValue: UIControlPrefs.bool(UIControlPrefs.K.gpuRoute) ?? false)
     }
 
-    private var gpuExcludes: [String] { (gpuInfo["exclude"] as? [String]) ?? [] }
+    private var gpuIncludes: [String] { (gpuInfo["include"] as? [String]) ?? [] }
 
     private var gpuStatusText: String {
         if gpuInfo["dylibPresent"] as? Bool == false {
             return "缺少 gpu-router.dylib —— 重装或重新构建 app 后再试"
         }
         if gpuBusy { return "正在应用…" }
-        if gpuOn { return "已开启：之后启动的 app 默认拿到独显" }
-        return "已关闭：跟随系统（内屏挂在核显上，默认核显）"
+        if gpuOn {
+            return gpuIncludes.isEmpty
+                ? "已开启：白名单为空，暂时没有 app 被接管"
+                : "已开启：白名单里的 \(gpuIncludes.count) 个 app 默认拿独显，其余跟随系统"
+        }
+        return "已关闭：完全不注入，所有 app 跟随系统（默认核显）"
     }
 
     var body: some View {
@@ -45,10 +51,10 @@ struct GpuRouteSection: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top, spacing: 8) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("默认使用独显").font(.system(size: 12.5, weight: .medium))
+                    Text("启用显卡路由").font(.system(size: 12.5, weight: .medium))
                         .foregroundStyle(Theme.txt)
                     if !hideCardSubs {
-                        Text("等价于 Windows「首选图形处理器 = 高性能 NVIDIA」。开启后新启动的 app 拿到的默认 Metal 设备是 RTX 2070S；画面仍由核显呈现（内屏物理接在核显上，这是 Optimus 的本义）。")
+                        Text("注入机制的总闸：开启后新启动的进程会载入路由组件，但只有下面白名单里的 app 才默认拿到独显（RTX 2070S），名单外的 app 一律跟随系统（内屏挂在核显上）。关闭则完全不注入。")
                             .font(.system(size: 10.5))
                             .foregroundStyle(Theme.dim2)
                             .fixedSize(horizontal: false, vertical: true)
@@ -89,14 +95,15 @@ struct GpuRouteSection: View {
             }
 
             // 2026-11-15（用户要求）：名单改成「带框列表 + 加号/减号」——
-            //   · +：菜单（当前最前面的 App / 其他 App…文件选择器），把 app 加入核显名单；
+            //   · +：菜单（当前最前面的 App / 其他 App…文件选择器），把 app 加入独显白名单；
             //   · −：移除列表里选中的 app（未选中时置灰）；
             //   · 行可点选，选中蓝底高亮；替代原来的 per-row「移除」链接和最前面 App 胶囊按钮。
+            // 2026-11-24：名单语义从「核显例外」反转为「独显白名单」。
             HStack(spacing: 6) {
-                Text("使用核显的 App")
+                Text("使用独显的 App")
                     .font(.system(size: 11.5, weight: .medium))
                     .foregroundStyle(Theme.txt)
-                Text("（这些 app 不吃「默认独显」，强制走核显）")
+                Text("（白名单 · 只有这些 app 被路由到独显，其余按系统默认走核显）")
                     .font(.system(size: 10))
                     .foregroundStyle(Theme.dim2)
                 Spacer(minLength: 4)
@@ -105,21 +112,21 @@ struct GpuRouteSection: View {
 
             // 名单框：panel2 底 + 描边，与核心温度块同款容器
             VStack(alignment: .leading, spacing: 0) {
-                if gpuExcludes.isEmpty {
+                if gpuIncludes.isEmpty {
                     Text("还没有添加 · 点右上角 + 把 app 加进来")
                         .font(.system(size: 11))
                         .foregroundStyle(Theme.dim2)
                         .frame(maxWidth: .infinity, alignment: .center)
                         .padding(.vertical, 12)
                 } else {
-                    ForEach(gpuExcludes, id: \.self) { id in
+                    ForEach(gpuIncludes, id: \.self) { id in
                         HStack(spacing: 8) {
                             Image(systemName: "app.dashed")
                                 .font(.system(size: 10))
                                 .foregroundStyle(Theme.dim2)
                             Text(id)
                                 .font(.system(size: 11, design: .monospaced))
-                                .foregroundStyle(id == selectedExclude ? Theme.txt : Theme.dim)
+                                .foregroundStyle(id == selectedInclude ? Theme.txt : Theme.dim)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
                             Spacer(minLength: 4)
@@ -127,13 +134,13 @@ struct GpuRouteSection: View {
                         .padding(.horizontal, 8)
                         .padding(.vertical, 5)
                         .background {
-                            if id == selectedExclude {
+                            if id == selectedInclude {
                                 RoundedRectangle(cornerRadius: 6, style: .continuous)
                                     .fill(Theme.blue.opacity(0.16))
                             }
                         }
                         .contentShape(Rectangle())
-                        .onTapGesture { selectedExclude = id }
+                        .onTapGesture { selectedInclude = id }
                     }
                 }
             }
@@ -152,8 +159,8 @@ struct GpuRouteSection: View {
             // 真值同步写回镜像：下次进页首帧就是它
             UIControlPrefs.set(UIControlPrefs.K.gpuRoute, gpuOn)
             // 选中的 app 若已被移除，清掉选中态
-            if let s = selectedExclude, !gpuExcludes.contains(s) {
-                selectedExclude = nil
+            if let s = selectedInclude, !gpuIncludes.contains(s) {
+                selectedInclude = nil
             }
         }
     }
@@ -171,11 +178,11 @@ struct GpuRouteSection: View {
         }
     }
 
-    private func setGpuExclude(_ id: String, on: Bool) {
+    private func setGpuInclude(_ id: String, on: Bool) {
         Task {
-            let r = await backend.post("/api/gpu/exclude", ["bundle": id, "on": on])
+            let r = await backend.post("/api/gpu/include", ["bundle": id, "on": on])
             gpuMsg = (r["ok"] as? Bool == true) ? nil : (r["error"] as? String)
-            if on, r["ok"] as? Bool == true { selectedExclude = id }
+            if on, r["ok"] as? Bool == true { selectedInclude = id }
             await refreshGpu()
         }
     }
@@ -188,12 +195,12 @@ struct GpuRouteSection: View {
             // +：菜单——最常用的是把当前最前面的 App 加进来，也支持从 /Applications 挑
             Menu {
                 if let front = gpuInfo["frontApp"] as? String, !front.isEmpty,
-                   !gpuExcludes.contains(front) {
+                   !gpuIncludes.contains(front) {
                     Button {
                         if front.hasPrefix("com.apple.") {
                             gpuMsg = "系统 App（\(front)）会拒绝注入，加了也不生效，不添加"
                         } else {
-                            setGpuExclude(front, on: true)
+                            setGpuInclude(front, on: true)
                         }
                     } label: {
                         Label("当前最前面的 App（\(front)）", systemImage: "rectangle.inset.filled")
@@ -218,16 +225,16 @@ struct GpuRouteSection: View {
             .menuIndicator(.hidden)
             .fixedSize()
             .disabled(gpuInfo["dylibPresent"] as? Bool == false)
-            .help("添加使用核显的 App")
+            .help("添加使用独显的 App")
 
             // −：移除选中的 app
             Button {
-                guard let s = selectedExclude else { return }
-                setGpuExclude(s, on: false)
+                guard let s = selectedInclude else { return }
+                setGpuInclude(s, on: false)
             } label: {
                 Image(systemName: "minus")
                     .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(selectedExclude == nil ? Theme.dim2 : Theme.red)
+                    .foregroundStyle(selectedInclude == nil ? Theme.dim2 : Theme.red)
                     .frame(width: 22, height: 20)
                     .background(Theme.panel2,
                                 in: RoundedRectangle(cornerRadius: 6, style: .continuous))
@@ -235,16 +242,16 @@ struct GpuRouteSection: View {
                         .strokeBorder(Theme.line, lineWidth: 0.8))
             }
             .buttonStyle(.plain)
-            .disabled(selectedExclude == nil)
+            .disabled(selectedInclude == nil)
             .help("移除选中的 App")
         }
     }
 
-    /// 文件选择器挑 app：读选中 .app 的 CFBundleIdentifier 加进名单
+    /// 文件选择器挑 app：读选中 .app 的 CFBundleIdentifier 加入白名单
     private func pickAppToAdd() {
         let panel = NSOpenPanel()
-        panel.title = "选择使用核显的 App"
-        panel.message = "选择一个 .app，会把它的 Bundle ID 加入核显名单（对之后启动的 app 生效）"
+        panel.title = "选择使用独显的 App"
+        panel.message = "选择一个 .app，会把它的 Bundle ID 加入独显白名单（对之后启动的 app 生效）"
         panel.directoryURL = URL(fileURLWithPath: "/Applications")
         panel.allowedContentTypes = [.application]
         panel.canChooseDirectories = false
@@ -256,14 +263,14 @@ struct GpuRouteSection: View {
             gpuMsg = "读不到 \(url.lastPathComponent) 的 Bundle ID，未添加"
             return
         }
-        if gpuExcludes.contains(id) {
-            gpuMsg = "\(id) 已经在名单里"
+        if gpuIncludes.contains(id) {
+            gpuMsg = "\(id) 已经在白名单里"
             return
         }
         if id.hasPrefix("com.apple.") {
             gpuMsg = "系统 App（\(id)）会拒绝注入，加了也不生效，不添加"
             return
         }
-        setGpuExclude(id, on: true)
+        setGpuInclude(id, on: true)
     }
 }

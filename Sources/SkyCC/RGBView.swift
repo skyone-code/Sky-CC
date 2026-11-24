@@ -910,7 +910,7 @@ struct RGBView: View {
             // 2.8.12：kext 真没装才整块置灰；「EC 本次读失败」只提示，控件照旧能点
             // （写路径与读路径是分开的，读失败往往只是邮箱被采样器占着）。
             if lightbarReason == "kext" {
-                KextRequiredHint(text: "海岸灯要读写 EC，需要 TongfangFan.kext")
+                KextRequiredHint(text: "海岸灯要读写 EC，需要 SkyCCEC.kext")
             } else if lightbarReason == "read" {
                 HStack(spacing: 6) {
                     Image(systemName: "exclamationmark.circle").font(.system(size: 10.5))

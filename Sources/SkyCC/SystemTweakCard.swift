@@ -128,7 +128,7 @@ struct SystemTweakSection: View {
 
     var body: some View {
         Card(title: "系统调整 · 原厂 FastSwitch 页") {
-            if !kextOK { KextRequiredHint(text: "Win 键锁定要 TongfangFan.kext") }
+            if !kextOK { KextRequiredHint(text: "Win 键锁定要 SkyCCEC.kext") }
             VStack(alignment: .leading, spacing: 11) {
                 // 2026-11-16（用户要求）：挂载 EFI 放本卡第一位（显示屏上面）——
                 // 1401 方案定位本机 OpenCore 所在的 EFI 分区并挂载。

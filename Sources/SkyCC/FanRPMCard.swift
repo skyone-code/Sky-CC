@@ -14,7 +14,7 @@ struct FanRPMCard: View {
 
     var body: some View {
         let avail = BackendService.bool(store.fan, "available") ?? false
-        return Card(title: "风扇 · TongfangFan",
+        return Card(title: "风扇 · SkyCCEC",
                     trailing: { Chip(text: fanModeText, color: Theme.blue) }) {
             if !avail {
                 HStack(spacing: 8) {

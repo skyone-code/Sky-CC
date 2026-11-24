@@ -13,12 +13,12 @@
  * 之后启动的 app 全部继承；不需要注入的进程由下面的策略表挡掉。
  *
  * 策略写在 ~/Library/Application Support/SkyCC/gpu-policy.json：
- *   {"mode": "dgpu" | "igpu" | "auto", "exclude": ["com.foo.bar", ...]}
+ *   {"mode": "whitelist", "include": ["com.foo.bar", ...]}
  *
- *   mode=dgpu  → 默认给独显（Windows「高性能」）
- *   mode=igpu  → 一律给核显（Windows「节能」）
- *   mode=auto  → 不干预，返回 Apple 的答案
- *   exclude    → 名单里的 bundle id 一律走核显（per-app 例外）
+ *   mode=whitelist → 白名单模式：include 里的 bundle id 走独显，
+ *                    其余一律保持 Apple 的答案（2026-11-24 起唯一模式；
+ *                    旧的全局 dgpu / exclude 字段废弃，读到旧文件一律不接管，
+ *                    等 app 下次写策略时自然覆盖成新格式）
  *
  * 安全：com.apple.* 一律不接管。系统进程本来就带 library validation、注入也加载不进来，
  * 但有些 com.apple.* 的工具进程没有，所以这一条是显式保护，不靠运气。
@@ -36,7 +36,7 @@ static os_log_t lg;
 /* 策略在构造函数里读一次就固定：app 跑起来之后改设置，下一次启动才生效。
    每次 dispatch 都去读盘会让「一次 launch 一次 syscall」变成热路径开销，
    而这个值在进程生命周期里不该变。 */
-static int g_mode = 1;            /* 1 = dgpu, 0 = igpu/auto */
+static int g_mode = 0;            /* 1 = 本进程被白名单命中，接管独显；0 = 不干预 */
 static int g_have_policy;
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 
@@ -48,26 +48,6 @@ static NSString *policyPath(void) {
             stringByAppendingPathComponent:@"gpu-policy.json"];
 }
 
-/* 返回 YES 表示「这个进程不该被接管」 */
-static BOOL isExcluded(NSString *bundleID) {
-    if (bundleID.length == 0) return NO;
-    if ([bundleID hasPrefix:@"com.apple."]) return YES;      /* 系统进程，永不动 */
-    if ([bundleID isEqualToString:@"com.skycc.console"]) return YES;
-
-    NSString *p = policyPath();
-    if (!p) return NO;
-    NSData *d = [NSData dataWithContentsOfFile:p];
-    if (!d) return NO;
-    NSDictionary *j = [NSJSONSerialization JSONObjectWithData:d options:0 error:NULL];
-    if (![j isKindOfClass:[NSDictionary class]]) return NO;
-    NSArray *ex = j[@"exclude"];
-    if ([ex isKindOfClass:[NSArray class]]) {
-        for (id v in ex)
-            if ([v isKindOfClass:[NSString class]] && [v isEqualToString:bundleID]) return YES;
-    }
-    return NO;
-}
-
 static void loadPolicy(void) {
     NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
 
@@ -76,36 +56,36 @@ static void loadPolicy(void) {
     const char *off = getenv("OPTIMUS_LAUNCH");
     if (off && strcmp(off, "0") == 0) { g_mode = 0; g_have_policy = 1; return; }
 
-    if (isExcluded(bundleID)) { g_mode = 0; g_have_policy = 1; return; }
-
-    /* 后台进程过滤：被路由的每个进程首次摸 Metal 都要付 ~390ms 的 Mesa 带起
-       （dlopen libvulkan_nouveau，实测 287-407ms，静态初始化器主导）。LaunchAgents、
-       XPC 服务、各种系统辅助进程也走独显的话，系统每次孵化它们整屏就顿一下，
-       而它们根本不做需要独显的工作。用户应用住在 /Applications（或 ~/Applications）
-       下的 .app 包里（Electron 的 Helper.app 也算）；其余一律保持 Apple 默认（核显）。
-       OPTIMUS_ALLOW_ANY_PATH=1 可关掉这个过滤。 */
-    if (!getenv("OPTIMUS_ALLOW_ANY_PATH")) {
-        NSString *bp = [[NSBundle mainBundle] bundlePath];
-        BOOL userApp = ([bp hasPrefix:@"/Applications/"] ||
-                        [bp hasPrefix:[NSHomeDirectory() stringByAppendingPathComponent:@"Applications/"]]) &&
-                       [bp hasSuffix:@".app"];
-        if (!userApp) { g_mode = 0; g_have_policy = 1; return; }
+    /* 结构性保护：系统进程与自身永不接管（白名单也救不回来）。 */
+    if (bundleID.length == 0 ||
+        [bundleID hasPrefix:@"com.apple."] ||
+        [bundleID isEqualToString:@"com.skycc.console"]) {
+        g_mode = 0; g_have_policy = 1; return;
     }
 
-    g_mode = 1;                       /* 文件读不到时的默认：结构上「注入了就是要独显」 */
-    NSString *p = policyPath();
-    if (!p) { g_have_policy = 1; return; }
-    NSData *d = [NSData dataWithContentsOfFile:p];
-    if (!d) { g_have_policy = 1; return; }
-    NSDictionary *j = [NSJSONSerialization JSONObjectWithData:d options:0 error:NULL];
-    if ([j isKindOfClass:[NSDictionary class]]) {
-        NSString *m = j[@"mode"];
-        if ([m isKindOfClass:[NSString class]]) {
-            if ([m isEqualToString:@"igpu"] || [m isEqualToString:@"auto"]) g_mode = 0;
-            else if ([m isEqualToString:@"dgpu"]) g_mode = 1;
-        }
-    }
+    /* 白名单模式（2026-11-24 起）：只有 include 里的 bundle id 才接管。
+       默认 0：文件缺失 / 格式不对 / 旧版字段（dgpu·exclude 时代）→ 一律不干预，
+       行为等同未注入；app 侧写回新格式后按名单放行。 */
+    g_mode = 0;
     g_have_policy = 1;
+
+    NSString *p = policyPath();
+    if (!p) return;
+    NSData *d = [NSData dataWithContentsOfFile:p];
+    if (!d) return;
+    NSDictionary *j = [NSJSONSerialization JSONObjectWithData:d options:0 error:NULL];
+    if (![j isKindOfClass:[NSDictionary class]]) return;
+
+    NSString *m = j[@"mode"];
+    if (![m isKindOfClass:[NSString class]] || ![m isEqualToString:@"whitelist"]) return;
+
+    NSArray *inc = j[@"include"];
+    if (![inc isKindOfClass:[NSArray class]]) return;
+    for (id v in inc)
+        if ([v isKindOfClass:[NSString class]] && [v isEqualToString:bundleID]) {
+            g_mode = 1;
+            return;
+        }
 }
 
 /* 设备列表缓存：进程的 Metal 设备来自 IOAccelDevice 注册，一旦注册齐全就不再变化。

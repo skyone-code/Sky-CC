@@ -1,5 +1,5 @@
 // ============================================================================
-// mckextload —— 开机把 TongfangFan.kext 装进内核
+// mckextload —— 开机把 SkyCCEC.kext 装进内核
 //
 // 背景（2.8.15）：
 //   早期 install-kext.sh 写的 LaunchDaemon 直接把 ProgramArguments 指到
@@ -27,7 +27,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define KEXT_PATH "/Library/Extensions/TongfangFan.kext"
+#define KEXT_PATH "/Library/Extensions/SkyCCEC.kext"
 #define LOG_PATH "/tmp/skycc-fankext.log"
 
 static FILE *g_log = NULL;
@@ -91,7 +91,7 @@ int main(int argc, char *argv[]) {
         logline("waitpid 失败：%s", strerror(errno));
     } else if (WIFEXITED(status)) {
         logline("kmutil load 退出码 %d", WEXITSTATUS(status));
-        if (WEXITSTATUS(status) == 0) logline("TongfangFan.kext 加载完成");
+        if (WEXITSTATUS(status) == 0) logline("SkyCCEC.kext 加载完成");
     } else if (WIFSIGNALED(status)) {
         logline("kmutil load 被信号 %d 终止", WTERMSIG(status));
     }

@@ -225,7 +225,7 @@ enum EC {
 // 两者对外 ABI 完全一致（IOConnectCallStructMethod selector 0，12 进 8 出），
 // 所以切换不需要改任何调用点。
 private let serviceClasses = ["SkyCCECDriver", "TongfangFanDriver"]
-private let kextID = "com.skycc.TongfangFan"
+private let kextID = "com.skycc.EC"
 
 // MARK: - 客户端
 
@@ -418,7 +418,7 @@ final class FanControl {
 
     /// 作废当前 user client 连接，下一次调用自动重开（2.8.12）。
     ///
-    /// 用途：kext 被重新加载（kmutil load / 重装 TongfangFan.kext）或睡眠唤醒后，
+    /// 用途：kext 被重新加载（kmutil load / 重装 SkyCCEC.kext）或睡眠唤醒后，
     /// 旧连接上的 IOConnectCallStructMethod 不会报错，而是**读到全 0**——
     /// 实测表现就是「写 0x7AB 不落地、回读 back=0x00」，界面报「调不了散热模式」。
     /// 重开一次连接即恢复，不需要重启 app/helper。

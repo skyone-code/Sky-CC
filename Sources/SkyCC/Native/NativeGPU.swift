@@ -5,6 +5,11 @@
 //  需求来源（用户原话）：「让 app 能跑在独显上，优先独显或者核显给一个开关就可以
 //  （变相的独显直连）」。
 //
+//  2026-11-24（用户拍板）白名单化：开关只管「注不注入」，策略只有
+//  mode=whitelist + include 名单 —— 名单内的 app 默认拿独显，其余一律跟随系统。
+//  动机：全局模式下 /Applications 里每个 app 都被注入且都付 ~390ms Mesa 带起，
+//  而真正需要独显的就那几个；白名单把注入的崩溃/兼容面收敛到用户主动选择的范围。
+//
 //  为什么不是改驱动：默认 Metal 设备由 SkyLight/WindowServer 按「显示拥有者」决定，
 //  内屏挂在 Intel 上，客户端没有 API 能改。唯一可行的用户态入口是 dyld interpose，
 //  所以这里控制的是「往之后启动的进程里注入 gpu-router.dylib」+ 一份策略文件。
@@ -120,10 +125,12 @@ enum NativeGPU {
     static func readPolicy() -> [String: Any] {
         guard let d = try? Data(contentsOf: policyURL),
               let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any]
-        else { return ["mode": "dgpu", "exclude": [String]()] }
+        else { return ["mode": "whitelist", "include": [String]()] }
         var out = j
-        if out["mode"] as? String == nil { out["mode"] = "dgpu" }
-        if out["exclude"] as? [String] == nil { out["exclude"] = [String]() }
+        // 2026-11-24 白名单化：旧版字段（mode=dgpu/igpu + exclude）一律废弃，
+        // 读到就归一化成新格式（include 空 = 全部跟随系统），等 UI 下次写盘自然覆盖
+        if (out["mode"] as? String) != "whitelist" { out["mode"] = "whitelist" }
+        if out["include"] as? [String] == nil { out["include"] = [String]() }
         return out
     }
 
@@ -141,8 +148,8 @@ enum NativeGPU {
         }
     }
 
-    static func excludeList() -> [String] {
-        (readPolicy()["exclude"] as? [String]) ?? []
+    static func includeList() -> [String] {
+        (readPolicy()["include"] as? [String]) ?? []
     }
 
     // MARK: - launchd 环境变量
@@ -173,13 +180,13 @@ enum NativeGPU {
 
     // MARK: - 开关
 
-    /// mode: "dgpu" 开启（注入 + 策略=dgpu）/ "off" 关闭（unsetenv）
+    /// mode: "dgpu" 开启（注入 + 白名单模式；名单外不接管）/ "off" 关闭（unsetenv，完全不注入）
     static func setMode(_ mode: String) -> [String: Any] {
         if mode == "off" {
             let (_, ok) = NativeProc.runCapture("/bin/launchctl",
                                                 ["unsetenv", "DYLD_INSERT_LIBRARIES"])
             guard ok else { return ["ok": false, "error": "launchctl unsetenv 失败"] }
-            return ["ok": true, "mode": "off", "note": "之后启动的 app 回到 Apple 默认（核显）"]
+            return ["ok": true, "mode": "off", "note": "完全不注入，所有 app 跟随系统（默认核显）"]
         }
 
         guard mode == "dgpu" else { return ["ok": false, "error": "未知模式: \(mode)"] }
@@ -194,9 +201,10 @@ enum NativeGPU {
                     "error": "找不到 gpu-router.dylib（应随 app 打包在 Contents/Resources）"]
         }
 
-        // 策略先落盘，再注入：反过来的话，先启动的 app 会读到旧策略
+        // 策略先落盘，再注入：反过来的话，先启动的 app 会读到旧策略。
+        // 2026-11-24 白名单化：注入开启 ≠ 全局独显，只有 include 名单里的 app 被接管
         var p = readPolicy()
-        p["mode"] = "dgpu"
+        p["mode"] = "whitelist"
         _ = writePolicy(p)
 
         let (out, ok) = NativeProc.runCapture("/bin/launchctl",
@@ -204,7 +212,10 @@ enum NativeGPU {
         guard ok else {
             return ["ok": false, "error": "launchctl setenv 失败: \(out)"]
         }
-        var note = "之后启动的 app 默认使用独显；已在运行的 app 需重启才生效"
+        var note = "注入已启用：白名单内的 app 默认使用独显，其余跟随系统；已在运行的 app 需重启才生效"
+        if includeList().isEmpty {
+            note += "；当前白名单为空，暂时不会有 app 被接管"
+        }
         if !sandboxVisible {
             note += "；注入路径 \(dylib.path) 对沙箱 app 不可读（会 dyld 崩溃），"
                 + "把 dylib 放到 \(sandboxSafeURL.path) 才对沙箱 app 可见"
@@ -213,23 +224,23 @@ enum NativeGPU {
                 "sandboxVisible": sandboxVisible, "note": note]
     }
 
-    /// 加/删 per-app 例外（名单里的 app 仍用核显）
-    static func setExclude(_ bundleID: String, on: Bool) -> [String: Any] {
+    /// 加/删白名单（名单里的 app 默认走独显，其余保持系统默认）
+    static func setInclude(_ bundleID: String, on: Bool) -> [String: Any] {
         let id = bundleID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !id.isEmpty else { return ["ok": false, "error": "bundle id 为空"] }
         guard !id.hasPrefix("com.apple.") else {
             return ["ok": false, "error": "系统 app 本来就不会被接管，无需加入"]
         }
         var p = readPolicy()
-        var ex = (p["exclude"] as? [String]) ?? []
+        var inc = (p["include"] as? [String]) ?? []
         if on {
-            if !ex.contains(id) { ex.append(id) }
+            if !inc.contains(id) { inc.append(id) }
         } else {
-            ex.removeAll { $0 == id }
+            inc.removeAll { $0 == id }
         }
-        p["exclude"] = ex.sorted()
+        p["include"] = inc.sorted()
         guard writePolicy(p) else { return ["ok": false, "error": "写入策略文件失败"] }
-        return ["ok": true, "exclude": p["exclude"] as? [String] ?? []]
+        return ["ok": true, "include": p["include"] as? [String] ?? []]
     }
 
     /// 当前前台 GUI app 的 bundle id（方便一键加入例外）
@@ -249,7 +260,7 @@ enum NativeGPU {
         let inj = injectedValue()
         let dylib = dylibURL
         var out: [String: Any] = [
-            "mode": p["mode"] as? String ?? "dgpu",
+            "mode": p["mode"] as? String ?? "whitelist",
             "injected": inj != nil,
             "injectedValue": inj ?? "",
             "dylib": dylib?.path ?? "",
@@ -257,10 +268,12 @@ enum NativeGPU {
             // 沙箱 app（QQ/微信这类）能否读到注入的 dylib：只有 /Library 下的副本可以
             "sandboxVisible": sandboxVisible,
             "sandboxSafePath": sandboxSafeURL.path,
-            "exclude": p["exclude"] as? [String] ?? [],
+            "include": p["include"] as? [String] ?? [],
             "policyPath": policyURL.path,
             // 说明性字段，UI 直接展示，避免前端再拼字符串
-            "effective": (inj != nil) ? "dGPU 优先" : "系统默认（核显）",
+            "effective": (inj != nil)
+                ? "白名单路由生效（\((p["include"] as? [String] ?? []).count) 个 app）"
+                : "未注入（系统默认）",
         ]
         if let f = frontAppBundleID() { out["frontApp"] = f }
         out["ok"] = true

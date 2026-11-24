@@ -201,7 +201,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             await BackendService.shared.start()
             await BackendService.shared.checkKext()
             // 2.8.12：kext 状态看门狗（未加载 2s / 已加载 20s）。用户装完 kext
-            // 不必重启 app，界面自己从「需要 TongfangFan.kext」变成可用。
+            // 不必重启 app，界面自己从「需要 SkyCCEC.kext」变成可用。
             BackendService.shared.startKextWatch()
             MonitorStore.shared.attach(BackendService.shared)
         }
@@ -630,16 +630,17 @@ struct MenuBarView: View {
                     .opacity(benchmark ? 0.5 : 1)
             }
 
-            // 2026-11-07（用户要求）：把「默认使用独显」也放进菜单栏弹窗 ——
+            // 2026-11-07（用户要求）：把显卡路由开关也放进菜单栏弹窗 ——
             // 这是最常临时切的一项（想让某个 app 用独显就跑一趟菜单栏）。
             // 与「设备控制」页里的 GpuRouteSection 共用同一接口 /api/gpu，
-            // 这里只留开关 + 一行状态，例外名单仍在「设备控制」页管理。
+            // 这里只留总闸 + 一行状态，独显白名单仍在「设备控制」页管理。
+            // 2026-11-24 白名单化：开关只管注入总闸，不再是「默认独显」。
             VStack(alignment: .leading, spacing: 6) {
                 Text("显卡")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                 HStack(spacing: 8) {
-                    Text("默认使用独显").font(.system(size: 11.5))
+                    Text("启用显卡路由").font(.system(size: 11.5))
                     Spacer(minLength: 4)
                     Toggle("", isOn: Binding(get: { gpuOn }, set: { setGpuMode($0) }))
                         .toggleStyle(.switch)
@@ -648,7 +649,7 @@ struct MenuBarView: View {
                         .disabled(gpuBusy || gpuUnavailable)
                 }
                 // 2026-11-18（用户要求）：基准模式行挪到显卡状态提示行下方，
-                // 与「默认使用独显」行同构 —— 11.5 号文字 + mini 开关右对齐。
+                // 与「启用显卡路由」行同构 —— 11.5 号文字 + mini 开关右对齐。
                 Text(gpuStatusText)
                     .font(.system(size: 10.5))
                     .foregroundStyle(.secondary)
@@ -712,8 +713,8 @@ struct MenuBarView: View {
     private var gpuStatusText: String {
         if gpuUnavailable { return "缺少显卡路由组件，需重装 app" }
         if gpuBusy { return "正在应用…" }
-        return gpuOn ? "已开启：之后启动的 app 拿到独显"
-                     : "已关闭：跟随系统（默认核显）"
+        return gpuOn ? "已开启：白名单内的 app 拿到独显，名单管理在控制页"
+                     : "已关闭：不注入任何进程，跟随系统"
     }
 
     private func refreshGpu() async {

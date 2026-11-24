@@ -612,7 +612,7 @@ struct PageHeader<Trailing: View>: View {
 
 // MARK: - kext 门控（2.8.12）
 //
-// 用户要求：所有「需要 TongfangFan.kext 才能调」的项，在没检测到 kext 时必须
+// 用户要求：所有「需要 SkyCCEC.kext 才能调」的项，在没检测到 kext 时必须
 // **禁用置灰**，而不是整块消失或显示一行「需要 kext」把控件顶掉。
 // 做法：保留原控件（布局不跳），`.disabled(!ok)` 让 SwiftUI 环境里 isEnabled=false，
 // 子控件全部不吃点击，再压一层透明度当视觉提示；卡片里另配一行
@@ -631,7 +631,7 @@ extension View {
 struct KextRequiredHint: View {
     @EnvironmentObject var backend: BackendService
     /// 自定义说明（默认泛指这一块）
-    var text: String = "需要 TongfangFan.kext 才能调整"
+    var text: String = "需要 SkyCCEC.kext 才能调整"
 
     var body: some View {
         HStack(spacing: 8) {
@@ -674,7 +674,7 @@ struct KextInstallButton: View {
         }
         .buttonStyle(.plain)
         .disabled(backend.kextInstalling)
-        .help("把 app 自带的 TongfangFan.kext 装进 /Library/Extensions 并加载（需要管理员密码）")
+        .help("把 app 自带的 SkyCCEC.kext 装进 /Library/Extensions 并加载（需要管理员密码）")
     }
 }
 
@@ -691,7 +691,7 @@ struct KextBanner: View {
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(Theme.txt)
                 Text(backend.kextInstalling
-                     ? "正在安装 TongfangFan.kext（请在系统弹窗里输入管理员密码）…"
+                     ? "正在安装 SkyCCEC.kext（请在系统弹窗里输入管理员密码）…"
                      : "风扇、散热模式、功耗档、充电阈值、海岸灯等硬件功能暂不可用。kext 已内嵌在本 app 里，点右侧按钮一键安装。")
                     .font(.system(size: 11.5))
                     .foregroundStyle(Theme.dim)

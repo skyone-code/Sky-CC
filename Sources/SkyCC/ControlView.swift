@@ -175,7 +175,7 @@ struct ControlView: View {
     // 只套 Card 外壳，段内自带头部说明与 /api/gpu 回读逻辑（GpuRouteCard.swift）。
     // 这张卡不碰 EC，所以**不做 kextGated 置灰** —— kext 没装时它照样可用。
     private var gpuCard: some View {
-        Card(title: "显卡 · 默认使用哪块 GPU") {
+        Card(title: "显卡 · 独显白名单") {
             GpuRouteSection()
         }
     }
